@@ -1,0 +1,160 @@
+// The bridge: what an agent does in a workflow's run is told on that run, and the run is found from the work.
+namespace Osysharp.Agents.Processes;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+
+/// What a line of a run is about when it is about an agent's piece of work: the receipt, by its id.
+public string AgentWorkSubject() { return "AgentTask"; }
+
+/// "VetSupplier" → "vet supplier".
+string SkillWords(string skill) {
+  var name = BareName(skill);
+  var words = "";
+  foreach (var c in name) {
+    if (char.IsUpper(c) && words != "") { words = words + " " + char.ToLower(c); }
+    else { words = words + char.ToLower(c); }
+  }
+  return words;
+}
+
+/// Say something about a piece of work on the run that gave it. Work handed on by other work is part of the step
+/// that handed it on: only the work the run itself gave is told there.
+///
+/// ⚑ NOTHING OF WHAT THE WORK SAID IS COPIED: a line names the agent and the skill, and the receipt — which is read
+///   under its own rules, and erased under its own — holds the rest.
+///
+/// SECURITY-INVARIANT(agents-processes-a-run-line-copies-nothing-the-work-said): a run's lines are read by everybody
+/// who follows the process, and are not erased with an agent's record. What the work was about, what it said and why
+/// it failed are on the receipt, which `Osysharp.Agents` keeps to whoever the work was for, its supervisors and its
+/// auditors, and erases on request. A line that quoted any of it would show it to more people and keep it longer.
+/// Guarded by tests/walk.test.osy `a_run_tells_that_an_agent_worked_and_nothing_of_what_the_work_said`.
+void TellTheRun(AgentTask task, string said, ProcessNoteTone tone, DateTime? at = null) {
+  if (task.Run == null || task.Parent != null) { return; }
+  NoteOnProcessRun(new ProcessLine {
+    Run = task.Run!, Workflow = task.RunWorkflow, Item = task.RunItem, Starter = task.RunStarter, State = task.RunState,
+    At = at, Said = said, Tone = tone, SubjectKind = AgentWorkSubject(), Subject = task.Id,
+  });
+}
+
+string Doing(AgentTask task) { return task.Skill == "" ? "a question" : SkillWords(task.Skill); }
+
+[On] void WorkGiven(AgentTaskStarted e) {
+  var again = e.Task.Attempt > 1 ? ", attempt " + e.Task.Attempt.ToString() : "";
+  TellTheRun(e.Task, $"{AgentName(e.Task.Agent)} was given work: {Doing(e.Task)}{again}.", ProcessNoteTone.Plain, e.Task.StartedAt);
+}
+
+[On] void WorkWaits(AgentTaskWaiting e) {
+  TellTheRun(e.Task, $"{AgentName(e.Task.Agent)}'s work waits for a person.", ProcessNoteTone.Waiting);
+}
+
+[On] void WorkFinished(AgentTaskFinished e) {
+  TellTheRun(e.Task, $"{AgentName(e.Task.Agent)} finished: {Doing(e.Task)}.", ProcessNoteTone.Done, e.Task.EndedAt);
+}
+
+[On] void WorkFailed(AgentTaskFailed e) {
+  TellTheRun(e.Task, $"{AgentName(e.Task.Agent)}'s work failed.", ProcessNoteTone.Problem, e.Task.EndedAt);
+}
+
+[On] void WorkGaveUp(AgentWorkGaveUp e) {
+  if (e.Attempts > 1) { TellTheRun(e.Task, $"{AgentName(e.Task.Agent)} gave up after {e.Attempts} attempts.", ProcessNoteTone.Problem, e.Task.EndedAt); }
+}
+
+[On] void WorkStopped(AgentTaskStopped e) {
+  var how = e.Task.Status == AgentTaskStatus.Cancelled ? "was called off" : "was stopped before it finished";
+  TellTheRun(e.Task, $"{AgentName(e.Task.Agent)}'s work {how}.", ProcessNoteTone.Problem, e.Task.EndedAt);
+}
+
+// ── a run's agent work, as a table ──────────────────────────────────────────────────────────────────────────────────
+
+/// One piece of agent work given in a run.
+public class AgentStepCard {
+  public Guid Task;
+  /// The agent and the skill, as a person reads them; what the work is about.
+  public string Name = "";
+  public string Skill = "";
+  public string About = "";
+  /// The state of the process that gave it the work.
+  public string State = "";
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  /// What it spent, with the work it handed on.
+  public string Cost = "";
+  public long CostMicros = 0;
+  /// How many pieces of work it handed on.
+  public int HandedOn = 0;
+  /// Where the app shows it, when it has said.
+  public string Href = "";
+}
+
+/// A run's agent work, with what it adds up to.
+public class AgentStepsOfRun {
+  public List<AgentStepCard> Steps = [];
+  /// What the agents spent in the run, in all — "$0.0123".
+  public string Cost = "";
+  /// Receipts of this run that whoever is looking may not read were left out.
+  public bool SomeKept = false;
+}
+
+/// ⭐ THE AGENT WORK GIVEN IN A RUN, in order — each piece the run itself gave, with the state that gave it, how it
+/// ended and what it cost with the work it handed on. `run` is the kit's row for the run (`ProcessRun.Id`).
+///
+/// Read as whoever is looking: a receipt they may not read is not in the list.
+[Server, Authorize(IsAuthenticated)]
+public AgentStepsOfRun AgentWorkInRun(Guid run) {
+  var answer = new AgentStepsOfRun();
+  var row = ProcessRun.FirstOrDefault(r => r.Id == run);
+  if (row == null) { return answer; }
+  var all = AgentTask.Where(t => t.Run == row!.Run).OrderBy(t => t.RunStep).ThenBy(t => t.StartedAt).Take(1000).ToList();
+  long total = 0;
+  foreach (var task in all) {
+    total = total + task.SpentMicros;
+    if (task.Parent != null) { continue; }
+    long cost = task.SpentMicros;
+    var handedOn = 0;
+    foreach (var other in all) {
+      if (other.Root != null && other.Root!.Id == task.Id) { cost = cost + other.SpentMicros; handedOn = handedOn + 1; }
+    }
+    answer.Steps.Add(new AgentStepCard {
+      Task = task.Id, Name = AgentName(task.Agent), Skill = Doing(task), About = task.About, State = StateLabelOf(task.RunWorkflow, task.RunState),
+      Status = task.Status, Cost = "$" + Dollars(cost), CostMicros = cost, HandedOn = handedOn, Href = WorkPageOf(task.Id),
+    });
+  }
+  answer.Cost = "$" + Dollars(total);
+  return answer;
+}
+
+// ── a piece of work's run ───────────────────────────────────────────────────────────────────────────────────────────
+
+/// The run a piece of work is a step of, as the work's own page shows it.
+public class RunOfWork {
+  /// The kit's row for the run; where the app shows it ("" when it has said no page, or the reader follows none).
+  public Guid Run;
+  public string Href = "";
+  /// The process, and what the run is about ("" when that is not the reader's to read).
+  public string Process = "";
+  public string Title = "";
+  /// Where the run is now, and whether it is still going.
+  public string StateLabel = "";
+  public ProcessStatus Status = ProcessStatus.Running;
+}
+
+/// ⭐ THE RUN A PIECE OF WORK IS A STEP OF. Null when it is a step of none — or whoever is looking follows no
+/// processes, or may not read the work.
+[Server, Authorize(IsAuthenticated)]
+public RunOfWork? ProcessRunOfWork(Guid task) {
+  var t = AgentTask.FirstOrDefault(x => x.Id == task);
+  if (t == null || t!.Run == null) { return null; }
+  var me = Session.CurrentUser;
+  if (me == null || !Security.Authorize(me, FollowsProcesses)) { return null; }
+  var run = ProcessRun.FirstOrDefault(r => r.Run == t!.Run);
+  if (run == null) { return null; }
+  var view = ProcessRunOf(run!.Id);
+  if (view == null) { return null; }
+  return new RunOfWork {
+    Run = run!.Id, Href = view!.Card.Href, Process = view!.Card.Process, Title = view!.Card.Title,
+    StateLabel = view!.Card.StateLabel, Status = view!.Card.Status,
+  };
+}

@@ -1,0 +1,225 @@
+// Osysharp.Agents.Processes — on screen, driven as the people of the office: the risk officer opens Brightwater's
+// qualification and reads it to the end, opens the registrar's work in place and then on its own page, follows a
+// step's link and goes back to the run; the lead sees what it cost and what she may not read; a buyer is told what
+// is not his; the run and the work are read while the work still waits; and what was erased is shown as erased.
+// `osy test --pixels` photographs each stage — wide and on a phone, light and dark (`Ui.Shot`).
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.Agents.Processes;
+using Procurement;
+
+[Test(Halden)]
+void the_risk_officer_reads_a_qualification_and_opens_the_work_of_each_agent() {
+  var supplier = TheBrightwaterCase();
+  Guid deciding = Guid.Empty;
+  runas (Edda) { deciding = StepAt(supplier, "Deciding").Id; }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Edda);
+  Ui.Visit("/");
+  Assert.Visible("Brightwater Castings", within: "Runs");
+  Assert.Visible("Approved", within: "Brightwater Castings");
+  Ui.Click("Brightwater Castings");
+
+  // The run: where it ended, the path it took, and each state with what the agents did there.
+  Assert.Visible("Brightwater Castings", within: "Where it stands");
+  Assert.Visible("Finished", within: "Where it stands");
+  Assert.Visible("ended at Approved", within: "Where it stands");
+  Assert.Visible("4 days", within: "In figures");
+  Assert.Probe("FlowCanvas", "nodes", 8);
+  Assert.Visible("Screener finished: check documents.", within: "State 1, Checking documents");
+  Assert.Visible("Assessor gave up after 2 attempts.", within: "State 2, Assessing risk");
+  Assert.Visible("The assessor could not finish, so the risk officer assesses this supplier by hand.", within: "State 2, Assessing risk");
+  Assert.Visible("Edda Lindqvist answered the assessed step.", within: "State 3, Assessed by hand");
+  Assert.Visible("Registrar's work waits for a person.", within: "State 4, Settling terms");
+  Assert.Visible("3 days", within: "State 4, Settling terms");
+  // The table of the run's agent work.
+  Assert.Visible("Registrar, settle terms", within: "Agent work");
+  Assert.Visible("Given at Assessing risk", within: "Agent work");
+  Assert.NoOverflow();
+  Ui.Shot("run-wide-light");
+
+  // Only the steps; only what went wrong.
+  Ui.Click("Problems");
+  Assert.Hidden("Screener finished: check documents.");
+  Assert.Visible("Assessor's work failed.", within: "State 2, Assessing risk");
+  Ui.Click("The whole run");
+
+  // A step opens in place, as the whole inspector.
+  Ui.Click("Open: Registrar finished: settle terms.");
+  Assert.Visible("Registrar, settle terms", within: "Opened step");
+  Assert.Visible("Approved by Mara Oyelaran on 5 Sep 2031, 08:00 after 3 days, and it ran as them.", within: "Opened step");
+  Assert.Visible("All 7 lines of its record are as they were written.", within: "Opened step");
+  Assert.NoOverflow();
+  Ui.Shot("run-step-open-wide-light");
+  Ui.Click("Close: Registrar finished: settle terms.");
+  Assert.Hidden("Approved by Mara Oyelaran on 5 Sep 2031, 08:00 after 3 days, and it ran as them.");
+
+  // The same work on its own page.
+  Ui.Click("Registrar, settle terms");
+  Assert.Visible("Terms for Brightwater Castings", within: "The work");
+  Assert.Visible("Done", within: "The work");
+  Assert.Visible("Given by a process: nobody was signed in.", within: "What was asked");
+  Assert.Visible("Done for nobody: with the agent's own rights alone.", within: "What was asked");
+  Assert.Visible("It ran as Registrar, Registrar's own account.", within: "What was asked");
+  Assert.Visible("A step of the process Qualification, given at Deciding.", within: "What was asked");
+  Assert.Visible("Brightwater Castings, assessed as medium risk: The only caster of this alloy nearby, and a large order.", within: "What it was given");
+  Assert.Visible("Conditions: Audit within a year.", within: "The result");
+  Assert.Visible("3 days", within: "In figures");
+  Assert.Visible("$0.0019 of $0.05", within: "Spent on models");
+  Assert.Visible("Approve the supplier", within: "People and help");
+  Assert.Visible("Because: It is a medium risk with its documents in order, so it is paid in 45 days and audited within a year.", within: "People and help");
+  Assert.Visible("Approved by Mara Oyelaran on 5 Sep 2031, 08:00 after 3 days, and it ran as them.", within: "People and help");
+  Assert.Visible("7 steps, in order", within: "Steps");
+  Assert.Visible("It waits for a decision from Mara Oyelaran.", within: "Step 4");
+  Assert.Visible("then 3 days", within: "Step 4");
+  Assert.Visible("It ran before anybody had taught Registrar anything.", within: "What it was told");
+  Assert.Visible("Proposes every time", within: "Its tools");
+  Assert.Visible("Checks", within: "The record");
+  Assert.Visible("All 7 lines of its record are as they were written.", within: "The record");
+  Assert.NoOverflow();
+  Ui.Shot("work-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("work-wide-dark");
+  Ui.Theme("light");
+
+  // A step says more when asked: a tool's arguments as a person reads them, a model call's model and words.
+  Ui.Click("More of step 3");
+  Assert.Visible("Brightwater Castings", within: "More of step 3");
+  Assert.Visible("Audit within a year.", within: "More of step 3");
+  Ui.Click("More of step 2");
+  Assert.Visible("Small", within: "More of step 2");
+  Assert.Visible("It is a medium risk with its documents in order, so it is paid in 45 days and audited within a year.", within: "More of step 2");
+  Ui.Shot("work-steps-open-wide-light");
+
+  // Only the steps a person had a part in.
+  Ui.Click("People");
+  Assert.Visible("It waits for a decision from Mara Oyelaran.", within: "Steps");
+  Assert.Hidden("Done. ");
+  Ui.Click("Problems");
+  Assert.Visible("Nothing went wrong in it.", within: "Steps");
+  Ui.Click("All");
+
+  // From the work back to its run.
+  Assert.Visible("Supplier qualification, ended at Approved", within: "Its process run");
+  Ui.Click("Open the run: Brightwater Castings");
+  Assert.Visible("ended at Approved", within: "Where it stands");
+
+  // The same on a phone.
+  Ui.Viewport(390, 844);
+  Ui.Visit("/work/" + deciding.ToString() + "/4");
+  Assert.Visible("Terms for Brightwater Castings", within: "The work");
+  Assert.Visible("It waits for a decision from Mara Oyelaran.", within: "Step 4");
+  Assert.NoOverflow();
+  Ui.Shot("work-phone-light");
+  Ui.Theme("dark");
+  Ui.Shot("work-phone-dark");
+  Ui.Theme("light");
+  Ui.Visit("/qualifications/" + RunOf(supplier).Id.ToString());
+  Assert.Visible("ended at Approved", within: "Where it stands");
+  Assert.NoOverflow();
+  Ui.Shot("run-phone-light");
+}
+
+[Test(Halden)]
+void the_lead_sees_what_it_cost_and_is_told_what_is_kept_from_her() {
+  var supplier = TheBrightwaterCase();
+  Guid screening = Guid.Empty;
+  runas (Mara) { SetProcessBudget("Qualification", 0.5m); UnitOfWork.Commit(); screening = StepAt(supplier, "Screening").Id; }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Mara);
+  Ui.Visit("/qualifications/" + RunOf(supplier).Id.ToString());
+  Assert.Visible("$0.0049 of $0.50", within: "Spent on models");
+  Assert.Visible("$0.0049 in all", within: "Agent work");
+  Assert.Visible("handed on 1 piece", within: "Screener, check documents");
+  Ui.Shot("run-cost-wide-light");
+
+  // She answers for the agents, and does not audit them: she reads that each step happened, not what it said.
+  Ui.Visit("/work/" + screening.ToString() + "/0");
+  Assert.Visible("Documents of Brightwater Castings", within: "The work");
+  Assert.Visible("Done for Jonas Brandt: never past what they may do themselves.", within: "What was asked");
+  Ui.Click("More of step 3");
+  Assert.Visible("What it said is kept from you: you may see that this happened, not what was said.", within: "More of step 3");
+  // The piece it handed on is part of it: the tree, and every piece's steps in the one record.
+  Assert.Visible("Insurance reader, read insurance", within: "Handed on");
+  Assert.Visible("This one", within: "Piece Screener");
+  // The teaching kit's panel is drawn under the record, through the inspector's slot: whoever supervises may correct.
+  Assert.Visible("Correct this", within: "Teaching");
+  Assert.NoOverflow();
+  Ui.Shot("work-kept-wide-light");
+}
+
+[Test(Halden)]
+void a_buyer_reads_the_work_done_for_him_and_is_told_what_is_not_his() {
+  var supplier = TheBrightwaterCase();
+  Guid screening = Guid.Empty;
+  Guid deciding = Guid.Empty;
+  runas (Mara) { screening = StepAt(supplier, "Screening").Id; deciding = StepAt(supplier, "Deciding").Id; }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Jonas);
+  Ui.Visit("/work/" + screening.ToString() + "/0");
+  Assert.Visible("Documents of Brightwater Castings", within: "The work");
+  Ui.Click("More of step 3");
+  Assert.Visible("Brightwater Castings", within: "More of step 3");
+  // The registrar's work was done for nobody: it is the lead's and the auditor's to read.
+  Ui.Visit("/work/" + deciding.ToString() + "/0");
+  Assert.Visible("This piece of work is not yours to see");
+  Assert.Hidden("Terms for Brightwater Castings");
+  Ui.Shot("work-not-yours-wide-light");
+  // On the run he follows, the registrar's line is there; opened, it says the same.
+  Ui.Visit("/qualifications/" + RunOf(supplier).Id.ToString());
+  Assert.Visible("Registrar finished: settle terms.", within: "State 4, Settling terms");
+  Ui.Click("Open: Registrar finished: settle terms.");
+  Assert.Visible("This piece of work is not yours to see", within: "Opened step");
+}
+
+[Test(Halden)]
+void a_qualification_that_waits_says_on_whom_and_for_how_long() {
+  TestClock.Set(new DateTime(2031, 9, 1, 8, 0, 0, DateTimeKind.Utc));
+  TheAgentsAnswer();
+  Guid supplier = Guid.Empty;
+  runas (Jonas) { supplier = BrightwaterIsAskedFor(); }
+  TestClock.Advance(TimeSpan.FromHours(50));
+  Guid deciding = Guid.Empty;
+  runas (Mara) { deciding = StepAt(supplier, "Deciding").Id; }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Edda);
+  Ui.Visit("/qualifications/" + RunOf(supplier).Id.ToString());
+  Assert.Visible("Running", within: "Where it stands");
+  Assert.Visible("at Settling terms", within: "Where it stands");
+  Assert.Visible("Registrar's work waits for a person.", within: "State 3, Settling terms");
+  Assert.Visible("2 days 2 hours so far", within: "State 3, Settling terms");
+  Assert.Visible("Waiting on a person", within: "Agent work");
+  Ui.Shot("run-waiting-wide-light");
+  Ui.Visit("/work/" + deciding.ToString() + "/0");
+  Assert.Visible("Waiting on a person", within: "The work");
+  Assert.Visible("Waiting on a decision from Mara Oyelaran, for 2 days 2 hours so far.", within: "The work");
+  Assert.Visible("Waiting for Mara Oyelaran since 1 Sep 2031, 08:00.", within: "People and help");
+  Assert.Visible("waiting 2 days 2 hours so far", within: "Step 4");
+  Assert.NoOverflow();
+  Ui.Shot("work-waiting-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("work-waiting-wide-dark");
+}
+
+[Test(Halden)]
+void work_whose_words_were_erased_shows_them_as_erased() {
+  var supplier = TheBrightwaterCase();
+  Guid screening = Guid.Empty;
+  runas (Mara) { screening = StepAt(supplier, "Screening").Id; }
+  TestClock.Advance(TimeSpan.FromDays(40));
+  runas (Tilde) { EraseAgentWorkContent(AgentTask.Single(t => t.Id == screening), "Kept thirty days."); UnitOfWork.Commit(); }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Edda);
+  Ui.Visit("/work/" + screening.ToString() + "/0");
+  Assert.Visible("What it said was erased on 15 Oct 2031, 08:00: Kept thirty days.", within: "The work");
+  Assert.Visible("Nothing is kept of what it handed back.", within: "What it handed back");
+  Assert.Visible("Erased", within: "Step 3");
+  Assert.Visible("Checks", within: "The record");
+  Assert.NoOverflow();
+  Ui.Shot("work-erased-wide-light");
+}

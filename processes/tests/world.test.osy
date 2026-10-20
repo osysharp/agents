@@ -1,0 +1,127 @@
+// The office the tests run in: Jonas is a buyer; Mara leads procurement — she answers for the three agents, decides
+// what they propose and reads what they cost; Edda is the risk officer, who audits the agents and assesses by hand
+// when the assessor cannot; Tilde keeps the records; Rafi works in the warehouse and has no business with any of it.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.Agents.Processes;
+using Procurement;
+
+[TestFixture]
+void Halden() {
+  var jonas = new Person { Email = "jonas@haldentools.example", DisplayName = "Jonas Brandt" };
+  var mara = new Person { Email = "mara@haldentools.example", DisplayName = "Mara Oyelaran" };
+  var edda = new Person { Email = "edda@haldentools.example", DisplayName = "Edda Lindqvist" };
+  var rafi = new Person { Email = "rafi@haldentools.example", DisplayName = "Rafi Demir" };
+  new RoleGrant { Member = jonas, Role = OfficeRole.Buyer };
+  new RoleGrant { Member = mara, Role = OfficeRole.Lead };
+  new RoleGrant { Member = edda, Role = OfficeRole.RiskOfficer };
+  new RoleGrant { Member = rafi, Role = OfficeRole.Warehouse };
+  var tilde = new Person { Email = "tilde@haldentools.example", DisplayName = "Tilde Aune" };
+  new RoleGrant { Member = tilde, Role = OfficeRole.Records };
+  // The lead answers for all three agents.
+  new AgentSeat { Agent = "Procurement.Screener", Sponsor = mara };
+  new AgentSeat { Agent = "Procurement.InsuranceReader", Sponsor = mara };
+  new AgentSeat { Agent = "Procurement.Assessor", Sponsor = mara };
+  new AgentSeat { Agent = "Procurement.Registrar", Sponsor = mara };
+}
+
+principal Jonas => Person.Single(p => p.Email == "jonas@haldentools.example");
+principal Mara  => Person.Single(p => p.Email == "mara@haldentools.example");
+principal Edda  => Person.Single(p => p.Email == "edda@haldentools.example");
+principal Rafi  => Person.Single(p => p.Email == "rafi@haldentools.example");
+/// The records clerk: erases what a piece of work said when its time is up.
+principal Tilde => Person.Single(p => p.Email == "tilde@haldentools.example");
+
+/// ⭐ THE AGENTS, SCRIPTED BY WHO IS ASKED. The screener lists the documents, hands the insurance certificate to the
+/// insurance reader — which reads the insured sum and says it is enough — and says whether the documents are all
+/// there; the assessor looks up the spend and calls it a medium risk — or cannot be reached at all; the registrar
+/// asks to approve the supplier, paid in 45 days and audited within a year, and hands those terms back once it may.
+void TheAgentsAnswer(bool assessorDown = false, bool documentsComplete = true) {
+  ScriptedAnswer.Stub((model, request) => {
+    var who = request.SystemSegments.Count > 0 ? request.SystemSegments[0].Content : "";
+    var turn = request.Messages.Count(m => m.Role == "assistant");
+    var brief = request.Messages[0].Content[0].Text ?? "";
+    var id = brief.Substring(brief.IndexOf("Its id is ") + 10, 36);
+    var supplier = "{\"supplier\":\"" + id + "\"}";
+    if (who.StartsWith("You are InsuranceReader.")) {
+      if (turn == 0) { return Says.Tool(Actions.Of(InsuredSum), supplier, 300, 20); }
+      return Says.HandBack(new InsuranceFinding { Enough = true, Says = "Covered for 500,000 euros, against 310,000 a year." }, 400, 40);
+    }
+    if (who.StartsWith("You are Screener.")) {
+      if (turn == 0) { return Says.Tool(Actions.Of(DocumentsOf), supplier, 400, 40); }
+      if (!documentsComplete && turn == 1) { return Says.Tool(Actions.Of(NoteMissing), "{\"supplier\":\"" + id + "\",\"what\":\"proof of insurance\"}", 500, 40); }
+      // With its documents in, the insurance certificate is handed to the agent that reads those.
+      if (documentsComplete && turn == 1) { return Says.HandTo<InsuranceReader>(new ReadInsurance(), Says.Row(Guid.Parse(id)), "call-insurance", 500, 40); }
+      List<string> missing = documentsComplete ? [] : ["proof of insurance"];
+      return Says.HandBack(new DocumentCheck { Complete = documentsComplete, Missing = missing }, 500, 40);
+    }
+    if (who.StartsWith("You are Assessor.")) {
+      if (assessorDown) { throw new ExternalServiceException("The model did not answer."); }
+      if (turn == 0) { return Says.Tool(Actions.Of(PlannedSpendWith), supplier, 400, 40); }
+      return Says.HandBack(new RiskAssessment { Level = RiskLevel.Medium, Why = "We plan to spend 310,000 euros a year with it, and it is the only caster of this alloy nearby." }, 500, 80);
+    }
+    if (turn == 0) {
+      return Says.Tool("It is a medium risk with its documents in order, so it is paid in 45 days and audited within a year.",
+                       Actions.Of(ApproveSupplier), "{\"supplier\":\"" + id + "\",\"paymentDays\":45,\"conditions\":\"Audit within a year.\"}", 600, 80);
+    }
+    return Says.HandBack(new Terms { PaymentDays = 45, Conditions = "Audit within a year." }, 700, 40);
+  });
+}
+
+/// A buyer asks for Brightwater Castings to be qualified, with its three documents on file, and the process runs as
+/// far as it goes by itself. Answers the supplier's id.
+Guid BrightwaterIsAskedFor(bool withInsurance = true) {
+  var supplier = Qualify("Brightwater Castings", "aluminium castings", 310000);
+  new SupplierDocument { Supplier = supplier, Kind = "Certificate of incorporation" };
+  new SupplierDocument { Supplier = supplier, Kind = "Quality certificate" };
+  if (withInsurance) { new SupplierDocument { Supplier = supplier, Kind = "Proof of insurance" }; }
+  UnitOfWork.Commit();
+  Workflow.Settle(supplier);
+  return supplier.Id;
+}
+
+/// The kit's row for a supplier's qualification.
+ProcessRun RunOf(Guid supplier) { return ProcessRunAbout("Qualification", supplier)!; }
+
+/// The piece of work a state of the qualification gave — the last attempt, when it was tried again.
+AgentTask StepAt(Guid supplier, string state) {
+  return AgentTask.Where(t => t.RunItem == supplier && t.RunState == state && t.Parent == null).OrderByDescending(t => t.RunStep).First();
+}
+
+/// Let work a person has decided go on, and its process with it.
+void GoOnWith(Guid task, Guid supplier) {
+  Workflow.Settle(AgentWait.Where(w => w.Task.Id == task).OrderByDescending(w => w.Since).First());
+  Workflow.Settle(AgentWorkWait.Single(w => w.Task.Id == task));
+  Workflow.Settle(Supplier.Single(s => s.Id == supplier));
+}
+
+/// ⭐ THE WHOLE CASE, as it happened over five days in September. Answers the supplier's id.
+///   1 Sep, 08:00  Jonas asks for Brightwater Castings. The screener finds its documents in order. The assessor's
+///                 model does not answer, twice; the process hands the assessment to the risk officer.
+///   2 Sep, 08:00  Edda assesses it by hand: medium. The registrar proposes to approve it on terms, and waits.
+///   5 Sep, 08:00  Mara approves. The supplier is approved as her, and the qualification ends.
+Guid TheBrightwaterCase() {
+  TestClock.Set(new DateTime(2031, 9, 1, 8, 0, 0, DateTimeKind.Utc));
+  Guid supplier = Guid.Empty;
+  TheAgentsAnswer(assessorDown: true);
+  runas (Jonas) { supplier = BrightwaterIsAskedFor(); }
+  TestClock.Advance(TimeSpan.FromDays(1));
+  TheAgentsAnswer();
+  runas (Edda) {
+    var s = Supplier.Single(x => x.Id == supplier);
+    AssessByHand(s, RiskLevel.Medium, "The only caster of this alloy nearby, and a large order.");
+    Workflow.Settle(s);
+  }
+  TestClock.Advance(TimeSpan.FromDays(3));
+  runas (Mara) {
+    var step = StepAt(supplier, "Deciding");
+    ApproveAgentProposal(AgentProposal.Single(p => p.Task == step));
+    GoOnWith(step.Id, supplier);
+  }
+  return supplier;
+}

@@ -1,0 +1,463 @@
+// Osysharp.Agents.Processes — one supplier's qualification, walked from the buyer's request to the approval: three
+// agent steps, one that fails and is handled by the process, one that waits three days on a person. Then the run and
+// each piece of work are read back — as the process's page reads them and as the inspector does — by the people who
+// may, and not by those who may not.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.Agents.Processes;
+using Procurement;
+
+// ── the case ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Halden)]
+void a_supplier_is_qualified_through_three_agent_steps_a_failure_and_a_three_day_wait() {
+  TestClock.Set(new DateTime(2031, 9, 1, 8, 0, 0, DateTimeKind.Utc));
+  Guid supplier = Guid.Empty;
+
+  // 1 September. Jonas asks. The screener finds the documents in order; the assessor's model does not answer —
+  // tried twice, as its skill says — and the process hands the assessment to a person.
+  TheAgentsAnswer(assessorDown: true);
+  runas (Jonas) {
+    supplier = BrightwaterIsAskedFor();
+    Assert.Equal(SupplierStage.ByHand, Supplier.Single(s => s.Id == supplier).Stage);
+    // The work was done for him, so its receipts are his to read: one step that finished, one that failed twice.
+    Assert.Equal(["CheckDocuments", "AssessRisk", "AssessRisk"], ProcessTrail.Skills(supplier));
+    Assert.Equal(["Screening", "Assessing", "Assessing"], ProcessTrail.States(supplier));
+    Assert.Equal(["Done", "Failed", "Failed"], ProcessTrail.Ended(supplier));
+  }
+
+  // 2 September. Edda assesses it by hand. The registrar proposes to approve it — which it may never do alone — and
+  // its work waits, and the process with it.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  TheAgentsAnswer();
+  runas (Edda) {
+    var s = Supplier.Single(x => x.Id == supplier);
+    AssessByHand(s, RiskLevel.Medium, "The only caster of this alloy nearby, and a large order.");
+    Workflow.Settle(s);
+    Assert.Equal(SupplierStage.Deciding, Supplier.Single(x => x.Id == supplier).Stage);
+    Assert.Equal(RiskLevel.Medium, Supplier.Single(x => x.Id == supplier).Risk);
+  }
+  runas (Mara) {
+    var step = StepAt(supplier, "Deciding");
+    Assert.Equal(AgentTaskStatus.Waiting, step.Status);
+    // Nobody was named for this step, so its proposal is put to whoever answers for the registrar.
+    var proposal = AgentProposal.Single(p => p.Task == step);
+    Assert.Equal(Mara.Id, proposal.DecideBy!.Id);
+    Assert.Equal("Approve the supplier", proposal.Label);
+    Assert.False(Supplier.Single(x => x.Id == supplier).Approved);
+  }
+
+  // Three days go by. Nothing runs, and nothing is asked of a model.
+  TestClock.Advance(TimeSpan.FromDays(3));
+  Background.Settle();
+  runas (Mara) {
+    Assert.Equal(SupplierStage.Deciding, Supplier.Single(x => x.Id == supplier).Stage);
+    var calls = ModelCall.Count();
+    var step = StepAt(supplier, "Deciding");
+    Assert.Equal(ProposalStatus.Done, ApproveAgentProposal(AgentProposal.Single(p => p.Task == step)).Status);
+    GoOnWith(step.Id, supplier);
+    // 5 September. The step answered with the finished work, and the process went on to its end.
+    var s = Supplier.Single(x => x.Id == supplier);
+    Assert.Equal(SupplierStage.Approved, s.Stage);
+    Assert.True(s.Approved);
+    Assert.Equal(45, s.PaymentDays);
+    Assert.Equal("Audit within a year.", s.Conditions);
+    Assert.Equal(calls + 1, ModelCall.Count());
+    Assert.Equal(["ApproveSupplier"], ProcessTrail.Proposed(supplier));
+  }
+
+  // The run, read back by somebody who was not there.
+  runas (Edda) {
+    var view = ProcessRunOf(RunOf(supplier).Id)!;
+    Assert.Equal("Brightwater Castings", view.Card.Title);
+    Assert.Equal("Supplier qualification", view.Card.Process);
+    Assert.Equal(ProcessStatus.Finished, view.Card.Status);
+    Assert.Equal("4 days", view.Card.Age);
+    Assert.Equal(["Checking documents", "Assessing risk", "Assessed by hand", "Settling terms", "Approved"], view.Stays.Select(s => s.Label).ToList());
+    Assert.Equal(["Screener was given work: check documents.", "Screener finished: check documents."],
+                 view.Stays[0].Moments.Select(m => m.Said).ToList());
+    Assert.Equal([
+      "Assessor was given work: assess risk.",
+      "Assessor's work failed.",
+      "Assessor was given work: assess risk, attempt 2.",
+      "Assessor's work failed.",
+      "Assessor gave up after 2 attempts.",
+      "The assessor could not finish, so the risk officer assesses this supplier by hand.",
+    ], view.Stays[1].Moments.Select(m => m.Said).ToList());
+    Assert.Equal(["Waiting for the risk officer's assessment.", "Edda Lindqvist answered the assessed step."],
+                 view.Stays[2].Moments.Select(m => m.Said).ToList());
+    Assert.Equal("1 day", view.Stays[2].Lasted);
+    Assert.Equal(["Registrar was given work: settle terms.", "Registrar's work waits for a person.", "Registrar finished: settle terms."],
+                 view.Stays[3].Moments.Select(m => m.Said).ToList());
+    Assert.Equal("3 days", view.Stays[3].Lasted);
+    // Each of the agents' lines opens the piece of work it is about.
+    Assert.Equal(AgentWorkSubject(), view.Stays[3].Moments[0].SubjectKind);
+    Assert.Equal(StepAt(supplier, "Deciding").Id, view.Stays[3].Moments[0].Subject);
+  }
+}
+
+[Test(Halden)]
+void a_simulated_process_reaches_approved() {
+  TestClock.Set(new DateTime(2031, 9, 1, 8, 0, 0, DateTimeKind.Utc));
+  TheAgentsAnswer();
+  Guid supplier = Guid.Empty;
+  runas (Jonas) { supplier = BrightwaterIsAskedFor(); }
+  // A person is simulated by doing what she would: the lead reads the proposal a day later and says yes.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Mara) {
+    var step = StepAt(supplier, "Deciding");
+    ApproveAgentProposal(AgentProposal.Single(p => p.Task == step));
+    GoOnWith(step.Id, supplier);
+
+    Assert.Equal(SupplierStage.Approved, Supplier.Single(s => s.Id == supplier).Stage);
+    // Where it went, what was proposed on the way, and what it cost.
+    Assert.Equal(["CheckDocuments", "AssessRisk", "SettleTerms"], ProcessTrail.Skills(supplier));
+    Assert.Equal(["Screening", "Assessing", "Deciding"], ProcessTrail.States(supplier));
+    Assert.Equal(["Done", "Done", "Done"], ProcessTrail.Ended(supplier));
+    Assert.Equal(["ApproveSupplier"], ProcessTrail.Proposed(supplier));
+    Assert.True(ProcessTrail.Cost(supplier) <= 20000);            // two cents
+    Assert.Equal(9, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+  }
+}
+
+[Test(Halden)]
+void a_supplier_with_a_document_missing_ends_where_the_first_step_sends_it() {
+  TheAgentsAnswer(documentsComplete: false);
+  runas (Jonas) {
+    var supplier = BrightwaterIsAskedFor(withInsurance: false);
+    var s = Supplier.Single(x => x.Id == supplier);
+    Assert.Equal(SupplierStage.Incomplete, s.Stage);
+    Assert.Equal("proof of insurance", s.Missing);
+    Assert.Equal(["CheckDocuments"], ProcessTrail.Skills(supplier));
+    Assert.Equal(ProcessStatus.Stopped, ProcessRunOf(RunOf(supplier).Id)!.Card.Status);
+  }
+}
+
+// ── cost ────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Halden)]
+void a_process_run_rolls_up_its_agent_costs() {
+  var supplier = TheBrightwaterCase();
+  runas (Mara) {
+    var run = RunOf(supplier);
+    // Five pieces of work in the run: two steps that finished — one of which handed a piece on — and one that failed
+    // twice before a call was served.
+    var receipts = AgentTask.Where(t => t.Run == run.Run).ToList();
+    Assert.Equal(5, receipts.Count);
+    long micros = 0;
+    foreach (var r in receipts) { micros = micros + r.SpentMicros; }
+    Assert.True(micros > 0);
+    // What the run cost is what its receipts add up to — and what the meter says was charged to the run.
+    var cost = ProcessRunOf(run.Id)!.Cost;
+    Assert.True(cost.Known);
+    Assert.Equal(micros / 1000000m, cost.Spent);
+    Assert.Equal(micros, ProcessTrail.Cost(supplier));
+    Assert.Equal(micros / 1000000m, SpentOn(RunScope("Qualification", run.Run)));
+    Assert.Equal(micros / 1000000m, SpentOn(WorkflowScope("Qualification")));
+    // The table of the run's agent work says the same, piece by piece.
+    var work = AgentWorkInRun(run.Id);
+    Assert.Equal(["Screener", "Assessor", "Assessor", "Registrar"], work.Steps.Select(s => s.Name).ToList());
+    Assert.Equal(["Checking documents", "Assessing risk", "Assessing risk", "Settling terms"], work.Steps.Select(s => s.State).ToList());
+    // The screener handed the insurance certificate on: that piece is part of its step, and of what the step cost.
+    Assert.Equal(1, work.Steps[0].HandedOn);
+    var screening = StepAt(supplier, "Screening");
+    Assert.Equal(WorkTree.CostOf(screening), work.Steps[0].CostMicros);
+    Assert.True(work.Steps[0].CostMicros > screening.SpentMicros);
+    var handedOn = WorkTree.HandedOnBy(screening).Single();
+    Assert.Equal("Procurement.InsuranceReader", handedOn.Agent);
+    Assert.Equal(run.Run, handedOn.Run);                       // the same step of the same run
+    Assert.Equal("Screening", handedOn.RunState);
+    Assert.Contains(RunScope("Qualification", run.Run), ModelCall.First(c => c.Scopes.Contains("task:" + handedOn.Id.ToString())).Scopes.Split("\n"));
+    long listed = 0;
+    foreach (var s in work.Steps) { listed = listed + s.CostMicros; }
+    Assert.Equal(micros, listed);
+    Assert.Equal("$" + Dollars(micros), work.Cost);
+  }
+}
+
+[Test(Halden)]
+void a_limit_for_each_qualification_stops_an_agent_step_and_the_process_handles_it() {
+  TestClock.Set(new DateTime(2031, 9, 1, 8, 0, 0, DateTimeKind.Utc));
+  // Each qualification may spend 0.8 cents on models. Screening — the screener's three calls and the insurance
+  // reader's two — uses 0.3 of it; the assessor's first call would hold another 0.54 before it left, and there is
+  // no room for it.
+  runas (Mara) { SetProcessBudget("Qualification", 0.008m); UnitOfWork.Commit(); }
+  TheAgentsAnswer();
+  Guid supplier = Guid.Empty;
+  runas (Jonas) {
+    supplier = BrightwaterIsAskedFor();
+    // The assessor was stopped before anything was sent. The process handed the assessment to a person, exactly as
+    // it does when the assessor gives up.
+    Assert.Equal(SupplierStage.ByHand, Supplier.Single(s => s.Id == supplier).Stage);
+    Assert.Equal(["Done", "Stopped"], ProcessTrail.Ended(supplier));
+    var assessing = StepAt(supplier, "Assessing");
+    Assert.StartsWith("Its money ran out: There is no room left in the run.Qualification budget for " + assessing.Run!.ToString(), assessing.Outcome);
+    Assert.Equal(0, assessing.ModelCalls);
+  }
+  runas (Mara) {
+    var view = ProcessRunOf(RunOf(supplier).Id)!;
+    Assert.Equal(0.008m, view.Cost.Limit);
+    Assert.Equal(0.003m, view.Cost.Spent);
+    Assert.Equal("$0.0030 of $0.0080", view.Cost.Words);
+    Assert.Equal([
+      "Assessor was given work: assess risk.",
+      "Assessor's work was stopped before it finished.",
+      "The assessor could not finish, so the risk officer assesses this supplier by hand.",
+    ], view.Stays[1].Moments.Select(m => m.Said).ToList());
+  }
+}
+
+// ── from the run to the work, and back ──────────────────────────────────────────────────────────────────────────────
+
+[Test(Halden)]
+void the_run_and_the_work_are_found_from_each_other() {
+  var supplier = TheBrightwaterCase();
+  runas (Mara) {
+    var run = RunOf(supplier);
+    var step = StepAt(supplier, "Deciding");
+    // The receipt says which run it is a step of…
+    Assert.Equal(run.Run, step.Run);
+    Assert.Equal("Qualification", step.RunWorkflow);
+    Assert.Equal(supplier, step.RunItem);
+    // …the work's own page says it in words, and leads to the run…
+    var seen = InspectAgentWork(step.Id)!;
+    Assert.Equal("Qualification", seen.Process);
+    Assert.Equal("Deciding", seen.ProcessState);
+    var origin = ProcessRunOfWork(step.Id)!;
+    Assert.Equal(run.Id, origin.Run);
+    Assert.Equal("/qualifications/" + run.Id.ToString(), origin.Href);
+    Assert.Equal("Brightwater Castings", origin.Title);
+    Assert.Equal("Approved", origin.StateLabel);
+    // …and the run's page leads to the work.
+    var work = AgentWorkInRun(run.Id);
+    Assert.Equal("/work/" + step.Id.ToString() + "/0", work.Steps.Last().Href);
+  }
+  // Somebody with no business in the office finds neither.
+  runas (Rafi) {
+    Assert.Equal(0, AgentWorkInRun(Guid.NewGuid()).Steps.Count);
+    Assert.Equal(0, AgentTask.Count());
+    Assert.Equal(0, ProcessRun.Count());
+  }
+}
+
+[Test(Halden)]
+void withdrawing_the_request_calls_off_the_work_the_qualification_waited_for() {
+  TheAgentsAnswer();
+  Guid supplier = Guid.Empty;
+  runas (Jonas) {
+    supplier = BrightwaterIsAskedFor();
+    Assert.Equal(SupplierStage.Deciding, Supplier.Single(s => s.Id == supplier).Stage);
+    // He no longer needs the supplier, while the registrar's proposal waits for the lead.
+    var s = Supplier.Single(x => x.Id == supplier);
+    WithdrawRequest(s);
+    Workflow.Settle(s);
+    Assert.Equal(SupplierStage.Withdrawn, Supplier.Single(x => x.Id == supplier).Stage);
+  }
+  Background.Settle();
+  runas (Mara) {
+    var step = StepAt(supplier, "Deciding");
+    Workflow.Settle(AgentWorkWait.Single(w => w.Task == step));
+    Workflow.Settle(AgentWait.Where(w => w.Task == step).OrderByDescending(w => w.Since).First());
+    step = StepAt(supplier, "Deciding");
+    Assert.Equal(AgentTaskStatus.Cancelled, step.Status);
+    Assert.Equal("It was called off: The process that was waiting for it was stopped.", step.Outcome);
+    Assert.Equal(ProposalStatus.Withdrawn, AgentProposal.Single(p => p.Task == step).Status);
+    Assert.False(Supplier.Single(x => x.Id == supplier).Approved);
+    // The run says so, in the state that gave the work.
+    var view = ProcessRunOf(RunOf(supplier).Id)!;
+    Assert.Equal(ProcessStatus.Stopped, view.Card.Status);
+    Assert.Contains("Registrar's work was called off.", view.Stays.Single(st => st.State == "Deciding").Moments.Select(m => m.Said).ToList());
+  }
+}
+
+[Test(Halden)]
+void a_run_tells_that_an_agent_worked_and_nothing_of_what_the_work_said() {
+  var supplier = TheBrightwaterCase();
+  // Jonas follows the qualification. The registrar's work was done for nobody: it is not his to read.
+  runas (Jonas) {
+    Assert.Equal(0, AgentTask.Count(t => t.RunState == "Deciding"));
+    var view = ProcessRunOf(RunOf(supplier).Id)!;
+    List<string> agentLines = [];
+    foreach (var stay in view.Stays) {
+      foreach (var m in stay.Moments) { if (m.SubjectKind == AgentWorkSubject()) { agentLines.Add(m.Said); } }
+    }
+    Assert.Equal(10, agentLines.Count);
+    // Each says who worked and at what — and none what the work was about, what was proposed, or why it failed.
+    foreach (var line in agentLines) {
+      Assert.False(line.Contains("Brightwater"));
+      Assert.False(line.Contains("45"));
+      Assert.False(line.Contains("Audit"));
+      Assert.False(line.Contains("could not be reached"));
+      Assert.False(line.Contains("Mara"));
+    }
+    Assert.Contains("Registrar's work waits for a person.", agentLines);
+  }
+}
+
+// ── the inspector ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Halden)]
+void the_inspector_tells_a_piece_of_work_to_somebody_who_was_not_there() {
+  var supplier = TheBrightwaterCase();
+  // Edda audits the agents: she reads every run with what it said.
+  runas (Edda) {
+    var step = StepAt(supplier, "Deciding");
+    var seen = InspectAgentWork(step.Id)!;
+    // What it was, and how it ended.
+    Assert.Equal("Registrar", seen.Name);
+    Assert.Equal("settle terms", seen.Skill);
+    Assert.Equal("Terms for Brightwater Castings", seen.About);
+    Assert.Equal(AgentTaskStatus.Done, seen.Status);
+    Assert.Equal("PaymentDays: 45\nConditions: Audit within a year.", seen.Result);
+    // Who asked, for whom, and as whom it ran.
+    Assert.Equal("Given by a process: nobody was signed in.", seen.GivenBy);
+    Assert.Equal("Done for nobody: with the agent's own rights alone.", seen.For);
+    Assert.Equal("It ran as Registrar, Registrar's own account.", seen.RanAs);
+    Assert.StartsWith("Brightwater Castings, assessed as medium risk: The only caster of this alloy nearby, and a large order.", seen.Brief);
+    // When, and how long.
+    Assert.Equal("2 Sep 2031, 08:00", seen.Started);
+    Assert.Equal("5 Sep 2031, 08:00", seen.EndedAt);
+    Assert.Equal("3 days", seen.Lasted);
+    // What it may do: its one tool is proposed to a person, every time.
+    Assert.Equal("Approve the supplier", seen.Tools.Single().Label);
+    Assert.Equal(Leave.ProposeEveryTime, seen.Tools.Single().Leave);
+    Assert.Equal("changes the app's data", seen.Tools.Single().Does);
+    // What it proposed, and who decided.
+    var proposal = seen.Proposals.Single();
+    Assert.Equal("Approve the supplier", proposal.Label);
+    Assert.Equal(["Brightwater Castings", "45", "Audit within a year."], proposal.Shown.Select(l => l.Value).ToList());
+    Assert.Equal("It is a medium risk with its documents in order, so it is paid in 45 days and audited within a year.", proposal.Why);
+    Assert.Equal("Mara Oyelaran", proposal.PutTo);
+    Assert.Equal("Approved by Mara Oyelaran on 5 Sep 2031, 08:00 after 3 days, and it ran as them.", proposal.Decided);
+    // The steps, in order — the wait says how long it lasted.
+    Assert.Equal(["Started", "ModelCall", "ToolCall", "Waiting", "Decided", "ModelCall", "Ended"], seen.Steps.Select(s => s.Kind.Name).ToList());
+    var waited = seen.Steps.Single(s => s.Kind == TraceKind.Waiting);
+    Assert.Equal("It waits for a decision from Mara Oyelaran.", waited.Said);
+    Assert.Equal("3 days", waited.Took);
+    Assert.Equal("person", waited.Group);
+    // A tool's arguments are read as a person reads them; a model call says which model, why, and what it cost.
+    var asked = seen.Steps.First(s => s.Kind == TraceKind.ToolCall);
+    Assert.Equal("Approve the supplier", asked.Tool);
+    Assert.Equal(["supplier: Brightwater Castings", "paymentDays: 45", "conditions: Audit within a year."], asked.Given.Select(g => g.Name + ": " + g.Value).ToList());
+    var call = seen.Steps.First(s => s.Kind == TraceKind.ModelCall);
+    Assert.Equal("Small", call.Model);
+    Assert.Equal("$0.0010", call.Cost);
+    Assert.Equal("It is a medium risk with its documents in order, so it is paid in 45 days and audited within a year.", call.Content);
+    Assert.Equal("/work/" + step.Id.ToString() + "/" + call.Seq.ToString(), call.Href);
+    // What it cost in all, against what it may; and what it was charged to.
+    Assert.Equal("$0.0019", seen.Spent);
+    Assert.Equal("$0.05", seen.Limit);
+    Assert.Equal(3, seen.Percent);
+    Assert.Contains("the run of qualification it is a step of", seen.ChargedTo);
+    // What it had been told, and whether its record still checks.
+    Assert.Equal("It ran before anybody had taught Registrar anything.", seen.RanWith);
+    Assert.True(seen.Intact);
+    Assert.Equal("All 7 lines of its record are as they were written.", seen.Record);
+    Assert.Equal(0, seen.Erasures.Count);
+    Assert.Equal(1, seen.Tree.Count);
+
+    // Work that handed a piece on shows the tree, and every piece's steps in the one record.
+    var screening = InspectAgentWork(StepAt(supplier, "Screening").Id)!;
+    Assert.Equal(["Screener, check documents", "Insurance reader, read insurance"], screening.Tree.Select(p => p.Name + ", " + p.Skill).ToList());
+    Assert.Equal([0, 1], screening.Tree.Select(p => p.Depth).ToList());
+    Assert.True(screening.Tree[0].This);
+    Assert.Contains("HandedOn", screening.Steps.Select(s => s.Kind.Name).ToList());
+    Assert.Contains("CameBack", screening.Steps.Select(s => s.Kind.Name).ToList());
+    Assert.Equal(["Screener", "Insurance reader"], screening.Steps.Select(s => s.By).Distinct().ToList());
+    Assert.True(screening.Intact);
+  }
+}
+
+[Test(Halden)]
+void a_step_that_failed_is_told_with_each_attempt_and_why() {
+  var supplier = TheBrightwaterCase();
+  runas (Edda) {
+    var last = StepAt(supplier, "Assessing");
+    var seen = InspectAgentWork(last.Id)!;
+    Assert.Equal(AgentTaskStatus.Failed, seen.Status);
+    Assert.Equal(2, seen.Attempt);
+    Assert.StartsWith("The model could not be reached:", seen.Outcome);
+    Assert.Equal("Done for Jonas Brandt: never past what they may do themselves.", seen.For);
+    Assert.Equal("Given by a process: nobody was signed in.", seen.GivenBy);
+    Assert.True(seen.Steps.Last().Problem);
+    Assert.Equal("$0.00", seen.Spent);
+  }
+}
+
+[Test(Halden)]
+void the_inspector_shows_each_reader_what_is_theirs_to_read() {
+  var supplier = TheBrightwaterCase();
+  Guid screening = Guid.Empty;
+  Guid deciding = Guid.Empty;
+  runas (Mara) { screening = StepAt(supplier, "Screening").Id; deciding = StepAt(supplier, "Deciding").Id; }
+  // Jonas: the screening was done for him, so he reads it with what it said. The registrar's work was for nobody.
+  runas (Jonas) {
+    var mine = InspectAgentWork(screening)!;
+    Assert.False(mine.Steps.Any(s => s.Kept));
+    Assert.Equal(["supplier: Brightwater Castings"], mine.Steps.First(s => s.Kind == TraceKind.ToolCall).Given.Select(g => g.Name + ": " + g.Value).ToList());
+    Assert.Null(InspectAgentWork(deciding));
+  }
+  // Mara supervises: she reads that each step happened, and not what it said.
+  runas (Mara) {
+    var seen = InspectAgentWork(screening)!;
+    Assert.Equal(AgentTaskStatus.Done, seen.Status);
+    Assert.True(seen.Steps.Where(s => s.Kind == TraceKind.ToolCall).All(s => s.Kept));
+    Assert.Equal(0, seen.Steps.First(s => s.Kind == TraceKind.ToolCall).Given.Count);
+    Assert.Equal("", seen.Brief);
+    Assert.True(seen.Intact);
+  }
+  // Rafi has no business in the office: nothing is his.
+  runas (Rafi) {
+    Assert.Null(InspectAgentWork(screening));
+    Assert.Null(InspectAgentWork(deciding));
+    Assert.Null(ProcessRunOfWork(screening));
+  }
+}
+
+[Test(Halden)]
+void what_was_erased_is_shown_as_erased_and_the_record_still_checks() {
+  var supplier = TheBrightwaterCase();
+  Guid screening = Guid.Empty;
+  runas (Mara) { screening = StepAt(supplier, "Screening").Id; }
+  TestClock.Advance(TimeSpan.FromDays(40));
+  runas (Tilde) {
+    EraseAgentWorkContent(AgentTask.Single(t => t.Id == screening), "Kept thirty days.");
+    UnitOfWork.Commit();
+  }
+  runas (Edda) {
+    var seen = InspectAgentWork(screening)!;
+    Assert.True(seen.Intact);
+    Assert.Equal("What it said was erased on 15 Oct 2031, 08:00: Kept thirty days.", seen.Erasures[0]);
+    Assert.Equal("", seen.Result);
+    Assert.Equal("", seen.Brief);
+    var call = seen.Steps.First(s => s.Kind == TraceKind.ToolCall);
+    Assert.True(call.Erased);
+    Assert.Equal(0, call.Given.Count);
+    // What happened, in what order and at what cost, is all still there.
+    Assert.Equal(["Started", "ModelCall", "ToolCall", "ToolResult", "ModelCall", "HandedOn"], seen.Steps.Select(s => s.Kind.Name).Take(6).ToList());
+    Assert.Equal("Ended", seen.Steps.Last().Kind.Name);
+    Assert.Equal("$0.0006", seen.Steps.First(s => s.Kind == TraceKind.ModelCall).Cost);
+  }
+}
+
+[Test(Halden)]
+void what_the_agent_has_been_told_since_is_set_apart_from_what_it_ran_with() {
+  var supplier = TheBrightwaterCase();
+  runas (Edda) {
+    var step = StepAt(supplier, "Deciding");
+    var told = ProposeAgentInstruction(new InstructionDraft {
+      Agent = step.Agent, Skill = step.Skill, Guidance = "A supplier with a single site is audited within six months.", Why = "One fire stops the line.",
+    });
+    ActivateAgentInstruction(told, "Agreed with the lead.");
+    UnitOfWork.Commit();
+    var seen = InspectAgentWork(step.Id)!;
+    Assert.Equal("It ran before anybody had taught Registrar anything. Since then 1 has been made active that it had not been sent.", seen.RanWith);
+    Assert.Equal(0, seen.Sent.Count);
+    Assert.Equal(["A supplier with a single site is audited within six months."], seen.Since);
+  }
+}

@@ -1,0 +1,70 @@
+// What the bridge draws: an agent's piece of work opened in place on a run's page, the table of a run's agent work
+// under its history, and — on the work's own page — the run it is a step of.
+namespace Osysharp.Agents.Processes;
+
+using Osysharp.Agents;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.Ui;
+
+Tone ToneOfStep(AgentTaskStatus status) {
+  return status == AgentTaskStatus.Done ? Tone.Success : status == AgentTaskStatus.Failed ? Tone.Danger
+       : status == AgentTaskStatus.Waiting ? Tone.Warning : status == AgentTaskStatus.Working ? Tone.Primary : Tone.Ghost;
+}
+
+/// A line of a run that is about an agent's piece of work opens as the whole inspector, in place.
+[Contribution("Agent step")]
+component AgentStepOpened(string kind, Guid subject) : ProcessMomentPanel {
+  render {
+    if (kind == AgentWorkSubject()) { WorkInspector(subject, embedded: true); }
+  }
+}
+
+/// The agent work given in a run, with what each piece cost — under the run's history.
+[Contribution("Agent work", Order = 20)]
+component AgentWorkOfRun(Guid run) : ProcessRunPanel {
+  AgentStepsOfRun? steps = null;
+  action Load() { try { steps = AgentWorkInRun(run); } catch (Exception ex) { steps = null; } }
+  on mount { Load(); }
+  render {
+    if (steps != null && steps.Steps.Count > 0) {
+      Stack(gap: 2, label: "Agent work") {
+        Row(gap: 3, align: Align.Baseline, wrap: Wrapping.Wrap) {
+          Text("Agent work in this run", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          Spacer();
+          Text(steps.Cost + " in all", fontSize: FontSize.Label, color: Colors.TextSecondary, fontFamily: Font.Mono);
+        }
+        Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg) {
+          foreach (var s in steps.Steps) {
+            Row(gap: 4, px: 4, py: 3, align: Align.Start, wrap: Wrapping.Wrap, label: s.Name + ", " + s.Skill) {
+              Stack(gap: 1, grow: 1, minW: "min(100%, 16rem)") {
+                if (s.Href != "") { TextLink(s.Name + ", " + s.Skill, to: s.Href); }
+                if (s.Href == "") { Text(s.Name + ", " + s.Skill, fontSize: FontSize.Body, fontWeight: FontWeight.Medium); }
+                Text("Given at " + s.State + (s.HandedOn > 0 ? " · handed on " + s.HandedOn.ToString() + (s.HandedOn == 1 ? " piece" : " pieces") : ""), fontSize: FontSize.Caption, color: Colors.TextMuted);
+              }
+              Badge(s.Status.Label, tone: ToneOfStep(s.Status));
+              Text(s.Cost, fontSize: FontSize.Label, color: Colors.TextSecondary, fontFamily: Font.Mono, minW: "5rem", textAlign: TextAlign.Right);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// On a piece of work's own page: the run it is a step of, and the way to it.
+[Contribution("Process run")]
+component RunOfThisWork(Guid task) : AgentWorkOrigin {
+  RunOfWork? run = null;
+  action Load() { try { run = ProcessRunOfWork(task); } catch (Exception ex) { run = null; } }
+  on mount { Load(); }
+  render {
+    if (run != null) {
+      Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap, label: "Its process run") {
+        if (run.Href != "") { TextLink(run.Title == "" ? "Open the run" : "Open the run: " + run.Title, to: run.Href); }
+        if (run.Href == "" && run.Title != "") { Text(run.Title, fontSize: FontSize.Body, fontWeight: FontWeight.Medium); }
+        Text(run.Process + (run.StateLabel == "" ? "" : (run.Status == ProcessStatus.Running ? ", now at " : ", ended at ") + run.StateLabel), fontSize: FontSize.Label, color: Colors.TextMuted);
+      }
+    }
+  }
+}

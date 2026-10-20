@@ -1,0 +1,343 @@
+// Halden Tools' procurement office: buyers ask for a supplier to be qualified; three agents do the paperwork — a
+// screener, an assessor and a registrar; the risk officer steps in when the assessor cannot; and the procurement
+// lead, who answers for the agents, decides what the registrar proposes.
+namespace Procurement;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Teaching;
+using Osysharp.Workflow;
+using Osysharp.Processes;
+
+[Role] enum OfficeRole { Authenticator, Buyer, Lead, RiskOfficer, Warehouse, Screening, Assessing, Registering, Records, Insurance }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsBuyer       => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Buyer);
+policy IsLead        => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Lead);
+policy IsRiskOfficer => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.RiskOfficer);
+policy IsScreening   => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Screening);
+policy IsAssessing   => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Assessing);
+policy IsRegistering => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Registering);
+policy IsRecords     => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Records);
+policy IsOffice      => IsBuyer || IsLead || IsRiskOfficer;
+policy IsInsurance   => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Insurance);
+policy IsAnAgent     => IsScreening || IsAssessing || IsRegistering || IsInsurance;
+
+// Agents: the office gives them work; the lead answers for them; the risk officer audits them and teaches them —
+// she reads every run with what it said, which is what teaching needs. The lead reads that each step happened.
+policy UsesAgents       => IsOffice;
+policy SupervisesAgents => IsLead;
+policy AuditsAgents     => IsRiskOfficer;
+policy TeachesAgents    => IsRiskOfficer;
+// The records clerk erases what a piece of work said when its time is up.
+policy ErasesAgentRecords => IsRecords;
+// Processes: the office follows them. What the model costs is the lead's to read and to limit.
+policy FollowsProcesses  => IsOffice;
+policy ReadsModelUsage   => IsLead;
+policy ManagesModelSpend => IsLead;
+
+/// Somebody at Halden Tools — and the agents' own accounts.
+entity Person : Principal {
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+  }
+}
+
+public enum SupplierStage {
+  [Label("Checking documents")] Screening,
+  [Label("Assessing risk")] Assessing,
+  [Label("Assessed by hand")] ByHand,
+  [Label("Settling terms")] Deciding,
+  Approved,
+  [Label("Documents missing")] Incomplete,
+  Declined,
+  Withdrawn,
+}
+
+public enum RiskLevel { Low, Medium, High }
+
+/// A company that wants to supply Halden Tools.
+entity Supplier {
+  [Required, Unique, MaxLength(120)] string Name;
+  [MaxLength(120)] string Supplies = "";
+  /// What we plan to spend with it in a year, in euros.
+  decimal PlannedSpend = 0;
+  /// What its insurer covers it for, in euros, as its certificate says.
+  decimal InsuredFor = 0;
+  /// The buyer who asked for it to be qualified.
+  [Required] Person RequestedBy;
+  SupplierStage Stage = SupplierStage.Screening;
+  /// What screening found missing; what the assessment found.
+  [MaxLength(400)] string Missing = "";
+  RiskLevel? Risk;
+  [MaxLength(600)] string RiskWhy = "";
+  /// Approved to trade, and on what terms. The lead approves a supplier, and so may the registrar's own account —
+  /// which proposes it to the lead first.
+  bool Approved = false;
+  int PaymentDays = 0;
+  [MaxLength(400)] string Conditions = "";
+  [MaxLength(400)] string Note = "";
+  security {
+    allow read, create, update when IsOffice || IsAnAgent;
+    deny update Approved, PaymentDays, Conditions when !IsLead && !IsRegistering;
+  }
+}
+
+/// A document a supplier has sent in.
+entity SupplierDocument {
+  [Required] Supplier Supplier;
+  [Required, MaxLength(80)] string Kind;
+  security { allow read when IsOffice || IsAnAgent; allow create when IsOffice; }
+}
+
+// ── what can be done for a supplier ─────────────────────────────────────────────────────────────────────────────────
+
+/// The documents a supplier has sent in, by what each is.
+[Action("List the supplier's documents", Query)]
+public List<string> DocumentsOf(Supplier supplier) {
+  return SupplierDocument.Where(d => d.Supplier == supplier).OrderBy(d => d.Kind).ToList().Select(d => d.Kind).ToList();
+}
+
+/// Write down a document the supplier still owes.
+[Action("Note a missing document")]
+public string NoteMissing(Supplier supplier, string what) {
+  supplier.Missing = supplier.Missing == "" ? what : supplier.Missing + ", " + what;
+  return "Noted: " + what + ".";
+}
+
+/// What the supplier's insurance certificate covers it for, in euros.
+[Action("Read the insured sum", Query)]
+public decimal InsuredSum(Supplier supplier) { return supplier.InsuredFor; }
+
+/// What we plan to spend with the supplier in a year, in euros.
+[Action("Look up the planned spend", Query)]
+public decimal PlannedSpendWith(Supplier supplier) { return supplier.PlannedSpend; }
+
+/// Approve the supplier to trade, on a payment term and with conditions.
+[Action("Approve the supplier")]
+public string ApproveSupplier(Supplier supplier, int paymentDays, string conditions) {
+  supplier.Approved = true;
+  supplier.PaymentDays = paymentDays;
+  supplier.Conditions = conditions;
+  return $"{supplier.Name} is approved, paid in {paymentDays} days.";
+}
+
+/// The supplier a tool's arguments name, by the name people know it by.
+string SupplierNamed(string value) {
+  var s = Supplier.FirstOrDefault(x => x.Id == Guid.Parse(value));
+  return s == null ? value : s!.Name;
+}
+
+// ── what the agents hand back ───────────────────────────────────────────────────────────────────────────────────────
+
+/// What the screener hands back.
+public class DocumentCheck {
+  /// Every document the office asks for is there.
+  public bool Complete;
+  /// What is missing, when something is.
+  public List<string> Missing = [];
+}
+
+/// What the insurance reader hands back.
+public class InsuranceFinding {
+  /// The cover is at least what we plan to spend in a year.
+  public bool Enough;
+  public string Says = "";
+}
+
+/// What the assessor hands back.
+public class RiskAssessment {
+  public RiskLevel Level;
+  /// Why, in a sentence.
+  public string Why = "";
+}
+
+/// What the registrar hands back.
+public class Terms {
+  public int PaymentDays;
+  public string Conditions = "";
+}
+
+// ── the skills and the agents ───────────────────────────────────────────────────────────────────────────────────────
+
+/// Checks that a supplier has sent in what the office asks for.
+public class CheckDocuments : Skill<Supplier, DocumentCheck> {
+  public override string Description => "Check that the supplier has sent every document the office asks for.";
+  public override string Instructions => "The office asks for a certificate of incorporation, a quality certificate and proof of insurance. Note each one that is missing.";
+  public override List<ActionInfo> Tools => [Actions.Of(DocumentsOf), Actions.Of(NoteMissing)];
+  public override string Brief(Supplier s) => $"{s.Name}, which supplies {s.Supplies}. Its id is {s.Id}.";
+  public override string Names(string action, string argument, string value) => argument == "supplier" ? SupplierNamed(value) : value;
+}
+
+/// Reads a supplier's insurance certificate — a piece of the screening, handed on to the agent that knows insurance.
+public class ReadInsurance : Skill<Supplier, InsuranceFinding> {
+  public override string Description => "Read the supplier's insurance certificate and say whether the cover is enough.";
+  public override List<ActionInfo> Tools => [Actions.Of(InsuredSum), Actions.Of(PlannedSpendWith)];
+  public override string Brief(Supplier s) => $"{s.Name}. Its id is {s.Id}.";
+  public override string Names(string action, string argument, string value) => argument == "supplier" ? SupplierNamed(value) : value;
+  // Handed on by another agent, the supplier is named by its id.
+  public override string HandedSchema() => HandOn.ById("The supplier whose certificate is read.");
+  public override Supplier Handed(string inputJson) {
+    var id = HandOn.IdIn(inputJson);
+    return Supplier.Single(s => s.Id == id);
+  }
+}
+
+/// Weighs how much depends on a supplier.
+public class AssessRisk : Skill<Supplier, RiskAssessment> {
+  public override string Description => "Assess the risk of depending on this supplier.";
+  public override string Instructions => "Look up the planned spend first. Over 250,000 euros a year is at least medium risk.";
+  public override List<ActionInfo> Tools => [Actions.Of(PlannedSpendWith)];
+  public override string Brief(Supplier s) => $"{s.Name}, which supplies {s.Supplies}. Its id is {s.Id}.";
+  public override string Names(string action, string argument, string value) => argument == "supplier" ? SupplierNamed(value) : value;
+  // A model that cannot be reached is tried once more before the work gives up.
+  public override RetryRule Retry => new RetryRule { Attempts = 2 };
+}
+
+/// Settles the terms a supplier is approved on.
+public class SettleTerms : Skill<Supplier, Terms> {
+  public override string Description => "Settle the terms this supplier is approved on, and approve it.";
+  public override string Instructions => "A medium risk is paid in 45 days and audited within a year. Approve the supplier on those terms.";
+  public override List<ActionInfo> Tools => [Actions.Of(ApproveSupplier)];
+  public override string Brief(Supplier s) => $"{s.Name}, assessed as {(s.Risk == null ? "unknown" : s.Risk!.ToString().ToLower())} risk: {s.RiskWhy} Its id is {s.Id}.";
+  public override string Names(string action, string argument, string value) => argument == "supplier" ? SupplierNamed(value) : value;
+}
+
+/// Checks the paperwork. It notes what is missing by itself, and hands the insurance certificate to the agent that
+/// reads those.
+[Actor(Roles = [OfficeRole.Screening])]
+public class Screener : Agent {
+  public static Person Principal => new Person { Email = "screener@haldentools.example", DisplayName = "Screener" };
+  public override string Purpose => "You check the paperwork of companies that want to supply Halden Tools.";
+  public override List<SkillBase> Skills => [new CheckDocuments()];
+  public override Permits May => Permits.ChangesAlone();
+  public override Delegation Delegates => new Delegation { To = [Specialist.Of<InsuranceReader>(new ReadInsurance(), budget: 0.01m)] };
+}
+
+/// Reads insurance certificates. It only reads.
+[Actor(Roles = [OfficeRole.Insurance])]
+public class InsuranceReader : Agent {
+  public static Person Principal => new Person { Email = "insurance@haldentools.example", DisplayName = "Insurance reader" };
+  public override string Purpose => "You read the insurance certificates of Halden Tools' suppliers.";
+  public override List<SkillBase> Skills => [new ReadInsurance()];
+}
+
+/// Weighs the risk. It only reads.
+[Actor(Roles = [OfficeRole.Assessing])]
+public class Assessor : Agent {
+  public static Person Principal => new Person { Email = "assessor@haldentools.example", DisplayName = "Assessor" };
+  public override string Purpose => "You assess the risk of depending on a supplier of Halden Tools.";
+  public override List<SkillBase> Skills => [new AssessRisk()];
+}
+
+/// Settles the terms. Approving a supplier is proposed to a person, every time.
+[Actor(Roles = [OfficeRole.Registering])]
+public class Registrar : Agent {
+  public static Person Principal => new Person { Email = "registrar@haldentools.example", DisplayName = "Registrar" };
+  public override string Purpose => "You settle the terms on which Halden Tools approves a supplier.";
+  public override List<SkillBase> Skills => [new SettleTerms()];
+  public override Permits May => new Permits { ProposeEveryTime = [Actions.Of(ApproveSupplier)] };
+}
+
+// ── the process ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ QUALIFYING A SUPPLIER. Three steps are agents' work — each an ordinary call that answers what its skill
+/// promises, however long it waited on a person — and one is a person's, taken when an agent could not.
+workflow Qualification {
+  Tracks = Supplier.Stage; Autostart = false; Initial = Screening;
+  /// The risk officer's own assessment.
+  event Assessed(RiskLevel level, string why);
+  /// The buyer no longer needs the supplier.
+  event Withdraw();
+
+  state Screening {
+    enter {
+      var check = await Agents.Of<Screener>().For(this.Item.RequestedBy).Do(new CheckDocuments(), this.Item, about: "Documents of " + this.Item.Name);
+      if (check.Done && !check.Result.Complete) { goto Incomplete; }
+      if (!check.Done) { Processes.Problem("The documents could not be checked, so the assessment goes ahead without: " + check.Problem); }
+      goto Assessing;
+    }
+  }
+  state Assessing {
+    enter {
+      var risk = await Agents.Of<Assessor>().For(this.Item.RequestedBy).Do(new AssessRisk(), this.Item, about: "Risk of " + this.Item.Name);
+      if (!risk.Done) {
+        // The assessor gave up. The process does not: the risk officer assesses this one by hand.
+        Processes.Problem("The assessor could not finish, so the risk officer assesses this supplier by hand.");
+        goto ByHand;
+      }
+      this.Item.Risk = risk.Result.Level;
+      this.Item.RiskWhy = risk.Result.Why;
+      goto Deciding;
+    }
+  }
+  state ByHand {
+    subscribe Assessed(RiskLevel level, string why);
+    enter { Processes.Waiting("Waiting for the risk officer's assessment."); }
+    on Assessed(RiskLevel level, string why) {
+      default {
+        this.Item.Risk = level;
+        this.Item.RiskWhy = why;
+        goto Deciding;
+      }
+    }
+  }
+  state Deciding {
+    enter {
+      // Nobody is named here: the registrar's proposal goes to whoever answers for it — the procurement lead.
+      var terms = await Agents.Of<Registrar>().Do(new SettleTerms(), this.Item, about: "Terms for " + this.Item.Name);
+      if (terms.Done && ApprovedNow(this.Item.Id)) { goto Approved; }
+      this.Item.Note = terms.Done ? "The terms were not accepted." : "No terms were settled: " + terms.Problem;
+      goto Declined;
+    }
+  }
+  on Withdraw { goto Withdrawn; }
+
+  terminal success Approved   { }
+  terminal cancel  Incomplete { Message = "documents are missing"; }
+  terminal cancel  Declined   { Message = "the supplier was not approved"; }
+  terminal cancel  Withdrawn  { Message = "the buyer withdrew the request"; }
+}
+
+/// Whether the supplier is approved, as it is stored now — after whatever a person decided meanwhile.
+[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+internal bool ApprovedNow(Guid id) { return Supplier.Single(s => s.Id == id).Approved; }
+
+/// The qualification of a supplier, for the people who follow it.
+public class SupplierQualification : Process<Supplier> {
+  public override string Name => "Supplier qualification";
+  public override string Workflow => "Qualification";
+  public override string Purpose => "From a buyer's request to a supplier approved on terms.";
+  public override WorkflowGraph Graph => Qualification.Graph;
+  public override TimeSpan? StuckAfter => TimeSpan.FromDays(7);
+  public override string TitleOf(Supplier s) => s.Name;
+  public override List<WorkflowAuditEntry> HistoryOf(Supplier s) => Qualification.For(s).Audit;
+}
+
+// ── what the office does ────────────────────────────────────────────────────────────────────────────────────────────
+
+/// A buyer asks for a supplier to be qualified.
+public Supplier Qualify(string name, string supplies, decimal plannedSpend, decimal insuredFor = 500000) {
+  var mine = Security.CurrentUserId;
+  var me = Person.Single(p => p.Id == mine);
+  var supplier = new Supplier { Name = name, Supplies = supplies, PlannedSpend = plannedSpend, InsuredFor = insuredFor, RequestedBy = me };
+  UnitOfWork.Commit();
+  Workflow.Run(supplier);
+  return supplier;
+}
+
+/// The risk officer assesses a supplier by hand.
+public void AssessByHand(Supplier supplier, RiskLevel level, string why) { Qualification.RaiseAssessed(supplier, level, why); }
+
+/// The buyer no longer needs the supplier.
+public void WithdrawRequest(Supplier supplier) { Qualification.RaiseWithdraw(supplier); }
+
+/// Something the office was told, so a test can read what happened.
+entity Heard {
+  [Required, MaxLength(40)] string What;
+  [MaxLength(4000)] string About = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}

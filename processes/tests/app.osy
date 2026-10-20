@@ -1,0 +1,22 @@
+// The producer's test project for Osysharp.Agents.Processes — the procurement office of a tool maker, qualifying a
+// new supplier. One case, walked from end to end: a buyer asks for a casting supplier to be qualified; a screener
+// checks its documents; an assessor is to weigh the risk and cannot — its model is down, twice — so the process
+// hands the assessment to the risk officer; a registrar then proposes to approve the supplier on terms, and waits
+// three days for the procurement lead to say yes. The run, and each piece of the agents' work, is then opened and
+// read. No model is ever called: the one model is scripted, and answers by which agent it is asked as.
+app Procurement {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Agents@1;
+  use Osysharp.Agents.Testing@1;
+  use Osysharp.Agents.Inspector@1;
+  use Osysharp.Agents.Teaching@1;
+  use Osysharp.Agents.Processes@1;
+  use Osysharp.Processes@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.Diagrams@0;
+  use Osysharp.Ui;
+}

@@ -1,0 +1,21 @@
+// The office's agents, its model, its one process and where its pages are. In a file of its own with no
+// `namespace`, because an `app.X = …` statement's value is resolved outside the file's namespace.
+using Osysharp.Agents;
+using Osysharp.Agents.Inspector;
+using Osysharp.Llm;
+using Osysharp.Processes;
+using Procurement;
+
+app.Llm = new LlmSetup {
+  Models = [
+    new LlmModel { Name = "Small", Client = new ScriptedModel { Name = "Small" }, Model = "scripted-small",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000 },
+  ],
+  Default = "Small",
+};
+
+app.Agents = new AgentsSetup { Agents = [new Screener(), new InsuranceReader(), new Assessor(), new Registrar()], TaskBudget = 0.05m };
+
+app.Processes = new ProcessesSetup { Processes = [new SupplierQualification()], RunPage = "/qualifications/{run}" };
+
+app.AgentInspector = new AgentInspectorSetup { WorkPage = "/work/{task}/{step}" };
