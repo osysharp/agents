@@ -1,0 +1,297 @@
+// Osysharp.Agents — asking for help: an agent that names a model to consult may ask it one focused question; work that
+// is stuck asks once before it gives up; a decision it is not sure of is asked again. The stronger model advises and
+// nothing more — it is given no tools — and every request is on the receipt, the record and the meter.
+//
+// The numbers. The stronger model costs $10 a million tokens in and $50 out: advice of 200 in and 50 out costs 4500
+// millionths of a dollar, and reserves a little over 50000 before it leaves.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Packhouse;
+
+// ── the model doing the work chooses to ask ─────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void a_model_may_ask_the_one_its_agent_consults_and_is_given_the_advice() {
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Consult("Is a crate of 9.8 kg short?", "The rule: a crate under 10 kg is short."),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true }))
+      .Advises("Strong", "Yes. Under 10 kg is short: flag it and say so.");
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+    var outcome = InspectCarefully(crate);
+    task = outcome.Task;
+
+    Assert.True(outcome.Done);
+    // The stronger model was asked the question with the context given — not the conversation — and offered no tools.
+    var strong = Heard.Single(h => h.What == "asked:Strong").About;
+    Assert.Equal("0 tools | Is a crate of 9.8 kg short?\n\nWhat I have to go on:\nThe rule: a crate under 10 kg is short.", strong);
+    // Its advice came back to the model doing the work, as what its `consult` answered.
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About == "\"Yes. Under 10 kg is short: flag it and say so.\""));
+    // The model doing the work was offered `consult` beside its tools; it stayed the one holding them.
+    Assert.StartsWith("5 tools", Heard.First(h => h.What == "asked:Small").About);
+
+    // On the receipt: three model calls, the advice among them — 200 + 4500 + 200.
+    Assert.Equal(["Small", "Strong", "Small"], Trajectory.Models(task));
+    Assert.Equal(4900, outcome.CostMicros);
+    Assert.Equal(4900, AgentTask.Single().SpentMicros);
+    Assert.Equal(3, AgentTask.Single().ModelCalls);
+    // On the record: that it asked, whom, why, and what it cost.
+    Assert.Contains("It asked Strong for help because it chose to; the advice cost $0.0045.", Trajectory.Said(task));
+    // And as a request for help of its own: who was asked, what, and what came back.
+    var help = AgentHelp.Single();
+    Assert.Equal(HelpFrom.Model, help.From);
+    Assert.Equal(HelpReason.Chosen, help.Why);
+    Assert.Equal("Strong", help.AskedModel);
+    Assert.Equal(HelpStatus.Answered, help.Status);
+    Assert.Equal("Is a crate of 9.8 kg short?", help.Question);
+    Assert.Equal("The rule: a crate under 10 kg is short.", help.Context);
+    Assert.Equal("Yes. Under 10 kg is short: flag it and say so.", help.Answer);
+    Assert.Equal(4500, help.CostMicros);
+    Assert.Equal(task, help.Task!.Id);
+    Assert.Equal(help.Id, TraceEvent.Single(e => e.Kind == TraceKind.AskedForHelp).Help!.Id);
+  }
+  Background.Settle();
+  // On the meter: an ordinary call, charged to the same piece of work, as a consult.
+  runas (Dana) {
+    var row = ModelCall.Single(c => c.Model == "Strong");
+    Assert.Equal(ModelCallOutcome.Served, row.Outcome);
+    Assert.Equal("consult", row.Purpose);
+    Assert.Equal(4500, row.CostMicros);
+    Assert.Contains("task:" + task.ToString(), row.Scopes);
+    Assert.Contains("agent:Packhouse.Sorter", row.Scopes);
+    // The facts the router was given say which step of the work it was: a consult (the ninth step the model kit names).
+    Assert.Contains("\"Step\":9", JsonSerializer.Serialize(row.Facts));
+    Assert.Equal(0.0049m, SpentOn("task:" + task.ToString()));
+    Assert.Equal(1, Heard.Count(h => h.What == "help" && h.About == "Strong Chosen"));
+  }
+}
+
+// ── stuck ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void work_that_is_stuck_consults_once_and_goes_on() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.HandBack(new Grade { Score = 14 }),
+    Says.HandBack(new Grade { Score = -1 }),
+    Says.HandBack(new Grade { Score = 9, Finding = "Sound." }))
+    .Advises("Strong", "A score runs from 0 to 10. Nine suits a sound crate.");
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+  var outcome = InspectCarefully(crate);
+
+  // Two results in a row were sent back; it asked, was advised, and the third fitted.
+  Assert.True(outcome.Done);
+  Assert.Equal(9, outcome.Result.Score);
+  Assert.Equal(1, Trajectory.Helps(outcome.Task));
+  var help = AgentHelp.Single();
+  Assert.Equal(HelpReason.Stuck, help.Why);
+  Assert.Contains("What went wrong last:\nA score is from 0 to 10.", help.Context);
+  Assert.Contains("Grade one crate of fruit.", help.Context);
+  Assert.Contains("It asked Strong for help because it was stuck; the advice cost $0.0045.", Trajectory.Said(outcome.Task));
+  // The advice reached the model doing the work before its next turn.
+  Assert.Equal(1, Heard.Count(h => h.What == "advice" && h.About.Contains("A score runs from 0 to 10.")));
+  // The stronger model was given no tools.
+  Assert.StartsWith("0 tools", Heard.Single(h => h.What == "asked:Strong").About);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void work_that_is_stuck_again_after_asking_fails() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.HandBack(new Grade { Score = 14 }), Says.HandBack(new Grade { Score = -1 }),
+    Says.HandBack(new Grade { Score = 15 }), Says.HandBack(new Grade { Score = -2 }),
+    Says.HandBack(new Grade { Score = 5 }))
+    .Advises("Strong", "A score runs from 0 to 10.");
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = InspectCarefully(crate);
+
+  Assert.Equal(AgentTaskStatus.Failed, outcome.Status);
+  Assert.Equal("It could not finish: A score is from 0 to 10.", outcome.Problem);
+  // It asked once, not every time.
+  Assert.Equal(1, AgentHelp.Count());
+  Assert.Equal(4, AgentTask.Single().Turns);
+}
+
+// ── when help does not come ─────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void a_consult_the_budget_has_no_room_for_is_refused_and_the_work_is_told() {
+  // The sorter's work may spend 0.10. The first turn costs 60500, and advice would reserve over 50000 more.
+  var crate = Crate.Single(c => c.Code == "A-2");
+  var script = AgentScript.Of(
+    Says.Consult("Is a crate of 9.8 kg short?", "Under 10 kg is short.", 60000, 100),
+    Says.HandBack(new Grade { Score = 4, Short = true }))
+    .Advises("Strong", "Never said.");
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+  var outcome = InspectCarefully(crate);
+
+  // Nothing was sent to the stronger model; the model doing the work was told why, and finished without it.
+  Assert.Equal(0, Heard.Count(h => h.What == "asked:Strong"));
+  Assert.True(outcome.Done);
+  Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.StartsWith("error: \"There was no room in the budget to consult Strong")));
+  var help = AgentHelp.Single();
+  Assert.Equal(HelpStatus.Refused, help.Status);
+  Assert.Equal(0, help.CostMicros);
+  Assert.True(Trajectory.Said(outcome.Task).Any(s => s.StartsWith("It asked Strong for help because it chose to, and got none: There was no room in the budget")));
+  Assert.Equal(60700, AgentTask.Single().SpentMicros);
+}
+
+[Test(Yard)]
+void a_consult_is_never_stepped_down_to_another_model() {
+  // The lead puts a budget on the stronger model that says: step down when there is no room.
+  runas (Dana) { SetBudget("model", "Strong", LlmBudgetWindow.Day, 0.001m, LlmOnLimit.StepDown); UnitOfWork.Commit(); }
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(Says.Consult("Is it short?", "It weighs 9.8 kg."), Says.HandBack(new Grade { Score = 4 }))
+      .Advises("Strong", "Never said.").Advises("Small", "Advice from the wrong model.");
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+    InspectCarefully(crate);
+
+    // The consult was refused — not handed to the everyday model in the stronger one's place.
+    Assert.Equal(HelpStatus.Refused, AgentHelp.Single().Status);
+    Assert.Equal(0, Heard.Count(h => h.What.StartsWith("asked:") && h.About.StartsWith("0 tools")));
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_model_that_cannot_be_reached_gives_no_help_and_the_work_goes_on() {
+  var crate = Crate.Single(c => c.Code == "A-2");
+  var script = AgentScript.Of(Says.Consult("Is it short?", "It weighs 9.8 kg."), Says.HandBack(new Grade { Score = 4 })).IsDown("Strong");
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = InspectCarefully(crate);
+
+  Assert.True(outcome.Done);
+  var help = AgentHelp.Single();
+  Assert.Equal(HelpStatus.Unavailable, help.Status);
+  Assert.Equal("Strong could not be reached: Strong is down.", help.Answer);
+}
+
+// ── nobody to ask ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void an_agent_that_names_nobody_to_consult_never_sends_anything_to_another_model() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Consult("Is it short?", "It weighs 12.5 kg."),
+    Says.HandBack(new Grade { Score = 14 }))
+    .Advises("Strong", "Never said.");
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+  var outcome = Inspect(crate);
+
+  // The inspector's model is not offered `consult`; calling it anyway is calling a tool it does not have; and when
+  // the work is stuck it fails, with nobody asked.
+  Assert.StartsWith("4 tools | ", Heard.First(h => h.What == "asked:Small").About);
+  Assert.Equal(AgentTaskStatus.Failed, outcome.Status);
+  Assert.Equal(0, Heard.Count(h => h.What == "asked:Strong"));
+  Assert.Equal(0, AgentHelp.Count());
+  Assert.Equal(["Small", "Small"], Trajectory.Models(outcome.Task));
+}
+
+[Test(Yard)]
+[runas(Ben)]
+void an_app_can_switch_consulting_off() {
+  // The packhouse's policy: no second opinions on Ben's account.
+  var crate = Crate.Single(c => c.Code == "B-1");
+  var script = AgentScript.Of(
+    Says.HandBack(new Grade { Score = 14 }), Says.HandBack(new Grade { Score = -1 }), Says.HandBack(new Grade { Score = 5 }))
+    .Advises("Strong", "Never said.");
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+  var outcome = InspectCarefully(crate);
+
+  // The sorter consults Strong — but not for Ben: `consult` is not offered, and stuck work fails without asking.
+  Assert.StartsWith("4 tools | ", Heard.First(h => h.What == "asked:Small").About);
+  Assert.Equal(AgentTaskStatus.Failed, outcome.Status);
+  Assert.Equal(0, Heard.Count(h => h.What == "asked:Strong"));
+  Assert.Equal(0, AgentHelp.Count());
+}
+
+[Test(Yard)]
+[runas(Ben)]
+void with_consulting_switched_off_an_unsure_decision_is_kept() {
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return Scripted.Text("{\"value\":\"Juice\",\"confidence\":0.3}", 300, 20); });
+  var decided = LineFor("Hard to say.");
+  Assert.Equal("Small", decided.Model);
+  Assert.Equal(0, Heard.Count(h => h.What == "asked:Strong"));
+}
+
+// ── a decision it is not sure of ────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void a_decision_the_model_is_not_sure_of_is_asked_again_of_the_one_it_consults() {
+  ScriptedAnswer.Stub((model, request) => {
+    NoteAsked(model, request);
+    return model == "Strong" ? Scripted.Text("{\"value\":\"Compost\",\"confidence\":0.95}", 300, 20)
+                             : Scripted.Text("{\"value\":\"Juice\",\"confidence\":0.55}", 300, 20);
+  });
+  runas (Ada) {
+    var decided = LineFor("Soft, split skins, a sour smell.");
+
+    // The sorter's floor is 0.8: the everyday model's 0.55 is under it, so the stronger model's answer is the one used.
+    Assert.Equal(Line.Compost, decided.Value);
+    Assert.Equal(0.95m, decided.Confidence);
+    Assert.Equal("Strong", decided.Model);
+    Assert.False(decided.Calibrated);
+    var help = AgentHelp.Single();
+    Assert.Equal(HelpReason.LowConfidence, help.Why);
+    Assert.Equal(HelpStatus.Answered, help.Status);
+    Assert.Equal("Strong", help.AskedModel);
+    Assert.Equal("Which line does this crate go to?", help.Question);
+    Assert.Null(help.Task);
+  }
+  runas (Dana) {
+    // Both calls are the sorter's, on the meter.
+    Assert.Equal(2, ModelCall.Count(c => c.Scopes.Contains("agent:Packhouse.Sorter") && c.Outcome == ModelCallOutcome.Served));
+    Assert.Equal("consult", ModelCall.Single(c => c.Model == "Strong").Purpose);
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_decision_the_model_is_sure_of_is_not_asked_again() {
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return Scripted.Text("{\"value\":\"Fresh\",\"confidence\":0.9}", 300, 20); });
+
+  var decided = LineFor("Firm, bright, no marks.");
+
+  Assert.Equal(Line.Fresh, decided.Value);
+  Assert.Equal("Small", decided.Model);
+  Assert.Equal(0, Heard.Count(h => h.What == "asked:Strong"));
+  Assert.Equal(0, AgentHelp.Count());
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void an_agent_that_consults_nobody_keeps_its_own_decision_however_unsure() {
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return Scripted.Text("{\"value\":\"Juice\",\"confidence\":0.2}", 300, 20); });
+
+  var decided = LineByInspector("Hard to say.");
+
+  Assert.Equal(Line.Juice, decided.Value);
+  Assert.Equal("Small", decided.Model);
+  Assert.Equal(0, Heard.Count(h => h.What == "asked:Strong"));
+  Assert.Equal(0, AgentHelp.Count());
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_request_for_help_is_written_only_by_the_kit() {
+  Assert.Denied(() => { ForgeHelp(); UnitOfWork.Commit(); });
+  UnitOfWork.Discard();
+  Assert.Equal(0, AgentHelp.Count());
+}

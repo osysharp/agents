@@ -1,0 +1,216 @@
+// Osysharp.Agents — who is in charge of what. Four things start out as "whoever supervises the agents" and are an
+// app's to hand to somebody else: naming a sponsor, pausing, reading the receipt of every piece of work, and deciding
+// a proposal that was put to somebody else. The packhouse hands three of them out: whoever is on call may pause, the
+// bookkeeper reads every receipt, the lead's deputy decides proposals.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+[TestFixture]
+void YardAtNight() {
+  Yard();
+  var nell = new Person { Email = "nell@packhouse.example", DisplayName = "Nell" };
+  var bo = new Person { Email = "bo@packhouse.example", DisplayName = "Bo" };
+  var hale = new Person { Email = "hale@packhouse.example", DisplayName = "Hale" };
+  new RoleGrant { Member = nell, Role = PackhouseRole.OnCall };
+  new RoleGrant { Member = bo, Role = PackhouseRole.Bookkeeper };
+  // The deputy grades too: what he approves runs as him, and a grader may flag any crate.
+  new RoleGrant { Member = hale, Role = PackhouseRole.Deputy };
+  new RoleGrant { Member = hale, Role = PackhouseRole.Grader };
+}
+
+principal Nell => Person.Single(p => p.Email == "nell@packhouse.example");
+principal Bo   => Person.Single(p => p.Email == "bo@packhouse.example");
+principal Hale => Person.Single(p => p.Email == "hale@packhouse.example");
+
+const string NightInspector = "Packhouse.Inspector";
+
+/// ⭐ PAUSING AND SPONSORING. Whoever the app names pauses an agent and lets it work again; a paused agent takes no
+/// new work, and says why; who did what, and when, is written down — and only by doing it.
+[Test(YardAtNight)]
+void pausing_and_sponsoring_are_for_who_the_app_names_and_each_is_written_down() {
+  TestClock.Set(new DateTime(2031, 4, 7, 22, 0, 0, DateTimeKind.Utc));
+  // A grower gives the agents work, and that is all: she neither pauses one nor names its sponsor.
+  runas (Ada) {
+    Assert.Denied(() => PauseAgent(NightInspector, "I do not trust it."));
+    Assert.Denied(() => SponsorAgent(NightInspector, Ada));
+    // …nor by writing the seat herself.
+    Assert.Denied(() => { PauseByHand(AgentSeat.Single(s => s.Agent == NightInspector)); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Denied(() => { SponsorByHand(AgentSeat.Single(s => s.Agent == NightInspector), Ada); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.False(AgentSeat.Single(s => s.Agent == NightInspector).Paused);
+  }
+  // Whoever is on call pauses it, with the reason. She supervises nothing: she may not name its sponsor, and reads
+  // nobody's work.
+  runas (Nell) {
+    PauseAgent(NightInspector, "It graded forty crates as short in ten minutes.");
+    UnitOfWork.Commit();
+    Assert.Denied(() => SponsorAgent(NightInspector, Nell));
+    Assert.Denied(() => { SponsorByHand(AgentSeat.Single(s => s.Agent == NightInspector), Nell); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Equal(0, AgentTask.Count());
+  }
+  // Paused, it takes no new work — and whoever asks is told why.
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var refused = Assert.Throws<AgentPaused>(() => Inspect(crate));
+    Assert.Equal("Inspector is paused: It graded forty crates as short in ten minutes.", refused.Message);
+    Assert.Equal(0, AgentTask.Count());
+    // She cannot let it work again, through the kit or by hand.
+    Assert.Denied(() => ResumeAgent(NightInspector));
+    Assert.Denied(() => { ResumeByHand(AgentSeat.Single(s => s.Agent == NightInspector)); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.True(AgentSeat.Single(s => s.Agent == NightInspector).Paused);
+  }
+  TestClock.Advance(TimeSpan.FromHours(9));
+  // In the morning the lead lets it work again, and names the auditor as the person who answers for it.
+  runas (Dana) {
+    ResumeAgent(NightInspector, "The scale had been knocked. It is fixed.");
+    SponsorAgent(NightInspector, Omar);
+    UnitOfWork.Commit();
+    Assert.Equal(Omar.Id, AgentSeat.Single(s => s.Agent == NightInspector).Sponsor!.Id);
+    // Every change is on the record, newest first: who, what, when and why.
+    var changes = SeatChangesOf(NightInspector);
+    Assert.Equal(3, changes.Count);
+    Assert.Equal(1, changes.Count(c => c.What == AgentSeatChangeKind.Sponsored && c.Sponsor!.Id == Omar.Id && c.By!.Id == Dana.Id));
+    Assert.Equal(1, changes.Count(c => c.What == AgentSeatChangeKind.Resumed && c.By!.Id == Dana.Id && c.Why == "The scale had been knocked. It is fixed."));
+    var paused = changes.Single(c => c.What == AgentSeatChangeKind.Paused);
+    Assert.Equal(Nell.Id, paused.By!.Id);
+    Assert.Equal("It graded forty crates as short in ten minutes.", paused.Why);
+    Assert.Equal(new DateTime(2031, 4, 7, 22, 0, 0, DateTimeKind.Utc), paused.At);
+    Assert.Equal(paused.Id, changes[2].Id);
+    // Pausing what is paused, or resuming what works, writes nothing.
+    ResumeAgent(NightInspector);
+    UnitOfWork.Commit();
+    Assert.Equal(3, SeatChangesOf(NightInspector).Count);
+    // The record is written by doing the thing, never by hand — not even by the lead — and is never changed.
+    Assert.Denied(() => { ForgeSeatChange(NightInspector, Nell); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Denied(() => { SeatChangesOf(NightInspector)[0].Delete(); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+  }
+  // It works again.
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(crate)), Says.HandBack(new Grade { Score = 9, Finding = "Sound." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Assert.True(Inspect(crate).Done);
+  }
+}
+
+/// ⭐ EVERY RECEIPT, AND NOT ITS WORDS. The bookkeeper reads the receipt of every piece of work — which agent, for
+/// whom, where it stands, what it cost — and nothing the work said: not what it was about, not what it handed back.
+/// Another grower reads none of it. The lead and the auditor read it all, as before.
+[Test(YardAtNight)]
+void every_receipt_is_read_by_who_the_app_names_and_its_words_are_not() {
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(crate), 400, 40), Says.HandBack(new Grade { Score = 9, Finding = "Sound." }, 500, 60));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = Inspect(crate).Task;
+    // Her own: all of it.
+    var mine = AgentTask.Single();
+    Assert.Equal("Crate A-1", mine.About);
+    Assert.Contains("Sound.", mine.Result!);
+  }
+  // Another grower: nothing.
+  runas (Ben) { Assert.Equal(0, AgentTask.Count()); }
+  // Whoever is on call may pause an agent, and reads nobody's work.
+  runas (Nell) { Assert.Equal(0, AgentTask.Count()); }
+  // The bookkeeper: the receipt, with its figures…
+  runas (Bo) {
+    var receipt = AgentTask.Single();
+    Assert.Equal(task, receipt.Id);
+    Assert.Equal(NightInspector, receipt.Agent);
+    Assert.Equal("Packhouse.GradeCrate", receipt.Skill);
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Equal(Ada.Id, receipt.Requester!.Id);
+    Assert.Equal(1400, receipt.SpentMicros);
+    Assert.Equal(2, receipt.ModelCalls);
+    // …and none of its words.
+    Assert.Null(receipt.About);
+    Assert.Null(receipt.Outcome);
+    Assert.Null(receipt.Result);
+    Assert.Null(receipt.WaitingOn);
+    // Nor the record of what was done, line by line; nor a proposal; nor anybody's question.
+    Assert.Equal(0, TraceEvent.Count());
+    Assert.Equal(0, AgentProposal.Count());
+    Assert.Equal(0, AgentHelp.Count());
+  }
+  // The lead and the auditor read it whole.
+  runas (Dana) { Assert.Equal("Crate A-1", AgentTask.Single().About); Assert.Contains("Sound.", AgentTask.Single().Result!); }
+  runas (Omar) { Assert.Equal("Crate A-1", AgentTask.Single().About); }
+}
+
+/// ⭐ A PROPOSAL PUT TO SOMEBODY ELSE is decided by whoever the app names — here the lead's deputy — and it runs as
+/// him. Somebody the app does not name decides nothing, whatever else they may do.
+[Test(YardAtNight)]
+void a_proposal_put_to_somebody_else_is_decided_by_who_the_app_names() {
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool("It weighs 8 kg, and a full crate holds 10.", Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = Settle(crate).Task;
+    Assert.Equal(Ada.Id, AgentProposal.Single().DecideBy!.Id);
+  }
+  // The bookkeeper reads every receipt, and decides nothing: he does not even see the proposal.
+  runas (Bo) { Assert.Equal(0, AgentProposal.Count()); }
+  // Whoever is on call may pause the clerk — and may not decide for it.
+  runas (Nell) { Assert.Equal(0, AgentProposal.Count()); }
+  // The auditor reads it, and it is not his to decide.
+  runas (Omar) {
+    var refused = Assert.Throws<AgentRefused>(() => ApproveAgentProposal(AgentProposal.Single()));
+    Assert.Equal("This proposal is not put to you.", refused.Message);
+  }
+  // The deputy decides it. It runs as the clerk, on his say.
+  runas (Hale) {
+    var decision = ApproveAgentProposal(AgentProposal.Single());
+    Assert.Equal(ProposalStatus.Done, decision.Status);
+    Assert.Equal(Hale.Id, AgentProposal.Single().DecidedBy!.Id);
+  }
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    Assert.Equal("short", crate.Flag);
+    Assert.Equal(Actor.Of<Clerk>().Id, crate.ChangedBy);
+    Workflow.Settle(AgentWait.Where(w => w.Task.Id == task).OrderByDescending(w => w.Since).First());
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+  }
+}
+
+[TestFixture]
+void YardWithAPatron() {
+  YardAtNight();
+  var pia = new Person { Email = "pia@packhouse.example", DisplayName = "Pia" };
+  new RoleGrant { Member = pia, Role = PackhouseRole.Patron };
+}
+
+principal Pia => Person.Single(p => p.Email == "pia@packhouse.example");
+
+/// ⭐ PAUSING IS ITS OWN POLICY. The patron names who answers for an agent — so an agent's place is hers to write —
+/// and still neither pauses one nor lets one work again: that is `PausesAgents`, which does not admit her. Positive
+/// control: what she may do, she does; and whoever is on call pauses.
+[Test(YardWithAPatron)]
+void pausing_is_refused_to_somebody_who_may_change_an_agents_place_in_another_way() {
+  runas (Pia) {
+    // Hers to do: name the sponsor. The place is written, and the change is on the record as hers.
+    SponsorAgent(NightInspector, Omar);
+    UnitOfWork.Commit();
+    Assert.Equal(Omar.Id, AgentSeat.Single(s => s.Agent == NightInspector).Sponsor!.Id);
+    // Not hers: pausing, and letting a paused agent work again.
+    Assert.Denied(() => PauseAgent(NightInspector, "I would rather it rested."));
+    Assert.False(AgentSeat.Single(s => s.Agent == NightInspector).Paused);
+  }
+  runas (Nell) { PauseAgent(NightInspector, "The scale is off."); UnitOfWork.Commit(); }
+  runas (Pia) {
+    Assert.Denied(() => ResumeAgent(NightInspector, "It looks fine to me."));
+    Assert.True(AgentSeat.Single(s => s.Agent == NightInspector).Paused);
+  }
+}

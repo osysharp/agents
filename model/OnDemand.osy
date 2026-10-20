@@ -1,0 +1,104 @@
+// Running a skill on demand — what a "Run" button on an agent's page, an automation and a test all call, with what
+// the skill takes as JSON. The form is built from the same schema an agent is handed work by.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// One thing a skill takes, as a form asks for it.
+public class SkillInputField {
+  /// The member's name in the JSON — "" when the skill takes one value, not an object.
+  public string Name = "";
+  /// What the form says above it: the schema's description, or the member's name in words.
+  public string Label = "";
+  /// "text", "number" or "yes-no".
+  public string Kind = "text";
+  public bool Required = false;
+}
+
+/// ⭐ WHAT A FORM ASKS FOR TO RUN `skill` ON DEMAND — one field for each member of what it takes, as it is handed work
+/// (`SkillBase.HandedSchema()`): a skill that takes a row asks for its id, one that takes a class asks for each member,
+/// one that takes text asks for the text.
+public List<SkillInputField> InputFieldsOf(SkillBase skill) {
+  var top = JsonSerializer.Deserialize<Dictionary<string, Json>>(skill.HandedSchema());
+  if (!top.ContainsKey("properties")) {
+    return [new SkillInputField { Name = "", Label = DescriptionIn(top, "What to give it"), Kind = KindIn(top), Required = true }];
+  }
+  var properties = JsonSerializer.Deserialize<Dictionary<string, Json>>(top["properties"].ToString());
+  List<string> required = top.ContainsKey("required") ? JsonSerializer.Deserialize<List<string>>(top["required"].ToString())! : [];
+  List<SkillInputField> fields = [];
+  foreach (var name in properties.Keys) {
+    var member = JsonSerializer.Deserialize<Dictionary<string, Json>>(properties[name].ToString());
+    fields.Add(new SkillInputField { Name = name, Label = DescriptionIn(member, Words(name)), Kind = KindIn(member), Required = required.Contains(name) });
+  }
+  return fields;
+}
+
+string DescriptionIn(Dictionary<string, Json> schema, string otherwise) {
+  if (!schema.ContainsKey("description")) { return otherwise; }
+  var said = JsonSerializer.Deserialize<string>(schema["description"].ToString()) ?? "";
+  return said == "" ? otherwise : said;
+}
+
+string KindIn(Dictionary<string, Json> schema) {
+  if (!schema.ContainsKey("type")) { return "text"; }
+  var type = schema["type"].ToString();
+  if (type == "\"integer\"" || type == "\"number\"") { return "number"; }
+  if (type == "\"boolean\"") { return "yes-no"; }
+  return "text";
+}
+
+/// What a form's answers are as the JSON the skill takes — `values` by field name ("" for a skill that takes one
+/// value). A number is written as a number, yes or no as `true` or `false`, everything else as text.
+public string InputJsonOf(List<SkillInputField> fields, Dictionary<string, string> values) {
+  if (fields.Count == 1 && fields[0].Name == "") { return ValueJson(fields[0], values.ContainsKey("") ? values[""] : ""); }
+  List<string> members = [];
+  foreach (var f in fields) {
+    var value = values.ContainsKey(f.Name) ? values[f.Name] : "";
+    if (value.Trim() == "" && !f.Required) { continue; }
+    members.Add(JsonSerializer.Serialize(f.Name) + ":" + ValueJson(f, value));
+  }
+  return "{" + string.Join(",", members) + "}";
+}
+
+string ValueJson(SkillInputField f, string value) {
+  var v = value.Trim();
+  var what = f.Label.TrimEnd('.');
+  if (f.Required && v == "") { throw new ValidationException($"Say {what.ToLower()}."); }
+  if (f.Kind == "number") {
+    decimal n;
+    if (!decimal.TryParse(v, out n)) { throw new ValidationException($"{what} is a number."); }
+    return n.ToString();
+  }
+  if (f.Kind == "yes-no") { return v == "yes" || v == "true" ? "true" : "false"; }
+  return JsonSerializer.Serialize(value);
+}
+
+/// ⭐ RUN A SKILL ON DEMAND: `agent` does `skill` with `inputJson` — what the skill takes, as `InputFieldsOf` asks for
+/// it — for whoever is signed in, as any piece of work they give it. Answers the receipt's id.
+///
+///     var task = RunSkill("Workshop.Estimator", "Workshop.EstimateRepair", "{\"id\":\"" + repair.Id + "\"}");
+///
+/// ⚑ IT IS ORDINARY WORK FOR THE PERSON WHO RUNS IT: the input is read as the agent, never past what they may read,
+///   its proposals come to them, and its cost is the agent's and theirs — the same as `Agents.Of<T>().Do(…)`.
+[Server, Authorize(UsesAgents)]
+public Guid RunSkill(string agent, string skill, string inputJson, string about = "") {
+  var definition = Definition(agent);
+  SkillBase? held = null;
+  foreach (var s in definition.Skills) { if (SkillNameOf(s) == skill) { held = s; } }
+  if (held == null) { throw new SkillNotHeld($"{BareName(agent)} does not hold the skill {BareName(skill)}."); }
+  var account = Actor.Of(definition.GetType());
+  var me = Session.CurrentUser;
+  var brief = "";
+  try {
+    runas (Actor.From(account), onBehalfOf: me) { brief = held!.BriefHanded(inputJson); }
+  } catch (ValidationException) {
+    throw;
+  } catch (Exception e) {
+    throw new ValidationException($"{AgentName(agent)} cannot be given that: {e.Message}");
+  }
+  var who = new AgentRef { Name = agent, Actor = account };
+  var run = StartWork(who, held!, brief, about == "" ? Words(BareName(skill)) : about, null, 1);
+  DriveWork(run, held!);
+  return run.Task;
+}

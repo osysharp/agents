@@ -1,0 +1,259 @@
+// Osysharp.Agents — the person rung of the ladder of help, the app's own guards, and trying again. An agent that may
+// ask a person puts one focused question to whoever the work is for; the work stops where it stands — for a minute or
+// a month — and goes on with the answer. Stuck work asks once before it gives up.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+// ── the model chooses to ask ────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void a_person_answers_after_thirty_days_and_the_work_continues() {
+  TestClock.Set(new DateTime(2031, 3, 3, 9, 0, 0, DateTimeKind.Utc));
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(Weigh), CrateArg(crate)),
+      Says.AskPerson("Is this crate from the north orchard?", "Crate A-1, 12.5 kg. North-orchard fruit is graded a point lower."),
+      Says.HandBack(new Grade { Score = 7, Finding = "North orchard: a point lower." }));
+    ScriptedAnswer.Stub((model, request) => { NoteOffer(request, "offered"); NoteAsked(model, request); return script.Answer(model, request); });
+
+    var outcome = Settle(crate);
+    task = outcome.Task;
+
+    // The model was offered the way to ask beside its tools, and used it: the work stopped on Ada.
+    Assert.Contains("ask_person", Heard.First(h => h.What == "offered").About);
+    Assert.True(outcome.Waiting);
+    Assert.Equal("an answer from Ada", AgentTask.Single().WaitingOn);
+    var question = AgentHelp.Single();
+    Assert.Equal(HelpFrom.Person, question.From);
+    Assert.Equal(HelpReason.Chosen, question.Why);
+    Assert.Equal(HelpStatus.Waiting, question.Status);
+    Assert.Equal(Ada.Id, question.AskedPerson!.Id);
+    Assert.Equal("Is this crate from the north orchard?", question.Question);
+    Assert.Equal("Crate A-1, 12.5 kg. North-orchard fruit is graded a point lower.", question.Context);
+    Assert.Equal(1, QuestionsForMe().Count);
+    Assert.Contains("It asked Ada a question because it chose to.", Trajectory.Said(task));
+  }
+  // Thirty days. Nothing runs; nothing is asked of a model; nothing is spent.
+  TestClock.Advance(TimeSpan.FromDays(30));
+  Background.Settle();
+  runas (Ada) {
+    Assert.Equal(AgentTaskStatus.Waiting, AgentTask.Single().Status);
+    Assert.Equal(2, AgentTask.Single().ModelCalls);
+
+    AnswerAgentQuestion(AgentHelp.Single(), "Yes, the north orchard.");
+    GoOn(task);
+
+    // The work went on from where it stood: the model got her answer as what its question answered.
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About == "\"Yes, the north orchard.\""));
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Contains("North orchard: a point lower.", receipt.Result!);
+    Assert.Equal(3, receipt.ModelCalls);
+    var question = AgentHelp.Single();
+    Assert.Equal(HelpStatus.Answered, question.Status);
+    Assert.Equal("Yes, the north orchard.", question.Answer);
+    Assert.Equal(Ada.Id, question.AnsweredBy!.Id);
+    Assert.Contains("Ada answered after 30 days.", Trajectory.Said(task));
+    Assert.Equal(2, Trajectory.Helps(task));
+    Assert.True(VerifyTrace(receipt).Intact);
+    Assert.Equal(0, QuestionsForMe().Count);
+  }
+}
+
+[Test(Yard)]
+void a_question_is_answered_only_by_who_was_asked() {
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.AskPerson("Juice or compost?", "It is badly bruised."),
+      Says.HandBack(new Grade { Score = 2, Finding = "Juice." }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    task = Settle(crate).Task;
+    // An answer written straight onto the question is refused where it is stored.
+    Assert.Denied(() => { ForgeAnswer(AgentHelp.Single()); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Throws<ValidationException>(() => AnswerAgentQuestion(AgentHelp.Single(), "  "));
+  }
+  // Another grower does not see the question, and so cannot answer it.
+  runas (Ben) {
+    Assert.Equal(0, AgentHelp.Count());
+    Assert.Equal(0, QuestionsForMe().Count);
+  }
+  // The auditor reads everything the agents did — and answers nothing.
+  runas (Omar) {
+    var refused = Assert.Throws<AgentRefused>(() => AnswerAgentQuestion(AgentHelp.Single(), "Compost."));
+    Assert.Equal("This question is not put to you.", refused.Message);
+  }
+  runas (Ada) {
+    Assert.Equal(HelpStatus.Waiting, AgentHelp.Single().Status);
+    Assert.Equal(AgentTaskStatus.Waiting, AgentTask.Single().Status);
+  }
+  // Whoever supervises the agents may answer for her.
+  runas (Dana) {
+    AnswerAgentQuestion(AgentHelp.Single(), "Juice.");
+    GoOn(task);
+    Assert.Equal(Dana.Id, AgentHelp.Single().AnsweredBy!.Id);
+    // Answered once.
+    Assert.Throws<AgentRefused>(() => AnswerAgentQuestion(AgentHelp.Single(), "Compost after all."));
+    Assert.Equal("Juice.", AgentHelp.Single().Answer);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void work_puts_only_so_many_questions_to_a_person() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.AskPerson("First?"), Says.AskPerson("Second?"), Says.AskPerson("Third?"),
+    Says.HandBack(new Grade { Score = 5 }));
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+  var task = Settle(crate).Task;
+  AnswerAgentQuestion(AgentHelp.Single(h => h.Status == HelpStatus.Waiting), "One.");
+  GoOn(task);
+  AnswerAgentQuestion(AgentHelp.Single(h => h.Status == HelpStatus.Waiting), "Two.");
+  GoOn(task);
+
+  // The clerk may put two questions to a person for one piece of work. The third was not put: the model was told so
+  // and finished without.
+  Assert.Equal(2, AgentHelp.Count());
+  Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+  Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.StartsWith("error: ") && h.About.Contains("the 2 questions it may")));
+}
+
+// ── stuck ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void stuck_work_asks_a_person_once_before_it_gives_up() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  // Twice it answers in words where a result must be handed back: it is stuck. The clerk consults no model, so the
+  // next rung is a person.
+  var script = AgentScript.Of(
+    Says.Words("It looks fine to me."), Says.Words("Really, it is fine."),
+    Says.HandBack(new Grade { Score = 8, Finding = "Fine." }));
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+  var outcome = Settle(crate);
+
+  Assert.True(outcome.Waiting);
+  var question = AgentHelp.Single();
+  Assert.Equal(HelpFrom.Person, question.From);
+  Assert.Equal(HelpReason.Stuck, question.Why);
+  Assert.Equal(Ada.Id, question.AskedPerson!.Id);
+  Assert.Contains("What went wrong last:", question.Context);
+  Assert.Contains("It asked Ada for help because it was stuck.", Trajectory.Said(outcome.Task));
+
+  AnswerAgentQuestion(question, "Hand the grade back with the tool, do not write it out.");
+  GoOn(outcome.Task);
+
+  // Her advice reached the model before its next turn, and it finished.
+  Assert.Equal(1, Heard.Count(h => h.What == "asked:Small" && h.About.Contains("Ada was asked because the last attempts failed, and says:")));
+  Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void stuck_work_that_a_person_could_not_help_fails() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Words("Fine."), Says.Words("Fine."), Says.Words("Fine."), Says.Words("Fine."), Says.Words("Fine."));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  var task = Settle(crate).Task;
+  AnswerAgentQuestion(AgentHelp.Single(), "Try once more.");
+  GoOn(task);
+
+  // It asked once. Stuck again, it gives up — and the packhouse hears that this work needs somebody.
+  Assert.Equal(1, AgentHelp.Count());
+  var receipt = AgentTask.Single();
+  Assert.Equal(AgentTaskStatus.Failed, receipt.Status);
+  Assert.Equal(1, Heard.Count(h => h.What == "gave up" && h.About.StartsWith("1: It could not finish")));
+}
+
+// ── the app's own guards ────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void a_guard_of_the_apps_stops_a_tool_and_the_model_is_told_why() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(FlagCrate), FlagArgs(crate, "contraband")),
+    Says.Tool(Actions.Of(FlagCrate), FlagArgs(crate, "kept in the vault")),
+    Says.HandBack(new Grade { Score = 3 }));
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+  var outcome = Inspect(crate);
+
+  Assert.True(outcome.Done);
+  // The first flag never ran: the packhouse's guard stopped it, and the model was told why.
+  Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.StartsWith("error: ") && h.About.Contains("Nothing is flagged contraband by an agent.")));
+  // The second ran — and what it answered was kept from the model.
+  Assert.Equal("kept in the vault", Crate.Single(c => c.Code == "A-1").Flag);
+  Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.Contains("what it answered is kept from you: What is in the vault stays there.")));
+  Assert.Equal(0, Heard.Count(h => h.What == "result" && h.About.Contains("A-1 is flagged")));
+  // Both are lines of the record.
+  var said = Trajectory.Said(outcome.Task);
+  Assert.Contains("Embargo stopped FlagCrate: Nothing is flagged contraband by an agent.", said);
+  Assert.Contains("Embargo kept what FlagCrate answered from the model: What is in the vault stays there.", said);
+  Assert.True(VerifyTrace(AgentTask.Single()).Intact);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_guard_of_the_apps_keeps_a_request_from_the_model() {
+  var script = AgentScript.Of(Says.Words("I should not have been asked."));
+  ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+  var reply = AskInspector("What do we do with the embargoed plums?");
+
+  // Nothing left for a model: the work was stopped with the guard's reason, and cost nothing.
+  Assert.Equal(AgentTaskStatus.Stopped, reply.Status);
+  Assert.Equal("A guard stopped it: Embargoed fruit is not discussed with a model.", reply.Problem);
+  Assert.Equal(0, Heard.Count(h => h.What == "asked:Small"));
+  Assert.Equal(0, AgentTask.Single().ModelCalls);
+  Assert.Equal(0, reply.CostMicros);
+}
+
+// ── trying again ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void failed_work_is_tried_again_and_gives_up_once() {
+  // The first attempt hands back a count that is refused, three times over; the second gets it right.
+  var bad = AgentScript.Of(Says.HandBack(new Grade { Score = -1 }), Says.HandBack(new Grade { Score = -1 }),
+                           Says.HandBack(new Grade { Score = -1 }), Says.HandBack(new Grade { Score = -1 }));
+  var good = AgentScript.Of(Says.HandBack(new Grade { Score = 2, Finding = "Two crates." }));
+  ScriptedAnswer.Stub((model, request) => AgentTask.Count() >= 2 ? good.Answer(model, request) : bad.Answer(model, request));
+
+  var outcome = CountFor("ada@packhouse.example");
+  Assert.Equal("", outcome.Problem);
+
+  Assert.True(outcome.Done);
+  Assert.Equal("Two crates.", outcome.Result.Finding);
+  // Two receipts: the failed attempt, and the one that followed it and names it.
+  Assert.Equal(2, AgentTask.Count());
+  var first = AgentTask.Single(t => t.Attempt == 1);
+  var second = AgentTask.Single(t => t.Attempt == 2);
+  Assert.Equal(AgentTaskStatus.Failed, first.Status);
+  Assert.Equal(AgentTaskStatus.Done, second.Status);
+  Assert.Equal(first.Id, second.RetryOf!.Id);
+  Assert.Equal(second.Id, outcome.Task);
+  Assert.Contains("the second attempt", Trajectory.Said(second.Id)[0]);
+  // The packhouse heard one failure — and no giving up, because the work did not.
+  Assert.Equal(1, Heard.Count(h => h.What == "failed"));
+  Assert.Equal(0, Heard.Count(h => h.What == "gave up"));
+
+  // Work whose every attempt fails gives up once, after the last.
+  ScriptedAnswer.Stub((model, request) => bad.Answer(model, request));
+  var lost = CountFor("ben@packhouse.example");
+  Assert.Equal(AgentTaskStatus.Failed, lost.Status);
+  Assert.Equal(4, AgentTask.Count());
+  Assert.Equal(1, Heard.Count(h => h.What == "gave up" && h.About.StartsWith("2: ")));
+}

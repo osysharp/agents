@@ -1,0 +1,894 @@
+// Instructions — standing guidance people have given an agent since it was written: drawn from corrections, read by
+// a person, and sent to the model only once that person has made it active. Every change to what an agent is told
+// is a numbered instruction set, so any piece of work can say exactly what it ran with — and the set can be put back.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// Who teaches the agents: reads what is proposed, makes an instruction active, retires one, and puts an agent back
+/// to an earlier instruction set. Nobody, until the app says: `policy TeachesAgents => IsLead;`.
+///
+/// ⚑ WHOEVER TEACHES READS THE WORK, WITH WHAT IT SAID — every agent's: what it was given, what it handed back, each
+///   step of its record, what it proposed and asked. Deciding whether an agent did the right thing needs the data it
+///   acted on. It is one answer for the whole app (a teacher teaches every agent), and it opens nothing that was erased.
+virtual policy TeachesAgents => false;
+
+/// How this app teaches its agents — `app.AgentTeaching = new TeachingSetup { MostInstructions = 12 };`.
+[AppSetting("AgentTeaching")]
+public class TeachingSetup {
+  /// The most instructions one piece of work is sent, and the most characters of them in all. An instruction that
+  /// would take the work it is for past either is refused when somebody tries to make it active.
+  public int MostInstructions = 20;
+  public int MostCharacters = 6000;
+  /// The model that words an instruction from corrections (`DraftAgentInstruction`), by the app's name for it.
+  /// "": the app's router decides.
+  public string DraftsWith = "";
+}
+
+/// Where an instruction stands. ⚠ Appended, never inserted: an enum is stored by position.
+public enum InstructionState {
+  /// Somebody — a person, a model, the agent itself — proposed it. Nothing is sent to any model.
+  [Label("Proposed")] Proposed,
+  /// A person made it active: work that starts from now on is sent it.
+  [Label("Active")] Active,
+  /// A person read it and said no.
+  [Label("Rejected")] Rejected,
+  /// It was active, and a person took it out of use — or put the agent back to a set without it.
+  [Label("Retired")] Retired,
+}
+
+/// ⭐ ONE INSTRUCTION: what an agent is told, in the words it is sent, and why — for all its work, for one skill, for
+/// the work it does for one person, or for work charged to one thing (a team, a client).
+///
+/// ⚑ ACTIVE ONLY AFTER A PERSON. Whoever proposes it — a person, a model, the agent — it is `Proposed`, and no model
+///   is sent a word of it. `ActivateAgentInstruction` is the only way it becomes `Active`, and that runs only for a
+///   signed-in person the app's `TeachesAgents` admits: never for an agent's own account, never for code running as
+///   the app.
+///
+/// ⚑ IT IS WORDS TO THE MODEL, NOT LEAVE. What the agent may do alone, what it proposes and what it never does are
+///   its declaration's (`Permits`); no instruction widens them.
+public entity AgentInstruction {
+  /// The agent it is for, by its class's full name; and the skill ("" — everything the agent does).
+  [Required, Immutable, MaxLength(200), Index] string Agent;
+  [Immutable, MaxLength(200)] string Skill = "";
+  /// Only for work done FOR this person. Nobody: for anybody's.
+  [Classification(Personal.Identity)] Principal? For;
+  /// Only for work charged to this (`AgentRef.On("team:" + team.Id)`). "": whatever it is charged to.
+  [Immutable, MaxLength(200)] string OnScope = "";
+
+  /// What the model is sent, word for word.
+  [Required, MaxLength(600), Classification(Personal.Content)] string Guidance;
+  /// Why — for the people who read, activate and later question it. Not sent to the model.
+  [Required, MaxLength(2000), Classification(Personal.Content)] string Why;
+
+  InstructionState State = InstructionState.Proposed;
+
+  /// Who proposed it: a person; or the agent, during the piece of work named; and the model that worded it, when one did.
+  [Classification(Personal.Identity)] Principal? ProposedBy;
+  [Immutable, MaxLength(200)] string ProposedByAgent = "";
+  AgentTask? LearnedIn;
+  [Immutable, MaxLength(200)] string DraftedBy = "";
+  [Immutable] DateTime ProposedAt = DateTime.UtcNow;
+  /// How many corrections it was drawn from.
+  [Immutable] int DrawnFrom = 0;
+
+  /// The person who read it and decided — made it active, or rejected it — and when.
+  [Classification(Personal.Identity)] Principal? ReviewedBy;
+  DateTime? ReviewedAt;
+  /// Since when it has been active, this time.
+  DateTime? ActiveSince;
+  /// Who took it out of use, when and why; or why it was rejected.
+  [Classification(Personal.Identity)] Principal? RetiredBy;
+  DateTime? RetiredAt;
+  [MaxLength(600), Classification(Personal.Content)] string RetiredWhy = "";
+  /// When what it said was erased.
+  DateTime? ErasedAt;
+
+  security {
+    // What an agent is told is read by whoever gives it work — what is active, and theirs to be told; by whoever may
+    // give it work for others; and whole, with what is only proposed, by whoever is in charge of the agents.
+    allow read when UsesAgents where State == InstructionState.Active && (For == null || For == user);
+    allow read when DirectsAgentsForOthers where State == InstructionState.Active;
+    allow read when IsAuthenticated where ProposedBy == user;
+    allow read when TeachesAgents || SupervisesAgents || AuditsAgents || ErasesAgentRecords;
+    allow create when IsAuthenticated;
+    allow update when TeachesAgents || ErasesAgentRecords;
+    // SECURITY-INVARIANT(agents-an-instruction-is-active-only-after-a-person): an instruction is made by the kit's
+    // two proposing functions — always `Proposed` — and its `State` is written by the five functions below and nothing
+    // else. Of those only `ActivateAgentInstruction` and `RollBackAgentInstructions` write `Active`, and both ask
+    // `RequireTeacher` first: a signed-in person, not an agent's own account, whom `TeachesAgents` admits. A name
+    // added to either list, or a grant in place of the deny, lets guidance reach every later run of an agent unread —
+    // the memory-poisoning hole this closes. Guarded by tests/teaching.test.osy
+    // `an_instruction_is_active_only_after_a_person`, `nobody_writes_an_instruction_active_past_the_kit`,
+    // `an_agent_cannot_activate_an_instruction_even_for_a_teacher`, `code_running_as_the_app_cannot_activate_one`.
+    deny create except via ProposeAgentInstruction, ProposeInstructionFromWork;
+    deny update State except via ActivateAgentInstruction, RejectAgentInstruction, RetireAgentInstruction, RollBackAgentInstructions, EraseAgentInstruction, WithholdAgentInstruction;
+    deny update ActiveSince except via ActivateAgentInstruction, RollBackAgentInstructions;
+    // Who decided and when, written with the decision; a person is taken off it only by `ForgetWhoTaughtAgents`.
+    deny update ReviewedBy except via ActivateAgentInstruction, RejectAgentInstruction, ForgetWhoTaughtAgents;
+    deny update ReviewedAt except via ActivateAgentInstruction, RejectAgentInstruction;
+    deny update RetiredBy except via ActivateAgentInstruction, RetireAgentInstruction, RollBackAgentInstructions, ForgetWhoTaughtAgents;
+    deny update RetiredAt except via ActivateAgentInstruction, RetireAgentInstruction, RollBackAgentInstructions, EraseAgentInstruction, WithholdAgentInstruction;
+    deny update RetiredWhy except via ActivateAgentInstruction, RejectAgentInstruction, RetireAgentInstruction, RollBackAgentInstructions, EraseAgentInstruction, WithholdAgentInstruction;
+    // What it says is settled before it is active, and afterwards goes only when it is erased.
+    deny update Guidance, Why except via ReviseAgentInstruction, EraseAgentInstruction;
+    deny update ErasedAt, For except via EraseAgentInstruction;
+    deny update ProposedBy except via ForgetWhoTaughtAgents, EraseAgentInstruction;
+    deny update LearnedIn except via ForgetAgentWork;
+    deny delete;
+  }
+}
+
+/// One correction an instruction was drawn from.
+[Unique(Instruction, Correction)]
+public entity AgentInstructionSource {
+  [Required, Immutable, Index] AgentInstruction Instruction;
+  [Required, Immutable, Index] AgentCorrection Correction;
+
+  security {
+    allow read when IsAuthenticated where Instruction.ProposedBy == user;
+    allow read when TeachesAgents || SupervisesAgents || AuditsAgents || ErasesAgentRecords;
+    allow create when IsAuthenticated;
+    deny create except via ProposeAgentInstruction;
+    deny update;
+    deny delete;
+  }
+}
+
+/// What made an instruction set. ⚠ Appended, never inserted.
+public enum InstructionChange {
+  /// An instruction was made active.
+  [Label("Made active")] Activated,
+  /// An instruction was taken out of use.
+  [Label("Retired")] Retired,
+  /// The agent — or one of its skills — was put back to an earlier set.
+  [Label("Rolled back")] RolledBack,
+  /// An instruction was erased while it was active.
+  [Label("Erased")] Erased,
+  /// An instruction was taken out of use for the person it is for, at their request.
+  [Label("Withheld")] Withheld,
+}
+
+/// ⭐ ONE INSTRUCTION SET: everything an agent is told from one change to the next. Each activation, each retirement
+/// and each rollback makes the next set of that agent — numbered from 1; an agent nobody has taught is on set 0 —
+/// and says who made the change, when, why, and exactly which instructions were active after it.
+///
+/// A piece of work records the set it started under (`AgentTask.InstructionSet`), and a proposal the set it was made
+/// under: a yes to a proposal covers that set only.
+[Unique(Agent, Number)]
+public entity AgentInstructionSet {
+  [Required, Immutable, MaxLength(200), Index] string Agent;
+  [Immutable] int Number = 0;
+  [Immutable] InstructionChange Change = InstructionChange.Activated;
+  /// The instruction that was made active, retired or erased. Nobody: a rollback.
+  [Immutable] AgentInstruction? Instruction;
+  /// A rollback: the set it went back to, and the skill it was done for ("" — the whole agent). -1: not a rollback.
+  [Immutable] int RestoredFrom = -1;
+  [Immutable, MaxLength(200)] string Skill = "";
+  /// The instructions active after the change: how many, their ids one to a line in order, and the SHA-256 of what
+  /// they are — each one's id, what it is for and the hash of its words. Two sets with the same instructions have
+  /// the same hash, so an agent put back to an earlier set can be SEEN to be on it. "": none.
+  [Immutable] int Count = 0;
+  [Immutable] string Members = "";
+  [Immutable, MaxLength(64)] string Hash = "";
+  /// Who made the change. Nobody: an erasure made it, or they have been taken off it.
+  [Classification(Personal.Identity)] Principal? By;
+  [Immutable] DateTime At = DateTime.UtcNow;
+  [Immutable, MaxLength(600), Classification(Personal.Content)] string Why = "";
+
+  security {
+    // That an agent's instructions changed, and when, is for everybody who uses it; it holds none of their words.
+    allow read when IsAuthenticated;
+    deny read By, Why when !TeachesAgents && !SupervisesAgents && !AuditsAgents && !ErasesAgentRecords;
+    allow create, update when TeachesAgents || ErasesAgentRecords;
+    deny create except via ActivateAgentInstruction, RetireAgentInstruction, RollBackAgentInstructions, EraseAgentInstruction, WithholdAgentInstruction;
+    deny update By except via ForgetWhoTaughtAgents;
+    deny delete;
+  }
+}
+
+/// An instruction was proposed. Nothing an agent does has changed.
+[Event("Agent instruction proposed")]
+public sealed class AgentInstructionProposed { public AgentInstruction Instruction; }
+
+/// What an agent is told changed: an instruction was made active or retired, or the agent was put back to an
+/// earlier set. Work that starts from now on runs under `Set`.
+[Event("Agent instructions changed")]
+public sealed class AgentInstructionsChanged { public AgentInstructionSet Set; }
+
+// ── proposing ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What an instruction is proposed from.
+///
+///     ProposeAgentInstruction(new InstructionDraft {
+///       Agent = Agents.Of<Usher>().Name, Skill = typeof(PlaceGroup).FullName,
+///       Guidance = "A group whose youngest member is under ten goes to the dusk viewing.",
+///       Why = "The late viewing ends after ten at night.", From = [correction.Id],
+///     });
+public class InstructionDraft {
+  /// The agent, and the skill ("" — everything it does), each by its class's full name.
+  public string Agent = "";
+  public string Skill = "";
+  /// Only for work done for this person; only for work charged to this scope.
+  public Guid? For;
+  public string OnScope = "";
+  public string Guidance = "";
+  public string Why = "";
+  /// The corrections it is drawn from.
+  public List<Guid> From = [];
+  /// The model that worded it, when one did.
+  public string DraftedBy = "";
+}
+
+/// ⭐ PROPOSE AN INSTRUCTION. It is `Proposed`: nothing an agent does changes until a person the app trusts with that
+/// makes it active (`ActivateAgentInstruction`).
+///
+/// For whoever teaches or supervises the agents; and for anybody, from a correction they made themselves — for the
+/// work that agent does for anybody, or only for the work it does for them.
+[Server, Authorize(IsAuthenticated)]
+public AgentInstruction ProposeAgentInstruction(InstructionDraft draft) {
+  var me = Security.CurrentUserId;
+  var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+  if (person == null) { throw new AgentRefused("An instruction is proposed by a person: nobody is signed in."); }
+  var checkedDraft = CheckedDraft(draft);
+  var inCharge = Security.Authorize(person!, TeachesAgents) || Security.Authorize(person!, SupervisesAgents);
+  List<AgentCorrection> from = [];
+  foreach (var id in draft.From) {
+    var c = AgentCorrection.FirstOrDefault(x => x.Id == id);
+    if (c == null || c!.Agent != draft.Agent) { throw new ValidationException("An instruction is drawn from corrections of the same agent's work."); }
+    if (c!.WithdrawnAt != null) { throw new ValidationException("One of those corrections was taken back; nothing new is drawn from it."); }
+    if (!inCharge && (c!.By == null || c!.By!.Id != person!.Id)) {
+      throw new AgentRefused("You may propose an instruction from a correction you made yourself. Whoever teaches the agents may propose any.");
+    }
+    from.Add(c!);
+  }
+  if (!inCharge && from.Count == 0) {
+    throw new AgentRefused("Propose an instruction from a correction you made (`From`). Whoever teaches the agents may propose one outright.");
+  }
+  if (!inCharge && draft.For != null && draft.For != person!.Id) {
+    throw new AgentRefused("You may propose an instruction for the work an agent does for you, or for anybody — not for one other person.");
+  }
+  var made = new AgentInstruction {
+    Agent = draft.Agent, Skill = draft.Skill, For = draft.For == null ? null : Principal.FirstOrDefault(p => p.Id == draft.For),
+    OnScope = draft.OnScope.Trim(), Guidance = checkedDraft.Guidance, Why = checkedDraft.Why, ProposedBy = person,
+    DraftedBy = Clipped(draft.DraftedBy, 200), DrawnFrom = from.Count,
+  };
+  foreach (var c in from) { new AgentInstructionSource { Instruction = made, Correction = c }; }
+  Raise(new AgentInstructionProposed { Instruction = made });
+  return made;
+}
+
+/// The words of a draft, checked: an agent the app lists, a skill it holds, and guidance short enough to be sent.
+InstructionDraft CheckedDraft(InstructionDraft draft) {
+  var definition = Definition(draft.Agent);
+  if (draft.Skill != "") {
+    var held = false;
+    foreach (var s in definition.Skills) { if (SkillNameOf(s) == draft.Skill) { held = true; } }
+    if (!held) { throw new ValidationException($"{BareName(draft.Agent)} does not hold the skill {BareName(draft.Skill)}."); }
+  }
+  var guidance = draft.Guidance.Trim();
+  var why = draft.Why.Trim();
+  if (guidance == "") { throw new ValidationException("Say what the agent is to do, in the words it will be sent."); }
+  if (guidance.Length > 600) {
+    throw new ValidationException($"An instruction is at most 600 characters, and this is {guidance.Length}. Say one thing; propose a second for the next.");
+  }
+  if (why == "") { throw new ValidationException("Say why: whoever reads it before it is made active decides from that."); }
+  if (draft.OnScope.Trim() != "" && !draft.OnScope.Contains(":")) {
+    throw new ValidationException("Work is charged to a kind and a subject: `\"team:\" + team.Id`.");
+  }
+  return new InstructionDraft { Guidance = guidance, Why = Clipped(why, 2000) };
+}
+
+/// What an agent proposes itself, during a piece of work. Always `Proposed`, like anybody's.
+public class WorkInstruction {
+  public Guid Task;
+  public string Agent = "";
+  public string Skill = "";
+  public string Guidance = "";
+  public string Why = "";
+}
+
+/// An agent's own proposal, written by the loop when the model asks for `suggest_instruction`. Answers its id.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal Guid ProposeInstructionFromWork(WorkInstruction said) {
+  var words = CheckedDraft(new InstructionDraft { Agent = said.Agent, Skill = said.Skill, Guidance = said.Guidance, Why = said.Why });
+  var made = new AgentInstruction {
+    Agent = said.Agent, Skill = said.Skill, Guidance = words.Guidance, Why = words.Why,
+    ProposedByAgent = said.Agent, LearnedIn = AgentTask.FirstOrDefault(t => t.Id == said.Task),
+  };
+  Raise(new AgentInstructionProposed { Instruction = made });
+  return made.Id;
+}
+
+/// The name of the tool a model suggests an instruction for its agent with.
+const string SuggestTool = "suggest_instruction";
+
+/// What the model suggests with `suggest_instruction`.
+public class InstructionSuggestion {
+  /// The one thing the agent should do from now on, as a short instruction addressed to it.
+  public string Guidance = "";
+  /// Why: what in this piece of work showed it.
+  public string Why = "";
+}
+
+/// The tool as the model is offered it.
+AgentTool SuggestInstructionTool() {
+  return new AgentTool {
+    Name = SuggestTool, SchemaJson = Json.SchemaOf<InstructionSuggestion>(), ReadsOnly = true, Does = "suggests an instruction",
+    Description = "Suggest ONE standing instruction for yourself, when this piece of work showed you something that would help "
+      + "with the next one. A person reads it; nothing you are told changes unless they agree. At most 600 characters, "
+      + "naming no person. Then carry on with the work as you were told.",
+  };
+}
+
+/// The model suggested an instruction: it is proposed — never more — and the record says so.
+LlmContentBlock SuggestedInstruction(AgentRun run, string input, LlmContentBlock back) {
+  if (run.Suggested >= 2) {
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize("This piece of work has suggested the two instructions it may. Carry on with the work.");
+    return back;
+  }
+  try {
+    var said = JsonSerializer.Deserialize<InstructionSuggestion>(input);
+    ProposeInstructionFromWork(new WorkInstruction { Task = run.Task, Agent = run.Agent, Skill = run.Skill, Guidance = said.Guidance, Why = said.Why });
+  } catch (Exception e) {
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize("That was not proposed: " + e.Message);
+    return back;
+  }
+  run.Suggested = run.Suggested + 1;
+  Trace(run, new TraceEntry { Kind = TraceKind.ToolCall, Tool = SuggestTool, PayloadJson = input,
+    Summary = "It suggested an instruction for itself. It is proposed: nothing it is told changes until a person makes it active." });
+  back.ResultJson = JsonSerializer.Serialize("Proposed. A person will read it; nothing you are told changes unless they make it active. Carry on with the work as you were told.");
+  return back;
+}
+
+/// What a model words from corrections.
+public class InstructionWords {
+  /// The one thing the agent should do from now on, as a short instruction addressed to it.
+  public string Guidance = "";
+  /// The reason, in a sentence, taken from the corrections.
+  public string Why = "";
+}
+
+/// ⭐ HAVE A MODEL WORD AN INSTRUCTION from one or several corrections of the same agent's work: it is asked for the
+/// one rule they have in common, and what it answers is PROPOSED — exactly as if a person had written it — with the
+/// model's name on it. Nothing is active until a person has read it and said so.
+///
+///     var proposed = await DraftAgentInstruction(CorrectionsOfAgent(usher.Name).Take(3).ToList());
+///
+/// The call is charged to the agent (`agent:<name>`), with the purpose `draft-instruction`.
+public async Task<AgentInstruction> DraftAgentInstruction(List<AgentCorrection> corrections, Guid? forPerson = null, string onScope = "") {
+  if (corrections.Count == 0) { throw new ValidationException("Give at least one correction to draw the instruction from."); }
+  var agent = corrections[0].Agent;
+  var skill = corrections[0].Skill;
+  var text = "";
+  var n = 0;
+  List<Guid> from = [];
+  foreach (var c in corrections) {
+    if (c.Agent != agent) { throw new ValidationException("An instruction is drawn from corrections of the same agent's work."); }
+    if (c.Skill != skill) { skill = ""; }
+    n = n + 1;
+    text = text + $"Correction {n}\nWhat was wrong: {c.Wrong}\nWhat it should have been: {c.Right}\nWhy: {c.Because}\n\n";
+    from.Add(c.Id);
+  }
+  var definition = Definition(agent);
+  var setup = App.Setting<TeachingSetup>();
+  var asked = $"These are corrections people made of the work of an AI agent called {BareName(agent)}. {definition.Purpose}\n"
+    + "Write the ONE standing instruction that would have prevented them: a short rule addressed to the agent, general "
+    + "enough to cover the next case and not only these, at most 600 characters, naming no person. Then the reason, in a sentence.";
+  var call = new LlmCall { Kind = LlmTaskKind.Extract, Scopes = AgentScopes(agent), Limits = AgentLimitsOf(agent, definition), Purpose = "draft-instruction" };
+  if (setup.DraftsWith != "") { call.Model = setup.DraftsWith; }
+  var words = await Llm.Extract<InstructionWords>(text, asked, call);
+  return ProposeAgentInstruction(new InstructionDraft {
+    Agent = agent, Skill = skill, For = forPerson, OnScope = onScope, Guidance = Clipped(words.Guidance.Trim(), 600), Why = words.Why,
+    From = from, DraftedBy = setup.DraftsWith == "" ? "a model" : setup.DraftsWith,
+  });
+}
+
+/// Change the words of an instruction that is still proposed — what a reviewer does before making it active. Once
+/// it has been active its words are settled: retire it and propose the better one.
+[Server, Authorize(TeachesAgents)]
+public void ReviseAgentInstruction(AgentInstruction instruction, string guidance, string why) {
+  RequireTeacher("revised");
+  if (instruction.State != InstructionState.Proposed) {
+    throw new AgentRefused($"This instruction is {instruction.State.Label.ToLower()}: its words are settled. Retire it and propose the better one.");
+  }
+  var words = CheckedDraft(new InstructionDraft { Agent = instruction.Agent, Skill = instruction.Skill, Guidance = guidance, Why = why });
+  instruction.Guidance = words.Guidance;
+  instruction.Why = words.Why;
+}
+
+// ── a person decides ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whoever is signed in, when they may change what an agent is told.
+///
+/// SECURITY-INVARIANT(agents-an-instruction-is-active-only-after-a-person): three things, each of which alone lets
+/// guidance go live unread. (1) Somebody is signed in — code running as the app (a workflow's body, an event's
+/// handler) passes every `[Authorize]`, and is refused here. (2) They are not a declared actor — an agent's own
+/// account may hold a role the app's `TeachesAgents` admits, and a tool run for a teacher answers to both; an agent
+/// never teaches itself. (3) The app's `TeachesAgents` admits them. Guarded by tests/teaching.test.osy
+/// `code_running_as_the_app_cannot_activate_one`, `an_agent_cannot_activate_an_instruction_even_for_a_teacher`,
+/// `an_instruction_is_active_only_after_a_person`.
+Principal RequireTeacher(string done) {
+  var me = Security.CurrentUserId;
+  var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+  if (person == null) {
+    throw new AgentRefused($"An instruction is {done} by a person: nobody is signed in. Code that runs as the app proposes (`ProposeAgentInstruction` needs a person too), and a person decides.");
+  }
+  if (IsDeclaredActor(person!)) {
+    throw new AgentRefused($"An instruction is {done} by a person, and {NameOfPrincipal(person!)} is an agent's own account. An agent may propose an instruction; it never makes one active.");
+  }
+  if (!Security.Authorize(person!, TeachesAgents)) {
+    throw new AgentRefused("Only whoever teaches the agents changes what an agent is told. The app says who: `policy TeachesAgents => …;`.");
+  }
+  return person!;
+}
+
+/// Whether an account is a declared actor's own — an agent's, or any other `[Actor]` of the app.
+bool IsDeclaredActor(Principal account) {
+  try {
+    var actor = Actor.From(account);
+    return actor != null;
+  } catch (Exception e) {
+    return false;
+  }
+}
+
+/// The instructions of an agent that are active, as they are stored now.
+List<AgentInstruction> ActiveOf(string agent) {
+  return AgentInstruction.Where(i => i.Agent == agent && i.State == InstructionState.Active).OrderBy(i => i.ActiveSince).Take(1000).ToList();
+}
+
+/// The number of the set an agent is on: 0 when nobody has taught it anything.
+public int InstructionSetOf(string agent) {
+  var last = AgentInstructionSet.Where(s => s.Agent == agent).OrderByDescending(s => s.Number).FirstOrDefault();
+  return last == null ? 0 : last!.Number;
+}
+
+/// One set of an agent, by its number. Null: there is none — 0 is the set before anybody taught it anything.
+public AgentInstructionSet? InstructionSetNumbered(string agent, int number) {
+  return AgentInstructionSet.FirstOrDefault(s => s.Agent == agent && s.Number == number);
+}
+
+/// What a set of instructions IS, as one hash: each member's id, what it is for and the hash of its words, in the
+/// order of their ids. "": no instructions.
+string SetHashOf(List<AgentInstruction> members) {
+  if (members.Count == 0) { return ""; }
+  List<string> lines = [];
+  foreach (var i in members.OrderBy(m => m.Id.ToString()).ToList()) {
+    lines.Add(string.Join("|", [i.Id.ToString(), i.Skill, i.For == null ? "" : i.For!.Id.ToString(), i.OnScope, Crypto.Sha256Hex(i.Guidance)]));
+  }
+  return Crypto.Sha256Hex(string.Join("\n", lines));
+}
+
+string MembersOf(List<AgentInstruction> members) {
+  List<string> ids = [];
+  foreach (var i in members.OrderBy(m => m.Id.ToString()).ToList()) { ids.Add(i.Id.ToString()); }
+  return string.Join("\n", ids);
+}
+
+/// Whether making `instruction` active keeps the work it is for within what one piece of work is sent. Null: it
+/// does; otherwise the sentence that says why not.
+string? OverTheBound(AgentInstruction instruction, List<AgentInstruction> active) {
+  var setup = App.Setting<TeachingSetup>();
+  var count = 1;
+  var characters = instruction.Guidance.Length;
+  foreach (var other in active) {
+    if (other.Id == instruction.Id) { continue; }
+    // The work this instruction is for is also sent everything less specific that applies to it.
+    if (other.Skill != "" && other.Skill != instruction.Skill) { continue; }
+    if (other.For != null && (instruction.For == null || other.For!.Id != instruction.For!.Id)) { continue; }
+    if (other.OnScope != "" && other.OnScope != instruction.OnScope) { continue; }
+    count = count + 1;
+    characters = characters + other.Guidance.Length;
+  }
+  var bare = BareName(instruction.Agent);
+  if (count > setup.MostInstructions) {
+    return $"{bare} would be sent {count} instructions for this work, and a piece of work is sent at most {setup.MostInstructions}. Retire one it no longer needs first.";
+  }
+  if (characters > setup.MostCharacters) {
+    return $"{bare} would be sent {characters} characters of instructions for this work, and a piece of work is sent at most {setup.MostCharacters}. Retire one it no longer needs first.";
+  }
+  return null;
+}
+
+/// ⭐ MAKE AN INSTRUCTION ACTIVE. Work the agent STARTS from now on is sent it; work already under way finishes
+/// under the set it started with. Answers the agent's new instruction set — who, when, why, and what is active now.
+///
+/// Only for a signed-in person the app's `TeachesAgents` admits. An agent's own account is refused whatever roles
+/// it holds, and so is code that runs as the app.
+///
+/// Refused when it would take the work it is for past what one piece of work is sent (`TeachingSetup`).
+[Server, Authorize(TeachesAgents)]
+public AgentInstructionSet ActivateAgentInstruction(AgentInstruction instruction, string why = "") {
+  var person = RequireTeacher("made active");
+  if (instruction.State == InstructionState.Active) { throw new AgentRefused("This instruction is already active."); }
+  if (instruction.State == InstructionState.Rejected) { throw new AgentRefused("This instruction was rejected. Propose it again to have it read again."); }
+  if (instruction.ErasedAt != null) { throw new AgentRefused("What this instruction said has been erased; there is nothing to send."); }
+  RequireListed(instruction.Agent);
+  var active = ActiveOf(instruction.Agent);
+  var over = OverTheBound(instruction, active);
+  if (over != null) { throw new AgentRefused(over!); }
+  var now = DateTime.UtcNow;
+  instruction.State = InstructionState.Active;
+  instruction.ActiveSince = now;
+  instruction.ReviewedBy = person;
+  instruction.ReviewedAt = now;
+  instruction.RetiredBy = null;
+  instruction.RetiredAt = null;
+  instruction.RetiredWhy = "";
+  List<AgentInstruction> members = [];
+  foreach (var a in active) { if (a.Id != instruction.Id) { members.Add(a); } }
+  members.Add(instruction);
+  var set = new AgentInstructionSet {
+    Agent = instruction.Agent, Number = InstructionSetOf(instruction.Agent) + 1, Change = InstructionChange.Activated,
+    Instruction = instruction, Count = members.Count, Members = MembersOf(members), Hash = SetHashOf(members), By = person,
+    Why = Clipped(why.Trim(), 600),
+  };
+  Raise(new AgentInstructionsChanged { Set = set });
+  return set;
+}
+
+/// Say no to a proposed instruction, with the reason. It is kept, as rejected.
+[Server, Authorize(TeachesAgents)]
+public void RejectAgentInstruction(AgentInstruction instruction, string why) {
+  var person = RequireTeacher("rejected");
+  if (instruction.State != InstructionState.Proposed) { throw new AgentRefused($"This instruction is {instruction.State.Label.ToLower()}, not proposed."); }
+  if (why.Trim() == "") { throw new ValidationException("Say why not: whoever proposed it reads the reason."); }
+  var now = DateTime.UtcNow;
+  instruction.State = InstructionState.Rejected;
+  instruction.ReviewedBy = person;
+  instruction.ReviewedAt = now;
+  instruction.RetiredWhy = Clipped(why.Trim(), 600);
+}
+
+/// ⭐ TAKE AN INSTRUCTION OUT OF USE. Work the agent starts from now on is no longer sent it; work already under way
+/// finishes as it started. Answers the agent's new instruction set.
+[Server, Authorize(TeachesAgents)]
+public AgentInstructionSet RetireAgentInstruction(AgentInstruction instruction, string why) {
+  var person = RequireTeacher("retired");
+  if (instruction.State != InstructionState.Active) { throw new AgentRefused($"This instruction is {instruction.State.Label.ToLower()}, not active."); }
+  if (why.Trim() == "") { throw new ValidationException("Say why it is retired: the record keeps the reason."); }
+  var now = DateTime.UtcNow;
+  instruction.State = InstructionState.Retired;
+  instruction.RetiredBy = person;
+  instruction.RetiredAt = now;
+  instruction.RetiredWhy = Clipped(why.Trim(), 600);
+  List<AgentInstruction> members = [];
+  foreach (var a in ActiveOf(instruction.Agent)) { if (a.Id != instruction.Id) { members.Add(a); } }
+  var set = new AgentInstructionSet {
+    Agent = instruction.Agent, Number = InstructionSetOf(instruction.Agent) + 1, Change = InstructionChange.Retired,
+    Instruction = instruction, Count = members.Count, Members = MembersOf(members), Hash = SetHashOf(members), By = person,
+    Why = Clipped(why.Trim(), 600),
+  };
+  Raise(new AgentInstructionsChanged { Set = set });
+  return set;
+}
+
+/// ⭐ PUT AN AGENT BACK TO AN EARLIER INSTRUCTION SET: what was active then is active again, and what has been made
+/// active since is retired. `toSet` is the set's number — 0 for "as it was before anybody taught it anything".
+/// With `skill`, only that skill's own instructions go back; the rest stay as they are.
+///
+/// The rollback is itself the agent's next set, and says which one it restored. Work already under way finishes
+/// under the set it started with; work that starts from now on runs under this one. Answers the new set.
+///
+/// Refused when nothing would change, and when an instruction of the earlier set has since been erased.
+[Server, Authorize(TeachesAgents)]
+public AgentInstructionSet RollBackAgentInstructions(string agent, int toSet, string why, string skill = "") {
+  var person = RequireTeacher("rolled back");
+  RequireListed(agent);
+  if (why.Trim() == "") { throw new ValidationException("Say why the agent is put back: the record keeps the reason."); }
+  var bare = BareName(agent);
+  List<string> then = [];
+  if (toSet != 0) {
+    var target = InstructionSetNumbered(agent, toSet);
+    if (target == null) { throw new ValidationException($"{bare} has no instruction set {toSet}."); }
+    foreach (var id in target!.Members.Split("\n")) { if (id != "") { then.Add(id); } }
+  }
+  var now = DateTime.UtcNow;
+  var reason = Clipped($"Put back to instruction set {toSet}: {why.Trim()}", 600);
+  var changed = 0;
+  List<AgentInstruction> members = [];
+  foreach (var a in ActiveOf(agent)) {
+    if ((skill == "" || a.Skill == skill) && !then.Contains(a.Id.ToString())) {
+      a.State = InstructionState.Retired;
+      a.RetiredBy = person;
+      a.RetiredAt = now;
+      a.RetiredWhy = reason;
+      changed = changed + 1;
+    } else {
+      members.Add(a);
+    }
+  }
+  foreach (var id in then) {
+    var was = AgentInstruction.FirstOrDefault(i => i.Agent == agent && i.Id == Guid.Parse(id));
+    if (was == null || was!.State == InstructionState.Active) { continue; }
+    if (skill != "" && was!.Skill != skill) { continue; }
+    if (was!.ErasedAt != null) {
+      throw new AgentRefused($"An instruction of set {toSet} has since been erased, so {bare} cannot be put back to exactly that set. Retire what it should no longer be told instead.");
+    }
+    was!.State = InstructionState.Active;
+    was!.ActiveSince = now;
+    was!.RetiredBy = null;
+    was!.RetiredAt = null;
+    was!.RetiredWhy = "";
+    members.Add(was!);
+    changed = changed + 1;
+  }
+  if (changed == 0) { throw new AgentRefused($"{bare} is already told exactly what it was told in set {toSet}."); }
+  var set = new AgentInstructionSet {
+    Agent = agent, Number = InstructionSetOf(agent) + 1, Change = InstructionChange.RolledBack, RestoredFrom = toSet, Skill = skill,
+    Count = members.Count, Members = MembersOf(members), Hash = SetHashOf(members), By = person, Why = Clipped(why.Trim(), 600),
+  };
+  Raise(new AgentInstructionsChanged { Set = set });
+  return set;
+}
+
+// ── what a piece of work is sent ────────────────────────────────────────────────────────────────────────────────────
+
+/// What one piece of work is told beyond its agent's and its skill's own instructions.
+public class InstructionsToWork {
+  /// The agent's instruction set as the work starts, and that set's hash.
+  public int Set = 0;
+  public string SetHash = "";
+  /// The instructions it is sent, in the order they are said: their ids, and the text itself. "": none.
+  public List<string> Ids = [];
+  public string Text = "";
+  /// The SHA-256 of `Text` — what the receipt records. "": none.
+  public string Hash = "";
+  /// How many applied and were left out because the work was at what one piece of work is sent.
+  public int LeftOut = 0;
+}
+
+/// How specific an instruction is: for a person outranks for what the work is charged to, which outranks for a skill.
+int Specific(AgentInstruction i) { return (i.For != null ? 4 : 0) + (i.OnScope != "" ? 2 : 0) + (i.Skill != "" ? 1 : 0); }
+
+/// The line every piece of taught work's instructions begin with.
+string ToldHeading() {
+  return "People who are in charge of your work have told you the following since. Follow each of them. Where one differs from "
+       + "what you were told above, it is the one that holds; where two differ, the later one does.";
+}
+
+/// ⭐ WHAT A PIECE OF WORK IS SENT, as things are stored now: the agent's ACTIVE instructions that apply to it — for
+/// everything the agent does, for this skill, for what the work is charged to, for the person it is for — said in
+/// that order, the most specific last, and within each by when it was made active. Never more than `TeachingSetup`
+/// allows: past it the least specific are left out, and the work's record says how many.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal InstructionsToWork InstructionsFor(string agent, string skill, Guid? person, List<string> scopes) {
+  var told = new InstructionsToWork();
+  var last = AgentInstructionSet.Where(s => s.Agent == agent).OrderByDescending(s => s.Number).FirstOrDefault();
+  if (last != null) { told.Set = last!.Number; told.SetHash = last!.Hash; }
+  List<AgentInstruction> apply = [];
+  foreach (var i in ActiveOf(agent)) {
+    if (i.Skill != "" && i.Skill != skill) { continue; }
+    if (i.For != null && (person == null || i.For!.Id != person)) { continue; }
+    if (i.OnScope != "" && !scopes.Contains(i.OnScope)) { continue; }
+    apply.Add(i);
+  }
+  if (apply.Count == 0) { return told; }
+  var ordered = apply.OrderBy(i => Specific(i)).ThenBy(i => i.ActiveSince).ToList();
+  // The bound: kept from the most specific down.
+  var setup = App.Setting<TeachingSetup>();
+  var keepFrom = ordered.Count;
+  var characters = 0;
+  while (keepFrom > 0 && ordered.Count - keepFrom < setup.MostInstructions
+         && characters + ordered[keepFrom - 1].Guidance.Length <= setup.MostCharacters) {
+    keepFrom = keepFrom - 1;
+    characters = characters + ordered[keepFrom].Guidance.Length;
+  }
+  told.LeftOut = keepFrom;
+  var text = ToldHeading();
+  var n = 0;
+  var at = 0;
+  foreach (var i in ordered) {
+    if (at >= keepFrom) {
+      n = n + 1;
+      text = text + $"\n{n}. {i.Guidance}";
+      told.Ids.Add(i.Id.ToString());
+    }
+    at = at + 1;
+  }
+  if (told.Ids.Count == 0) { return told; }
+  told.Text = text;
+  told.Hash = Crypto.Sha256Hex(text);
+  return told;
+}
+
+/// The hash of the set an agent is on now. "": it is told nothing beyond its declaration.
+public string InstructionSetHashNow(string agent) {
+  var last = AgentInstructionSet.Where(s => s.Agent == agent).OrderByDescending(s => s.Number).FirstOrDefault();
+  return last == null ? "" : last!.Hash;
+}
+
+/// The sentence a record's first line says about what the work was sent.
+string ToldWords(InstructionsToWork told) {
+  if (told.Ids.Count == 0) { return told.Set == 0 ? "" : $" It runs under instruction set {told.Set}, none of which is for this work."; }
+  var left = told.LeftOut == 0 ? "" : $"; {told.LeftOut} more applied and did not fit";
+  return $" It runs under instruction set {told.Set}, and was sent {told.Ids.Count} instruction{(told.Ids.Count == 1 ? "" : "s")}{left}.";
+}
+
+/// Work that waited for a person takes up the agent's instructions as they stand NOW — the one time it does: a yes
+/// was refused because they changed, and what it proposes next has to be proposed under the new ones for anybody's
+/// yes to cover it. Answers the sentence for the record; "" when nothing changed.
+string TakeUpInstructions(AgentRun run) {
+  var told = InstructionsFor(run.Agent, run.Skill, run.Person, run.Scopes);
+  if (told.SetHash == run.InstructionSetHash) { return ""; }
+  List<LlmSystemSegment> system = [];
+  foreach (var segment in run.System) { if (run.Told == "" || segment.Content != run.Told) { system.Add(segment); } }
+  if (told.Text != "") { system.Add(new LlmSystemSegment { Content = told.Text, Stability = LlmCacheStability.AgentLevel }); }
+  run.System = system;
+  var was = run.InstructionSet;
+  run.InstructionSet = told.Set;
+  run.InstructionSetHash = told.SetHash;
+  run.Told = told.Text;
+  return $" Its instructions changed while it waited: it started under instruction set {was} and goes on under set {told.Set}"
+       + (told.Ids.Count == 0 ? ", which has none for this work." : $", sent {told.Ids.Count} instruction{(told.Ids.Count == 1 ? "" : "s")}.");
+}
+
+// ── looking back ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What a piece of work ran with, and what has changed since.
+public class RanWith {
+  /// The set it started under, and the hash of exactly what it was sent ("" — nothing).
+  public int Set = 0;
+  public string Hash = "";
+  /// The instructions it was sent, in the order they were said.
+  public List<AgentInstruction> Sent = [];
+  /// The agent's set now; instructions that apply to this agent and skill now that it was NOT sent; and ones it was
+  /// sent that have been retired since.
+  public int SetNow = 0;
+  public List<AgentInstruction> NotYet = [];
+  public List<AgentInstruction> RetiredSince = [];
+  /// The same, in a sentence or two.
+  public string Words = "";
+}
+
+/// ⭐ WHAT A PIECE OF WORK RAN WITH: the instruction set it started under, each instruction it was sent, and — so a
+/// past result can be explained — what the agent is told now that this work had not been told yet.
+///
+///     InstructionsOf(task).Words   // "It ran under instruction set 1, sent 1 instruction. Since then 1 has been
+///                                  //  made active that it had not been sent."
+public RanWith InstructionsOf(AgentTask task) {
+  var ran = new RanWith { Set = task.InstructionSet, Hash = task.InstructionsHash, SetNow = InstructionSetOf(task.Agent) };
+  List<string> sent = [];
+  foreach (var id in task.InstructionsSent.Split("\n")) { if (id != "") { sent.Add(id); } }
+  foreach (var id in sent) {
+    var i = AgentInstruction.FirstOrDefault(x => x.Id == Guid.Parse(id));
+    if (i == null) { continue; }
+    ran.Sent.Add(i!);
+    if (i!.State != InstructionState.Active) { ran.RetiredSince.Add(i!); }
+  }
+  foreach (var i in AgentInstruction.Where(x => x.Agent == task.Agent && x.State == InstructionState.Active).OrderBy(x => x.ActiveSince).Take(1000).ToList()) {
+    if (i.Skill != "" && i.Skill != task.Skill) { continue; }
+    if (i.For != null && (task.Requester == null || i.For!.Id != task.Requester!.Id)) { continue; }
+    if (!sent.Contains(i.Id.ToString())) { ran.NotYet.Add(i); }
+  }
+  var bare = BareName(task.Agent);
+  var words = ran.Set == 0 && sent.Count == 0 ? $"It ran before anybody had taught {bare} anything."
+            : sent.Count == 0 ? $"It ran under instruction set {ran.Set}, none of which was for this work."
+            : $"It ran under instruction set {ran.Set}, sent {sent.Count} instruction{(sent.Count == 1 ? "" : "s")}.";
+  if (ran.NotYet.Count > 0) {
+    words = words + $" Since then {ran.NotYet.Count} {(ran.NotYet.Count == 1 ? "has" : "have")} been made active that it had not been sent.";
+  }
+  if (ran.RetiredSince.Count > 0) {
+    words = words + $" {ran.RetiredSince.Count} of what it was sent {(ran.RetiredSince.Count == 1 ? "has" : "have")} been retired since.";
+  }
+  ran.Words = words;
+  return ran;
+}
+
+/// Whether an instruction helped, as plain counts.
+public class InstructionEffect {
+  /// Since when it has been active. Null: it is not.
+  public DateTime? Since;
+  /// The corrections it was drawn from.
+  public int DrawnFrom = 0;
+  /// Pieces of work that were sent it — of those whoever is looking may read.
+  public int WorkSince = 0;
+  /// Of that work, how many pieces a person still corrected; and how many corrections say this is the instruction the
+  /// work did not follow.
+  public int CorrectedSince = 0;
+  public int NotFollowed = 0;
+}
+
+/// ⭐ WHETHER AN INSTRUCTION HELPED, counted — no model is asked. The work that was sent it, how much of that work
+/// people still corrected, and how many of those corrections name this instruction as the one that was not followed.
+///
+/// Counted over the work whoever is looking may read: whoever supervises or audits the agents sees all of it.
+public InstructionEffect EffectOf(AgentInstruction instruction) {
+  var id = instruction.Id.ToString();
+  var effect = new InstructionEffect { Since = instruction.State == InstructionState.Active ? instruction.ActiveSince : null, DrawnFrom = instruction.DrawnFrom };
+  effect.WorkSince = AgentTask.Count(t => t.Agent == instruction.Agent && t.InstructionsSent.Contains(id));
+  foreach (var c in AgentCorrection.Where(x => x.Agent == instruction.Agent && x.WithdrawnAt == null).Take(2000).ToList()) {
+    if (c.Despite != null && c.Despite!.Id == instruction.Id) { effect.NotFollowed = effect.NotFollowed + 1; }
+    if (c.Sent.Contains(id)) { effect.CorrectedSince = effect.CorrectedSince + 1; }
+  }
+  return effect;
+}
+
+/// An agent's instructions — every one whoever is looking may read — newest first.
+public List<AgentInstruction> InstructionsOfAgent(string agent) {
+  return AgentInstruction.Where(i => i.Agent == agent).OrderByDescending(i => i.ProposedAt).Take(500).ToList();
+}
+
+/// The corrections an instruction was drawn from, oldest first.
+public List<AgentCorrection> SourcesOf(AgentInstruction instruction) {
+  List<AgentCorrection> from = [];
+  foreach (var s in AgentInstructionSource.Where(x => x.Instruction == instruction).Take(200).ToList()) { from.Add(s.Correction); }
+  return from.OrderBy(c => c.At).ToList();
+}
+
+/// An agent's instruction sets, newest first: every change to what it is told, with who, when and why.
+public List<AgentInstructionSet> InstructionSetsOf(string agent) {
+  return AgentInstructionSet.Where(s => s.Agent == agent).OrderByDescending(s => s.Number).Take(500).ToList();
+}
+
+// ── erasing ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ ERASE WHAT AN INSTRUCTION SAID, and whose work it was for. One that is active is taken out of use first — that
+/// is the agent's next instruction set, made by nobody. That there was an instruction, when it was active and what
+/// each set's hash was stay.
+[Server, Authorize(ErasesAgentRecords)]
+public void EraseAgentInstruction(AgentInstruction instruction, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is erased: that much is kept."); }
+  if (instruction.ErasedAt != null) { return; }
+  var now = DateTime.UtcNow;
+  if (instruction.State == InstructionState.Active) {
+    instruction.State = InstructionState.Retired;
+    instruction.RetiredAt = now;
+    instruction.RetiredWhy = Clipped("Erased: " + why.Trim(), 600);
+    List<AgentInstruction> members = [];
+    foreach (var a in ActiveOf(instruction.Agent)) { if (a.Id != instruction.Id) { members.Add(a); } }
+    var set = new AgentInstructionSet {
+      Agent = instruction.Agent, Number = InstructionSetOf(instruction.Agent) + 1, Change = InstructionChange.Erased,
+      Instruction = instruction, Count = members.Count, Members = MembersOf(members), Hash = SetHashOf(members),
+      Why = Clipped(why.Trim(), 600),
+    };
+    Raise(new AgentInstructionsChanged { Set = set });
+  }
+  instruction.Guidance = ErasedSummary();
+  instruction.Why = ErasedSummary();
+  instruction.For = null;
+  instruction.ProposedBy = null;
+  instruction.ErasedAt = now;
+}
+
+/// Take an active instruction out of use WITHOUT a teacher — for a privacy request that keeps what is held about a
+/// person out of use: an instruction for their work is their data, and the agent stops being sent it. It is the
+/// agent's next instruction set, made by nobody; whoever teaches may make it active again when the request is lifted.
+/// It can only ever take out of use: nothing is made active here.
+[Server, Authorize(ErasesAgentRecords)]
+public void WithholdAgentInstruction(AgentInstruction instruction, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is withheld: the record keeps the reason."); }
+  if (instruction.State != InstructionState.Active) { return; }
+  instruction.State = InstructionState.Retired;
+  instruction.RetiredAt = DateTime.UtcNow;
+  instruction.RetiredWhy = Clipped("Withheld: " + why.Trim(), 600);
+  List<AgentInstruction> members = [];
+  foreach (var a in ActiveOf(instruction.Agent)) { if (a.Id != instruction.Id) { members.Add(a); } }
+  var set = new AgentInstructionSet {
+    Agent = instruction.Agent, Number = InstructionSetOf(instruction.Agent) + 1, Change = InstructionChange.Withheld,
+    Instruction = instruction, Count = members.Count, Members = MembersOf(members), Hash = SetHashOf(members),
+    Why = Clipped(why.Trim(), 600),
+  };
+  Raise(new AgentInstructionsChanged { Set = set });
+}
+
+/// ⭐ TAKE A PERSON OFF WHAT THEY TAUGHT: the corrections they wrote, the instructions they proposed, read, activated
+/// or retired, and the instruction sets they made no longer say who. What was said and decided stays. Answers how
+/// many records they were taken off.
+[Server, Authorize(ErasesAgentRecords)]
+public int ForgetWhoTaughtAgents(Principal person) {
+  var gone = 0;
+  foreach (var c in AgentCorrection.Where(x => x.By == person).ToList()) { c.By = null; gone = gone + 1; }
+  foreach (var i in AgentInstruction.Where(x => x.ProposedBy == person || x.ReviewedBy == person || x.RetiredBy == person).ToList()) {
+    if (i.ProposedBy != null && i.ProposedBy!.Id == person.Id) { i.ProposedBy = null; }
+    if (i.ReviewedBy != null && i.ReviewedBy!.Id == person.Id) { i.ReviewedBy = null; }
+    if (i.RetiredBy != null && i.RetiredBy!.Id == person.Id) { i.RetiredBy = null; }
+    gone = gone + 1;
+  }
+  foreach (var s in AgentInstructionSet.Where(x => x.By == person).ToList()) { s.By = null; gone = gone + 1; }
+  return gone;
+}

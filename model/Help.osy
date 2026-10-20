@@ -1,0 +1,216 @@
+// Asking for help — one shape, whoever is asked. An agent that is unsure asks a more capable model; the next rung of
+// the same ladder is a person.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// Who was asked. ⚠ Appended, never inserted: an enum is stored by position.
+public enum HelpFrom {
+  /// A more capable model — the one the agent names in `Consults`.
+  [Label("A model")] Model,
+  /// A person.
+  [Label("A person")] Person,
+}
+
+/// Why help was asked for. ⚠ Appended, never inserted.
+public enum HelpReason {
+  /// The model doing the work chose to ask.
+  [Label("It chose to ask")] Chosen,
+  /// It tried, and what it produced was refused more than once.
+  [Label("It was stuck")] Stuck,
+  /// It decided, and was not sure enough of the decision.
+  [Label("It was not sure")] LowConfidence,
+}
+
+/// What became of a request for help. ⚠ Appended, never inserted.
+public enum HelpStatus {
+  /// It is waiting for its answer.
+  [Label("Waiting")] Waiting,
+  /// Help came.
+  [Label("Answered")] Answered,
+  /// It was not allowed: no room in the budget, or the app does not let its agents ask.
+  [Label("Refused")] Refused,
+  /// Whoever was asked could not be reached.
+  [Label("Unavailable")] Unavailable,
+}
+
+/// ⭐ ONE REQUEST FOR HELP: who was asked, why, what was asked with what context, what came back and what it cost.
+/// Asking a model and asking a person are the same row with a different `From`.
+///
+/// Written only by this package's own functions.
+public entity AgentHelp {
+  /// The agent that asked, by its class's full name, and the piece of work it asked during — null for a decision
+  /// made outside one.
+  [Required, Immutable, MaxLength(200), Index] string Agent;
+  [Immutable, Index] AgentTask? Task;
+  [Classification(Personal.Identity)] Principal? Requester;
+  /// Who was signed in when it was asked — the same person unless the work was done `For` somebody else.
+  [Classification(Personal.Identity)] Principal? StartedBy;
+  [Immutable] HelpFrom From = HelpFrom.Model;
+  [Immutable] HelpReason Why = HelpReason.Chosen;
+  /// Who was asked: a model, by the app's name for it; a person, by who they are.
+  [Immutable, MaxLength(200)] string AskedModel = "";
+  [Classification(Personal.Identity)] Principal? AskedPerson;
+  [Immutable] DateTime At = DateTime.UtcNow;
+  /// The question, and what was given with it.
+  [Classification(Personal.Content)] string Question = "";
+  [Classification(Personal.Content)] string Context = "";
+  /// The answers a person chooses between, as a JSON list of strings — "[]" for an answer in words.
+  [Immutable] string OptionsJson = "[]";
+  /// Through whom it comes, when the work was handed on: "Checker, working for Coordinator". "": the agent's own work.
+  [Immutable, MaxLength(600)] string AskedThrough = "";
+  HelpStatus Status = HelpStatus.Waiting;
+  /// What came back — the advice, or why none did.
+  [Classification(Personal.Content)] string Answer = "";
+  /// What asking cost, in millionths of a US dollar, and the meter's id for the call when a model was asked.
+  long CostMicros = 0;
+  Guid? Call;
+  DateTime? AnsweredAt;
+  /// The person who answered, when a person did.
+  [Classification(Personal.Identity)] Principal? AnsweredBy;
+  /// When what was asked and answered was erased, or whose it was taken off it. The row stays: that help was asked
+  /// for, of whom, and what it cost.
+  DateTime? ErasedAt;
+
+  security {
+    allow read when UsesAgents where Requester == user || StartedBy == user;
+    allow read when SupervisesAgents || AuditsAgents || TeachesAgents || ErasesAgentRecords;
+    // What was asked and answered is content, like a line's payload.
+    deny read Question, Context, Answer when !AuditsAgents && !TeachesAgents where Requester != user && StartedBy != user && AskedPerson != user && AnsweredBy != user;
+    allow create when UsesAgents;
+    deny create except via RecordAgentHelp, AskAgentQuestion;
+    allow update, delete when ErasesAgentRecords;
+    // A question put to a person is answered by that person, or by whoever supervises the agents.
+    allow read, update when IsAuthenticated where AskedPerson == user;
+    allow update when SupervisesAgents;
+    // It changes by being answered — once, through the kit — and by losing what it said, or whose it was.
+    // SECURITY-INVARIANT(agents-a-question-is-answered-once-through-the-kit): the answer an agent goes on from is
+    // written by `CloseAgentQuestion` alone, after `AnswerAgentQuestion` has asked who is answering. Guarded by
+    // tests/people.test.osy `a_question_is_answered_only_by_who_was_asked`.
+    deny update Question, Context except via EraseAgentWorkContent, EraseAgentHelp;
+    deny update Answer except via CloseAgentQuestion, EraseAgentWorkContent, EraseAgentHelp;
+    deny update Requester, StartedBy except via AnonymiseAgentWork, EraseAgentHelp;
+    deny update AskedPerson except via AnonymiseAgentWork, EraseAgentHelp, ForgetWhoOversawAgents;
+    deny update AnsweredBy except via CloseAgentQuestion, AnonymiseAgentWork, EraseAgentHelp, ForgetWhoOversawAgents;
+    deny update ErasedAt except via EraseAgentWorkContent, AnonymiseAgentWork, EraseAgentHelp;
+    deny update Status, AnsweredAt except via CloseAgentQuestion;
+    deny update CostMicros, Call;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+/// What one request for help was, and what came of it — what a caller is handed back.
+public class HelpAnswer {
+  public HelpStatus Status = HelpStatus.Unavailable;
+  /// The advice when it came; why it did not, otherwise.
+  public string Answer = "";
+  /// The model that answered, by the app's name for it.
+  public string Model = "";
+  public long CostMicros = 0;
+  public Guid? Call;
+  /// The row that records it.
+  public Guid? Help;
+
+  public bool Came() { return Status == HelpStatus.Answered; }
+}
+
+/// What a request for help is recorded from.
+public class HelpRecord {
+  public string Agent = "";
+  public Guid? Task;
+  public Guid? Requester;
+  public HelpFrom From = HelpFrom.Model;
+  public HelpReason Why = HelpReason.Chosen;
+  public string AskedModel = "";
+  public string Question = "";
+  public string Context = "";
+  public List<string> Options = [];
+  public string AskedThrough = "";
+  public HelpStatus Status = HelpStatus.Answered;
+  public string Answer = "";
+  public long CostMicros = 0;
+  public Guid? Call;
+}
+
+/// Record one request for help, with its answer. Answers the row's id.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal Guid RecordAgentHelp(HelpRecord record) {
+  var me = Security.CurrentUserId;
+  var help = new AgentHelp {
+    StartedBy = me == null ? null : Principal.FirstOrDefault(p => p.Id == me),
+    Agent = record.Agent, Task = record.Task == null ? null : AgentTask.FirstOrDefault(t => t.Id == record.Task),
+    Requester = record.Requester == null ? null : Principal.FirstOrDefault(p => p.Id == record.Requester),
+    From = record.From, Why = record.Why, AskedModel = record.AskedModel, Question = record.Question,
+    Context = record.Context, Status = record.Status, Answer = record.Answer, CostMicros = record.CostMicros,
+    Call = record.Call, AnsweredAt = DateTime.UtcNow,
+  };
+  Raise(new AgentAskedForHelp { Help = help });
+  return help.Id;
+}
+
+// ── asking a model ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether this app lets its agents consult a stronger model, as its `AgentsMayConsult` policy answers for whoever
+/// is asking.
+[Server, Authorize(AgentsMayConsult)]
+internal bool ConsultingIsAllowed() { return true; }
+
+bool MayConsult() {
+  try { return ConsultingIsAllowed(); } catch (Exception e) { return false; }
+}
+
+/// What the consulted model is told it is there for.
+string ConsultBrief() {
+  return "You are advising another model that is doing a piece of work and has asked you one focused question. "
+       + "Answer that question: say what you would do and why, briefly and concretely. You cannot act, look "
+       + "anything up or ask a question back — work from what you are given, and say so plainly when it is not "
+       + "enough to tell.";
+}
+
+/// ⭐ ASK THE MODEL AN AGENT CONSULTS ONE FOCUSED QUESTION. The stronger model is sent the question and the context
+/// given with it — never the conversation — and NO tools: it advises, and whoever asked goes on doing the work.
+///
+/// The call is an ordinary metered one, charged to the same scopes and held to the same limits as the work it is
+/// asked during (`step: Consult`), and never stepped down to a cheaper model: a consult that does not fit is refused.
+/// Recorded as an `AgentHelp` row whatever became of it.
+HelpAnswer AskModel(string agent, string consults, HelpReason why, string question, string context,
+                    Guid? task, Guid? requester, List<string> scopes, List<LlmLimit> limits) {
+  var answer = new HelpAnswer { Model = consults };
+  if (consults == "") {
+    answer.Answer = "This agent names no model to consult.";
+    return answer;
+  }
+  {
+    var request = new LlmRequest { SystemPrompt = ConsultBrief() };
+    var asked = context.Trim() == "" ? question : question + "\n\nWhat I have to go on:\n" + context;
+    request.Messages.Add(new LlmMessage { Role = "user", Content = [ new LlmContentBlock { Kind = LlmBlockKind.Text, Text = asked } ] });
+    try {
+      var result = await Llm.Complete(request, new LlmCall {
+        Model = consults, Kind = LlmTaskKind.Reason, Step = LlmStep.Consult, Scopes = scopes, Limits = limits,
+        Purpose = "consult", OnLimit = LlmOnLimit.Stop,
+        // A consult during a piece of work is charged where the work is (its scopes say), not to the run it is made in.
+        ChargedToItsRun = task == null,
+      });
+      answer.Status = HelpStatus.Answered;
+      answer.Answer = result.Text();
+      answer.Model = result.Model;
+      answer.CostMicros = result.CostMicros;
+      answer.Call = result.Call;
+    } catch (LlmBudgetExceeded e) {
+      answer.Status = HelpStatus.Refused;
+      answer.Answer = "There was no room in the budget to consult " + consults + ": " + e.Message;
+    } catch (LlmRefused e) {
+      answer.Status = HelpStatus.Refused;
+      answer.Answer = consults + " could not be consulted: " + e.Message;
+    } catch (ExternalServiceException e) {
+      answer.Answer = consults + " could not be reached: " + e.Message;
+    }
+  }
+  answer.Help = RecordAgentHelp(new HelpRecord {
+    Agent = agent, Task = task, Requester = requester, From = HelpFrom.Model, Why = why, AskedModel = consults,
+    Question = question, Context = context, Status = answer.Status, Answer = answer.Answer,
+    CostMicros = answer.CostMicros, Call = answer.Call,
+  });
+  return answer;
+}

@@ -1,0 +1,1009 @@
+// The loop — how a piece of work is done: the model is asked, the tools it asks for are run as the agent, what it
+// hands back is checked, and every step is written to the record.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// The name of the tool a model hands its finished result back with.
+const string HandBackTool = "hand_back";
+/// The name of the tool a model consults a more capable model with.
+const string ConsultTool = "consult";
+
+/// One tool as the model is offered it.
+public class AgentTool {
+  /// The name the model calls it by.
+  public string Name = "";
+  /// The action it is — "" for the two the loop provides itself (`hand_back`, `consult`).
+  public string Action = "";
+  public string Description = "";
+  public string SchemaJson = "";
+  /// It only reads.
+  public bool ReadsOnly = false;
+  /// What running it does, in a few words, for the record.
+  public string Does = "";
+  /// What the agent's declaration says of it: run alone, or proposed to a person first.
+  public Leave Leave = Leave.Alone;
+  /// For a tool that hands work on: the agent and the skill it goes to, each by its full name, as `Agent|Skill`.
+  public string HandsTo = "";
+}
+
+/// What the model is asked with `consult`.
+public class ConsultAsk {
+  /// The one question to answer.
+  public string Question = "";
+  /// Everything needed to answer it: whoever is asked sees nothing else.
+  public string Context = "";
+}
+
+/// A piece of work under way: what the loop remembers between its steps.
+public class AgentRun {
+  public Guid Task;
+  public Guid Root;
+  public string Agent = "";
+  public string Skill = "";
+  public Guid Actor;
+  /// Who the work is for. Null: nobody — the agent's own roles alone.
+  public Guid? Person;
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  public string Problem = "";
+  /// The finished result as JSON of the skill's type; and, for a job that answers in words, the words.
+  public string ResultJson = "";
+  public string Text = "";
+  public long SpentMicros = 0;
+  public long LimitMicros = 0;
+
+  public List<LlmSystemSegment> System = [];
+  public List<LlmMessage> Messages = [];
+  public List<AgentTool> Tools = [];
+  public List<string> Scopes = [];
+  public List<LlmLimit> Limits = [];
+
+  public bool Typed = false;
+  public int Turn = 0;
+  public int MaxTurns = 0;
+  public int SameCall = 3;
+  public int ClearPast = 0;
+  /// Failed attempts in a row, and whether the work has already consulted because it was stuck.
+  public int Failures = 0;
+  public int StuckAfter = 2;
+  public bool ConsultedWhenStuck = false;
+  public string LastProblem = "";
+  /// Advice that arrived while a turn's tools were being answered: it goes to the model after their answers.
+  public string Advice = "";
+  public string Consults = "";
+  /// Each tool call made so far, as `name arguments` — how going in circles is seen.
+  public List<string> Calls = [];
+
+  /// The tools of the turn under way that are still to answer, and the answers so far: what a wait stops between.
+  public List<LlmContentBlock> Pending = [];
+  public List<LlmContentBlock> Answered = [];
+  /// The model's id for the call the work is waiting on.
+  public string WaitingToolUse = "";
+  /// Whether the model may ask a person, whether stuck work does, how many questions it may put, and how many it has.
+  public bool PeopleMayChoose = false;
+  public bool PeopleWhenStuck = false;
+  public int PeopleMost = 3;
+  public int PeopleAsked = 0;
+  public bool AskedPersonWhenStuck = false;
+  /// The problem stuck work is about to ask a person about, once the turn under way is answered.
+  public string StuckAsk = "";
+  /// Which attempt this is, of how many.
+  public int Attempt = 1;
+  public int MaxAttempts = 1;
+
+  /// The piece of work that handed this one on, how far under the top it is, and the agents above it from the
+  /// nearest up — what a person is shown when it asks them something. Null, 0 and none: it is the top.
+  public Guid? Parent;
+  public int Depth = 0;
+  public List<string> Above = [];
+  /// The work it has handed on and is waiting for, and how many pieces it has handed on in all.
+  public List<HandedOn> Legs = [];
+  public int HandedOnCount = 0;
+  /// What people had told the agent when the work started: the instruction set and its hash, and the text sent.
+  public int InstructionSet = 0;
+  public string InstructionSetHash = "";
+  public string Told = "";
+  public string ToldWords = "";
+  /// Whether the model may suggest an instruction for the agent, and how many this work has.
+  public bool Suggests = false;
+  public int Suggested = 0;
+}
+
+// ── starting ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Open the receipt for a piece of work on a skill, and set the loop up for it.
+AgentRun StartWork(AgentRef agent, SkillBase skill, string brief, string about, Guid? retryOf, int attempt, WorkAbove? above = null) {
+  var definition = Definition(agent.Name);
+  var skillName = SkillNameOf(skill);
+  var held = false;
+  foreach (var s in definition.Skills) { if (SkillNameOf(s) == skillName) { held = true; } }
+  if (!held) {
+    throw new SkillNotHeld($"{BareName(agent.Name)} does not hold the skill {BareName(skillName)}. An agent is given work only "
+      + $"for a skill its class lists: `public override List<SkillBase> Skills => [new {BareName(skillName)}()];`");
+  }
+  if (skill.Typed() && !skill.HandsBackSchema().StartsWith("{\"type\":\"object\"")) {
+    throw new ValidationException($"{BareName(skillName)} hands back {skill.HandsBack()}, and a skill hands back a class — "
+      + "so the result has named parts — or `string`. Wrap the value in a class.");
+  }
+  var run = Opened(agent, definition, skill, skillName, AgentTaskCause.Call, about, skill.Takes(), retryOf, attempt, above);
+  run.MaxAttempts = skill.Retry.Attempts;
+  run.Tools = ToolsOf(skill.Tools, run, skill);
+  run.Messages.Add(UserSays(brief));
+  var again = attempt > 1 ? $" — the {Ordinal(attempt)} attempt" : "";
+  var by = run.Above.Count == 0 ? "" : $", by {run.Above[0]}";
+  Trace(run, new TraceEntry {
+    Kind = TraceKind.Started, Summary = $"{BareName(agent.Name)} was given {Words(BareName(skillName)).ToLower()}" + (about == "" ? "" : $": {about}") + by + again + "." + run.ToldWords,
+    PayloadJson = JsonSerializer.Serialize(brief),
+  });
+  return run;
+}
+
+/// Open the receipt for something an agent is asked, with every tool its skills hold.
+AgentRun StartChat(AgentRef agent, SkillBase skill, List<AgentTurn> turns) {
+  var definition = Definition(agent.Name);
+  if (turns.Count == 0 || turns[turns.Count - 1].Role != "user") {
+    throw new ValidationException("An agent is asked something: the last turn is the user's.");
+  }
+  var asked = turns[turns.Count - 1].Text;
+  var run = Opened(agent, definition, skill, "", AgentTaskCause.Chat, Clipped(asked, 120), "", null, 1);
+  List<ActionInfo> tools = [];
+  foreach (var s in definition.Skills) {
+    foreach (var tool in s.Tools) {
+      var known = false;
+      foreach (var t in tools) { if (t.Name == tool.Name) { known = true; } }
+      if (!known) { tools.Add(tool); }
+    }
+  }
+  run.Tools = ToolsOf(tools, run, skill);
+  foreach (var turn in turns) {
+    run.Messages.Add(new LlmMessage { Role = turn.Role == "assistant" ? "assistant" : "user",
+                                      Content = [ new LlmContentBlock { Kind = LlmBlockKind.Text, Text = turn.Text } ] });
+  }
+  Trace(run, new TraceEntry {
+    Kind = TraceKind.Started, Summary = $"{BareName(agent.Name)} was asked something." + run.ToldWords, PayloadJson = JsonSerializer.Serialize(asked),
+  });
+  return run;
+}
+
+AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillName, AgentTaskCause cause, string about, string given, Guid? retryOf, int attempt, WorkAbove? above = null) {
+  var setup = App.Setting<AgentsSetup>();
+  var dollars = skill.Budget ?? definition.Limits.PerTask ?? setup.TaskBudget;
+  var limit = Micros(dollars);
+  var person = agent.ForSomebody ? (agent.Person == null ? null : agent.Person!.Id) : Security.CurrentUserId;
+  var charged = string.Join("\n", agent.ChargedTo.Select(c => c.Scope));
+  // Work handed on by another piece of work: for whoever THAT is for, with no more than it has left, charged where
+  // it is charged — none of which is the caller's to say.
+  if (above != null) {
+    person = above!.Person;
+    limit = above!.LimitFor(limit);
+    charged = above!.ChargedTo;
+  }
+  // What people have told the agent since it was written, as it stands now: the work is sent it, and records it.
+  List<string> chargedTo = ["agent:" + agent.Name];
+  if (skillName != "") { chargedTo.Add("skill:" + skillName); }
+  foreach (var scope in charged.Split("\n")) { if (scope.Trim() != "") { chargedTo.Add(scope); } }
+  var told = InstructionsFor(agent.Name, skillName, person, chargedTo);
+  var inRun = Workflow.Current;
+  var task = OpenAgentTask(new AgentTaskOpening {
+    Agent = agent.Name, Skill = skillName, SkillVersion = skillName == "" ? "" : skill.Version, Cause = cause,
+    InstructionSet = told.Set, InstructionsSent = string.Join("\n", told.Ids), InstructionsHash = told.Hash,
+    Actor = agent.Actor.Id, Requester = person, About = about, Given = given, LimitMicros = limit,
+    ChargedTo = charged, RetryOf = retryOf, Attempt = attempt, Parent = above == null ? null : above!.Task,
+    // Given in a workflow's run, it is a step of that process: the receipt says which. (Work handed on by other work
+    // takes the run of the work above it, where the receipt is opened.)
+    Run = inRun?.Id, RunWorkflow = inRun == null ? "" : inRun.Workflow, RunState = inRun == null ? "" : inRun.State,
+    RunItem = inRun?.Item, RunStarter = inRun?.Starter,
+  });
+  var people = definition.People;
+  var stop = skill.Stop;
+  var run = new AgentRun {
+    Task = task, Root = task, Agent = agent.Name, Skill = skillName, Actor = agent.Actor.Id, Person = person,
+    LimitMicros = limit, Typed = skill.Typed(), MaxTurns = stop.MaxTurns > 0 ? stop.MaxTurns : setup.MaxTurns,
+    SameCall = stop.SameCall, ClearPast = stop.ClearResultsPast, StuckAfter = definition.StuckAfter,
+    // Nobody to consult when the agent names nobody — or the app does not let its agents ask, for whoever this is.
+    Consults = definition.Consults != "" && MayConsult() ? definition.Consults : "",
+    PeopleMayChoose = people.MayChoose || people.About.Trim() != "", PeopleWhenStuck = people.WhenStuck, PeopleMost = people.Most,
+    Attempt = attempt, InstructionSet = told.Set, InstructionSetHash = told.SetHash, Told = told.Text, ToldWords = ToldWords(told),
+    Suggests = definition.SuggestsInstructions,
+  };
+  run.Scopes = ["agent:" + agent.Name, "task:" + task.ToString()];
+  if (skillName != "") { run.Scopes.Add("skill:" + skillName); }
+  run.Limits = AgentLimitsOf(agent.Name, definition);
+  run.Limits.Add(new LlmLimit { Scope = "task:" + task.ToString(), LimitMicros = limit });
+  // …and its model calls are charged to that workflow and that run, as any call made there is — named here, once,
+  // because the work may go on in another run (the one that waits on a person for it).
+  // SECURITY-INVARIANT(agents-work-is-charged-to-the-run-that-gave-it): the run is read here, from the engine, where
+  // the work is started — never taken from the caller — and stays with the work wherever it goes on. Dropping it
+  // lets a step's spend escape the limit set for each run of its process; taking it from an argument lets work be
+  // charged to somebody else's run. Guarded by tests/processes.test.osy
+  // `a_budget_for_each_run_of_a_process_stops_the_work_and_the_process_handles_it` and
+  // `work_that_goes_on_after_a_person_decided_is_still_charged_to_its_process`.
+  // Work handed on is charged where the work above it is (`PlaceUnder`) — the run that gave THAT, not the one this
+  // happens to be opened in.
+  if (above == null) { foreach (var scope in RunScopes()) { run.Scopes.Add(scope); } }
+  // What the caller charged the work to: named on every call, and held to as every call leaves.
+  foreach (var charge in agent.ChargedTo) {
+    if (!run.Scopes.Contains(charge.Scope)) { run.Scopes.Add(charge.Scope); }
+    run.Limits.Add(charge);
+  }
+  if (above != null) { PlaceUnder(run, above!); }
+
+  // Stable first, so a provider's prompt cache holds across turns: who it is, then the job.
+  var who = $"You are {BareName(agent.Name)}. {definition.Purpose}".Trim();
+  if (definition.Instructions != "") { who = who + "\n\n" + definition.Instructions; }
+  if (people.About.Trim() != "") {
+    who = who + $"\n\nThese decisions are a person's, not yours: {people.About.Trim()} Ask with `{AskPersonTool}` before you decide one.";
+  }
+  run.System.Add(new LlmSystemSegment { Content = who, Stability = LlmCacheStability.AgentLevel });
+  var job = skill.Description;
+  if (skill.Instructions != "") { job = job + "\n\n" + skill.Instructions; }
+  if (run.Typed) {
+    job = job + $"\n\nWhen the work is done, hand the result back by calling `{HandBackTool}`. Do not answer in words.";
+  }
+  if (job.Trim() != "") { run.System.Add(new LlmSystemSegment { Content = job.Trim(), Stability = LlmCacheStability.AgentLevel }); }
+  // Last, so it has the last word: what people in charge of the work have told the agent since.
+  if (told.Text != "") { run.System.Add(new LlmSystemSegment { Content = told.Text, Stability = LlmCacheStability.AgentLevel }); }
+  return run;
+}
+
+/// The tools a piece of work is offered: the skill's actions, the way to hand a typed result back, and — when the
+/// agent has somebody to consult and the app lets it — the way to ask.
+List<AgentTool> ToolsOf(List<ActionInfo> actions, AgentRun run, SkillBase skill) {
+  List<AgentTool> tools = [];
+  var definition = Definition(run.Agent);
+  foreach (var action in actions) {
+    // What the agent never does — or any piece of work above it never does — is not offered at all.
+    var leave = LeaveInTree(run, definition, action);
+    if (leave == Leave.Never) { continue; }
+    var name = BareName(action.Name);
+    foreach (var other in actions) {
+      if (other.Name != action.Name && BareName(other.Name) == name) { name = action.Name.Replace(".", "_"); }
+    }
+    var effects = action.Effects;
+    var does = action.Query ? "reads only"
+             : effects.Spends ? "spends"
+             : effects.Sends ? "sends something"
+             : effects.Creates.Count + effects.Modifies.Count + effects.Deletes.Count > 0 ? "changes data"
+             : effects.External ? "reaches outside the app"
+             : "reads";
+    var says = action.Description == "" ? action.Label : action.Description;
+    if (leave != Leave.Alone) {
+      says = says + " A person may have to approve this before it runs: say in a sentence why you want to do it, then call "
+           + "it. What you get back is what it answered — or the person's decision and their reason.";
+    }
+    tools.Add(new AgentTool {
+      Name = name, Action = action.Name, Description = says,
+      SchemaJson = action.ParametersSchema, ReadsOnly = action.Query, Does = does, Leave = leave,
+    });
+  }
+  foreach (var tool in HandOnTools(run, definition)) { tools.Add(tool); }
+  if (run.PeopleMayChoose) {
+    tools.Add(new AgentTool {
+      Name = AskPersonTool, SchemaJson = Json.SchemaOf<PersonAsk>(), ReadsOnly = true, Does = "asks a person",
+      Description = "Ask a person ONE focused question, when the decision is theirs or only they can know the answer. The "
+        + "work stops until they have answered, which can take days: ask only what you cannot find out with your tools. "
+        + "Put everything they need in `Context`: they see nothing else. Give `Options` when the answer is one of a few.",
+    });
+  }
+  if (run.Suggests) { tools.Add(SuggestInstructionTool()); }
+  if (run.Consults != "") {
+    tools.Add(new AgentTool {
+      Name = ConsultTool, SchemaJson = Json.SchemaOf<ConsultAsk>(), ReadsOnly = true, Does = "asks for advice",
+      Description = "Ask a more capable model for advice on ONE focused question. Use it when you are stuck after a failed "
+        + "attempt, when a decision has real consequences, or when you are not confident of your answer. Put everything "
+        + "it needs in `Context`: it sees nothing else, and it cannot act — you stay the one doing the work.",
+    });
+  }
+  if (run.Typed) {
+    tools.Add(new AgentTool {
+      Name = HandBackTool, SchemaJson = skill.HandsBackSchema(), ReadsOnly = true, Does = "hands the result back",
+      Description = "Hand back the finished result. Call it once, when the work is done.",
+    });
+  }
+  return tools;
+}
+
+LlmMessage UserSays(string text) {
+  return new LlmMessage { Role = "user", Content = [ new LlmContentBlock { Kind = LlmBlockKind.Text, Text = text } ] };
+}
+
+// ── one turn ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Whether the work goes on to another turn: not when somebody called it off, and not past its turns.
+bool NextTurn(AgentRun run) {
+  if (run.Status != AgentTaskStatus.Working) { return false; }
+  if (EndedMeanwhile(run)) { return false; }
+  if (run.Turn >= run.MaxTurns) {
+    End(run, AgentTaskStatus.Stopped, $"It was stopped after {run.MaxTurns} turns without finishing.");
+    return false;
+  }
+  run.Turn = run.Turn + 1;
+  return true;
+}
+
+/// Somebody called the work off while the model was answering: none of the tools it asked for runs.
+bool CalledOffMeanwhile(AgentRun run) { return EndedMeanwhile(run); }
+
+/// Whether the work ended while this process was at it — read where it is stored, never from what the run remembers.
+/// Called off: it ends here, as cancelled. ALREADY CLOSED — it wrote nothing for so long that it was closed as
+/// abandoned (`CloseAbandonedAgentWork`), and this process has come back to it: the receipt stands as it was closed,
+/// and nothing more is asked of a model, run or handed on in its name.
+bool EndedMeanwhile(AgentRun run) {
+  var now = ReceiptAsStored(run.Task);
+  if (now.Status != AgentTaskStatus.Working && now.Status != AgentTaskStatus.Waiting) {
+    run.Status = now.Status;
+    run.Problem = now.Outcome;
+    return true;
+  }
+  if (now.Called == null) { return false; }
+  End(run, AgentTaskStatus.Cancelled, now.Called!);
+  return true;
+}
+
+/// The request for this turn. Past the skill's threshold, the results of older tool calls are cleared to a line
+/// each — the calls themselves stay, so the model still knows what it did.
+LlmRequest RequestOf(AgentRun run, ModelNeeds needs) {
+  var request = new LlmRequest { SystemSegments = run.System, Messages = run.Messages, CacheTools = true };
+  foreach (var tool in run.Tools) {
+    request.Tools.Add(new LlmToolDefinition { Name = tool.Name, Description = tool.Description, InputSchemaJson = tool.SchemaJson });
+  }
+  if (needs.MaxTokens > 0) { request.MaxTokens = needs.MaxTokens; }
+  // A typed job ends with a tool call — the hand-back — so the model is held to calling one.
+  if (run.Typed) { request.ToolChoice = LlmToolChoice.Any; }
+  if (run.ClearPast > 0 && EstimateTokens(request) > run.ClearPast) {
+    var keep = run.Messages.Count - 4;
+    var index = 0;
+    foreach (var message in run.Messages) {
+      if (index < keep) {
+        foreach (var block in message.Content) {
+          if (block.Kind == LlmBlockKind.ToolResult && block.ResultJson != null && block.ResultJson!.Length > 200) {
+            block.ResultJson = JsonSerializer.Serialize($"[cleared: this result was {block.ResultJson!.Length} characters; call the tool again if you need it]");
+          }
+        }
+      }
+      index = index + 1;
+    }
+  }
+  return request;
+}
+
+LlmCall CallOf(AgentRun run, ModelNeeds needs) {
+  return new LlmCall {
+    Model = needs.Model, Kind = needs.Kind, Step = LlmStep.Act, Latency = needs.Latency, MinQuality = needs.MinQuality,
+    Scopes = run.Scopes, Limits = run.Limits, Purpose = run.Skill == "" ? "ask" : BareName(run.Skill),
+    // The run the work belongs to is among its scopes already (`Opened`); the run this call happens to be made in is
+    // not what it is charged to.
+    ChargedToItsRun = false,
+  };
+}
+
+/// The model answered: its message joins the conversation, the call joins the record and the receipt.
+void Answered(AgentRun run, LlmResponse response, string model, string routeRule, Guid? call, long costMicros, int attempts) {
+  run.Messages.Add(new LlmMessage { Role = "assistant", Content = response.Content });
+  run.SpentMicros = run.SpentMicros + costMicros;
+  var asks = 0;
+  foreach (var block in response.Content) { if (block.Kind == LlmBlockKind.ToolUse) { asks = asks + 1; } }
+  var did = asks == 0 ? "answered" : asks == 1 ? "asked for a tool" : $"asked for {asks} tools";
+  var by = routeRule == "" ? "" : $" (chosen by {routeRule})";
+  var tried = attempts > 1 ? $", after {attempts - 1} other model{(attempts > 2 ? "s" : "")} failed" : "";
+  Trace(run, new TraceEntry {
+    Kind = TraceKind.ModelCall, Summary = $"{model}{by} {did}{tried}; it cost ${Dollars(costMicros)}.",
+    Model = model, RouteRule = routeRule, Attempts = attempts, Call = call, CostMicros = costMicros,
+    PayloadJson = JsonSerializer.Serialize(response.Content),
+  });
+  SettleAgentTask(run.Task, new AgentTaskUse {
+    Micros = costMicros, ModelCalls = 1, Turns = 1, InputTokens = response.InputTokens, OutputTokens = response.OutputTokens,
+    CacheReadTokens = response.CacheReadTokens,
+  });
+}
+
+/// The tools the last answer asked for, in order.
+List<LlmContentBlock> AskedFor(LlmResponse response) {
+  List<LlmContentBlock> asked = [];
+  foreach (var block in response.Content) { if (block.Kind == LlmBlockKind.ToolUse) { asked.Add(block); } }
+  return asked;
+}
+
+/// The last answer asked for no tool: for a job that answers in words, that is the answer; for a typed job it is a
+/// miss, and the model is told how to hand its result back.
+void AnsweredInWords(AgentRun run, LlmResponse response) {
+  var text = TextOf(response);
+  if (!run.Typed) {
+    run.Text = text;
+    run.ResultJson = JsonSerializer.Serialize(text);
+    End(run, AgentTaskStatus.Done, "It answered.");
+    return;
+  }
+  var problem = $"The result was not handed back: call `{HandBackTool}` with it.";
+  Missed(run, problem);
+  if (run.Status == AgentTaskStatus.Working) {
+    run.Messages.Add(UserSays(run.Advice == "" ? problem : problem + "\n\n" + run.Advice));
+    run.Advice = "";
+  }
+}
+
+/// Run one tool the model asked for, and answer the block that goes back to it.
+LlmContentBlock RunTool(AgentRun run, SkillBase skill, LlmContentBlock asked) {
+  var name = asked.ToolName ?? "";
+  var input = asked.InputJson ?? "{}";
+  var back = new LlmContentBlock { Kind = LlmBlockKind.ToolResult, ToolUseId = asked.ToolUseId };
+
+  if (name == HandBackTool && run.Typed) {
+    var problem = skill.Problem(input);
+    if (problem == null) {
+      run.ResultJson = input;
+      back.ResultJson = JsonSerializer.Serialize("Received.");
+      End(run, AgentTaskStatus.Done, "It handed back its result.");
+      return back;
+    }
+    Trace(run, new TraceEntry { Kind = TraceKind.SentBack, Summary = "The result was sent back: " + problem!, PayloadJson = input });
+    Missed(run, problem!);
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize(problem!);
+    return back;
+  }
+
+  if (name == ConsultTool && run.Consults != "") {
+    ConsultAsk ask;
+    try { ask = JsonSerializer.Deserialize<ConsultAsk>(input); }
+    catch (Exception e) {
+      back.IsError = true;
+      back.ResultJson = JsonSerializer.Serialize("Ask with a `Question` and the `Context` it needs.");
+      return back;
+    }
+    var help = Consulted(run, HelpReason.Chosen, ask.Question, ask.Context);
+    back.IsError = !help.Came();
+    back.ResultJson = JsonSerializer.Serialize(help.Answer);
+    return back;
+  }
+
+  if (name == SuggestTool && run.Suggests) { return SuggestedInstruction(run, input, back); }
+
+  if (name == AskPersonTool && run.PeopleMayChoose) {
+    PersonAsk ask;
+    try { ask = JsonSerializer.Deserialize<PersonAsk>(input); }
+    catch (Exception e) {
+      back.IsError = true;
+      back.ResultJson = JsonSerializer.Serialize("Ask with a `Question` and the `Context` the person needs.");
+      return back;
+    }
+    var whom = PersonToAsk(run);
+    if (ask.Question.Trim() == "" || whom == null || run.PeopleAsked >= run.PeopleMost) {
+      back.IsError = true;
+      back.ResultJson = JsonSerializer.Serialize(ask.Question.Trim() == "" ? "Ask a question."
+        : whom == null ? "There is nobody to ask. Go on without, or say what you cannot do."
+        : $"This work has put the {run.PeopleMost} questions it may to a person. Go on without, or say what you cannot do.");
+      return back;
+    }
+    run.PeopleAsked = run.PeopleAsked + 1;
+    var question = AskAgentQuestion(new HelpRecord {
+      Agent = run.Agent, Task = run.Task, Requester = run.Person, Why = HelpReason.Chosen,
+      Question = ask.Question.Trim(), Context = ask.Context, Options = ask.Options, AskedThrough = ThroughWhom(run),
+    }, whom!.Value);
+    var asked1 = PrincipalNameOf(whom!.Value);
+    Trace(run, new TraceEntry { Kind = TraceKind.AskedForHelp, Help = question, Summary = $"It asked {asked1} a question because it chose to.", PayloadJson = JsonSerializer.Serialize(ask.Question) });
+    Park(run, asked.ToolUseId ?? "", $"an answer from {asked1}", null, question);
+    return back;
+  }
+
+  AgentTool? tool = null;
+  foreach (var t in run.Tools) { if (t.Name == name && t.Action != "") { tool = t; } }
+  if (tool == null) {
+    // Not one of this work's tools — whatever the model called it. Nothing runs.
+    Trace(run, new TraceEntry { Kind = TraceKind.ToolCall, Tool = name, Summary = $"It asked for `{name}`, which is not one of its tools. Nothing ran.", PayloadJson = input });
+    Missed(run, $"`{name}` is not one of your tools.");
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize(run.LastProblem);
+    return back;
+  }
+
+  // Going in circles: the same call with the same arguments, again and again.
+  var key = tool!.Name + " " + input;
+  var same = 1;
+  foreach (var made in run.Calls) { if (made == key) { same = same + 1; } }
+  run.Calls.Add(key);
+  if (same >= run.SameCall) {
+    Trace(run, new TraceEntry { Kind = TraceKind.ToolCall, Tool = tool!.Action, Summary = $"It asked for {BareName(tool!.Action)} with the same arguments a {Ordinal(same)} time.", PayloadJson = input });
+    End(run, AgentTaskStatus.Failed, $"It went in circles: it asked for {BareName(tool!.Action)} with the same arguments {same} times.");
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize("Stopped.");
+    return back;
+  }
+
+  // The gate: what the agent's declaration says of this tool, for this work, now.
+  var definition = Definition(run.Agent);
+  var info = Actions.Find(tool!.Action);
+  if (info == null) {
+    Missed(run, $"`{name}` is no longer an action of this app.");
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize(run.LastProblem);
+    return back;
+  }
+  var stopped = GuardBeforeTool(run, info!, input);
+  if (stopped != null) {
+    Missed(run, $"{BareName(tool!.Action)} was stopped: {stopped!.Why}");
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize("This was stopped before it ran: " + stopped!.Why);
+    return back;
+  }
+  var gate = GateFor(run, definition, info!);
+  if (gate.Leave == Leave.Never) {
+    // SECURITY-INVARIANT(agents-out-of-envelope-is-never-approvable): what the declaration says the agent never does
+    // is refused here, outright — it is not proposed, so there is nothing for anybody to approve.
+    Trace(run, new TraceEntry { Kind = TraceKind.ToolCall, Tool = tool!.Action, PayloadJson = input,
+      Summary = $"It asked for {BareName(tool!.Action)}, and {gate.Why}. Nothing ran, and nothing was proposed." });
+    Missed(run, $"You may not do {BareName(tool!.Action)}, and no person can approve it.");
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize(run.LastProblem);
+    return back;
+  }
+  if (gate.Leave != Leave.Alone) {
+    // Where the skill sends what it proposes for this tool — else the person the work is for, or the sponsor.
+    ProposalRoute? route = null;
+    try { route = run.Skill == "" ? null : skill.DecidedBy(tool!.Action); }
+    catch (Exception e) {
+      // The skill names somebody who could not be found: it is put to nobody rather than to somebody else.
+      Missed(run, $"{BareName(tool!.Action)} is proposed first, and whoever {BareName(run.Skill)} sends it to could not be found: {e.Message}");
+      back.IsError = true;
+      back.ResultJson = JsonSerializer.Serialize(run.LastProblem);
+      return back;
+    }
+    var toQueue = route == null ? "" : route!.Queue.Trim();
+    var routed = route != null && (toQueue != "" || route!.Person != null);
+    var decider = toQueue != "" ? null : routed ? route!.Person : PersonToAsk(run);
+    if (decider == null && toQueue == "") {
+      Missed(run, $"{BareName(tool!.Action)} is proposed to a person first, and there is nobody to propose it to.");
+      back.IsError = true;
+      back.ResultJson = JsonSerializer.Serialize(run.LastProblem);
+      return back;
+    }
+    var why = LastWords(run);
+    var proposal = ProposeAgentAction(new ProposalDraft {
+      Task = run.Task, Agent = run.Agent, Skill = run.Skill, SkillVersion = run.Skill == "" ? "" : skill.Version,
+      Action = tool!.Action, Label = info!.Label, Does = tool!.Does,
+      Changes = info!.Effects.Creates.Count + info!.Effects.Modifies.Count + info!.Effects.Deletes.Count > 0,
+      Sends = info!.Effects.Sends, Spends = info!.Effects.Spends, ArgumentsJson = input, ShownJson = ShownOf(skill, tool!.Action, input), Why = why,
+      EvidenceJson = EvidenceOf(run), SubjectVersion = skill.VersionOf(tool!.Action, input), InstructionSet = run.InstructionSet, InstructionSetHash = run.InstructionSetHash, DecideBy = decider, ToolUseId = asked.ToolUseId ?? "",
+      Routed = routed, DecideQueue = toQueue,
+      AskedThrough = ThroughWhom(run),
+    });
+    var whoDecides = toQueue != "" ? "the " + toQueue + " queue" : PrincipalNameOf(decider!.Value);
+    Trace(run, new TraceEntry { Kind = TraceKind.ToolCall, Tool = tool!.Action, PayloadJson = input,
+      Summary = $"It asked for {BareName(tool!.Action)} ({tool!.Does}); {gate.Why}, so it was put to {whoDecides}." });
+    Park(run, asked.ToolUseId ?? "", $"a decision from {whoDecides}", proposal, null);
+    return back;
+  }
+
+  Trace(run, new TraceEntry {
+    Kind = TraceKind.ToolCall, Tool = tool!.Action, PayloadJson = input,
+    Summary = $"It asked for {BareName(tool!.Action)} ({tool!.Does}); " + (gate.Rule == null && gate.RulesAbove.Count == 0 ? "it is one of this work's tools" : gate.Why)
+            + ", so it runs as the agent" + (run.Person == null ? "." : ", for whoever asked."),
+  });
+  if (gate.Rule != null) { NoteStandingRuleUsed(gate.Rule!.Value); }
+  foreach (var above in gate.RulesAbove) { NoteStandingRuleUsed(above); }
+  ActionResult result;
+  try {
+    result = RunAsAgent(run, tool!.Action, input);
+  } catch (Exception e) {
+    result = new ActionResult { Outcome = ActionOutcome.Failed, Said = "", Value = "", Problem = e.Message, RanAs = "" };
+  }
+  var ok = result.Outcome == ActionOutcome.Done;
+  var said = ok ? (result.Value == "" ? JsonSerializer.Serialize("Done.") : result.Value) : JsonSerializer.Serialize(result.Outcome.Name + ": " + result.Problem);
+  if (ok) {
+    var kept = GuardAfterTool(run, info!, said);
+    if (kept != null) { said = JsonSerializer.Serialize("It ran, and what it answered is kept from you: " + kept!.Why); }
+  }
+  Trace(run, new TraceEntry {
+    Kind = TraceKind.ToolResult, Tool = tool!.Action, PayloadJson = said,
+    Summary = ok ? $"{BareName(tool!.Action)} answered." : $"{BareName(tool!.Action)} did not run: {result.Outcome.Label.ToLower()}. {Clipped(result.Problem, 300)}",
+  });
+  SettleAgentTask(run.Task, new AgentTaskUse { ToolCalls = 1 });
+  if (ok) { run.Failures = 0; } else { Missed(run, $"{BareName(tool!.Action)}: {result.Problem}"); }
+  back.IsError = !ok;
+  back.ResultJson = said;
+  return back;
+}
+
+/// ⭐ RUN ONE ACTION AS THE AGENT — its own account, and, when the work is for a person, never past what that person
+/// may do themselves. Every change it makes is recorded with the agent, the person and this piece of work.
+ActionResult RunAsAgent(AgentRun run, string action, string argumentsJson) {
+  var values = Actions.ValuesFromJson(action, argumentsJson);
+  var cause = "agent-task:" + run.Task.ToString();
+  var task = AgentTask.Single(t => t.Id == run.Task);
+  var actor = Principal.Single(p => p.Id == run.Actor);
+  if (run.Person == null) {
+    runas (Actor.From(actor), scope: task) { return Actions.Run(action, values, cause: cause); }
+  }
+  var person = Principal.FirstOrDefault(p => p.Id == run.Person);
+  runas (Actor.From(actor), onBehalfOf: person, scope: task) { return Actions.Run(action, values, cause: cause); }
+}
+
+/// Stop the work where it stands, on a person: the record says so, its state is kept, and nothing more runs.
+void Park(AgentRun run, string toolUse, string on, Guid? proposal, Guid? question) {
+  run.WaitingToolUse = toolUse;
+  Trace(run, new TraceEntry { Kind = TraceKind.Waiting, Summary = $"It waits for {on}." });
+  ParkAgentTask(run.Task, JsonSerializer.Serialize(run), on, proposal, question);
+  run.Status = AgentTaskStatus.Waiting;
+}
+
+/// Stuck work that turns to a person does so here, once the turn under way has been answered.
+bool StuckParks(AgentRun run) {
+  var problem = run.StuckAsk;
+  run.StuckAsk = "";
+  if (problem == "" || run.Status != AgentTaskStatus.Working) { return false; }
+  var whom = PersonToAsk(run);
+  if (whom == null) { End(run, AgentTaskStatus.Failed, "It could not finish: " + problem); return true; }
+  var question = AskAgentQuestion(new HelpRecord {
+    Agent = run.Agent, Task = run.Task, Requester = run.Person, Why = HelpReason.Stuck,
+    Question = "I am stuck on this piece of work: what I tried was refused. What should I do?",
+    Context = "What I was asked to do:\n" + JobOf(run) + "\n\nWhat went wrong last:\n" + problem, AskedThrough = ThroughWhom(run),
+  }, whom!.Value);
+  var name = PrincipalNameOf(whom!.Value);
+  Trace(run, new TraceEntry { Kind = TraceKind.AskedForHelp, Help = question, Summary = $"It asked {name} for help because it was stuck." });
+  Park(run, "", $"help from {name}", null, question);
+  return true;
+}
+
+/// A person's name, by their id.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal string PrincipalNameOf(Guid id) {
+  var p = Principal.FirstOrDefault(x => x.Id == id);
+  return p == null ? "a person" : NameOfPrincipal(p!);
+}
+
+/// What the model said as it asked for its tools this turn — why it wants what it proposes.
+string LastWords(AgentRun run) {
+  var words = "";
+  if (run.Messages.Count == 0) { return words; }
+  var last = run.Messages[run.Messages.Count - 1];
+  if (last.Role != "assistant") { return words; }
+  foreach (var block in last.Content) { if (block.Kind == LlmBlockKind.Text) { words = words + (block.Text ?? ""); } }
+  return words.Trim();
+}
+
+/// What the work had looked at before it proposed: each tool it ran, with what came back — the last eight.
+string EvidenceOf(AgentRun run) {
+  List<ProposalEvidence> seen = [];
+  var names = new Dictionary<string, string>();
+  foreach (var message in run.Messages) {
+    foreach (var block in message.Content) {
+      if (block.Kind == LlmBlockKind.ToolUse) { names[block.ToolUseId ?? ""] = ToolLabel(run, block.ToolName ?? ""); }
+      if (block.Kind == LlmBlockKind.ToolResult && !block.IsError && names.ContainsKey(block.ToolUseId ?? "") && names[block.ToolUseId ?? ""] != "") {
+        seen.Add(new ProposalEvidence { Tool = names[block.ToolUseId ?? ""], Said = Clipped(PlainText(block.ResultJson ?? ""), 600) });
+      }
+    }
+  }
+  foreach (var block in run.Answered) {
+    if (!block.IsError && names.ContainsKey(block.ToolUseId ?? "") && names[block.ToolUseId ?? ""] != "") {
+      seen.Add(new ProposalEvidence { Tool = names[block.ToolUseId ?? ""], Said = Clipped(PlainText(block.ResultJson ?? ""), 600) });
+    }
+  }
+  while (seen.Count > 8) { seen.RemoveAt(0); }
+  return JsonSerializer.Serialize(seen);
+}
+
+/// One of the work's tools as a person reads it — the action's own label, "Weigh the crate". "": not one of the
+/// app's actions (the hand-back, a consult, a question).
+string ToolLabel(AgentRun run, string name) {
+  foreach (var t in run.Tools) {
+    if (t.Name == name && t.Action != "") {
+      var info = Actions.Find(t.Action);
+      return info == null || info!.Label == "" ? Words(BareName(t.Action)) : info!.Label;
+    }
+  }
+  return "";
+}
+
+/// A JSON string as its text; anything else as it stands.
+string PlainText(string json) {
+  if (json.StartsWith("\"") && json.EndsWith("\"") && json.Length >= 2) {
+    return json.Substring(1, json.Length - 2).Replace("\\n", "\n").Replace("\\\"", "\"").Replace("\\u0027", "'");
+  }
+  return json;
+}
+
+/// Answer the tools of the turn under way, one by one. False: the work stopped on a person part-way; what is left
+/// stays where it is, for when it goes on.
+bool FinishTurn(AgentRun run, SkillBase skill) {
+  while (run.Pending.Count > 0 && run.Status == AgentTaskStatus.Working) {
+    // Work it hands on: every piece asked for together goes out together, and the turn waits for all of them.
+    if (IsHandOn(run, run.Pending[0])) {
+      if (!HandWorkOn(run)) { return false; }
+      continue;
+    }
+    var back = RunTool(run, skill, run.Pending[0]);
+    if (run.Status == AgentTaskStatus.Waiting) { return false; }
+    run.Pending.RemoveAt(0);
+    run.Answered.Add(back);
+  }
+  ToolsAnswered(run, run.Answered);
+  run.Answered = [];
+  run.Pending = [];
+  return !StuckParks(run);
+}
+
+/// The tools' answers go back to the model as one message.
+void ToolsAnswered(AgentRun run, List<LlmContentBlock> results) {
+  if (results.Count == 0) { return; }
+  // Advice that came while they ran follows the answers, in the same message: a tool's answer comes first.
+  if (run.Advice != "" && run.Status == AgentTaskStatus.Working) {
+    results.Add(new LlmContentBlock { Kind = LlmBlockKind.Text, Text = run.Advice });
+  }
+  run.Advice = "";
+  run.Messages.Add(new LlmMessage { Role = "user", Content = results });
+}
+
+/// A step failed. Past `StuckAfter` in a row the work is stuck: it consults once, when it has somebody to consult,
+/// and fails the next time.
+void Missed(AgentRun run, string problem) {
+  run.Failures = run.Failures + 1;
+  run.LastProblem = problem;
+  if (run.Failures < run.StuckAfter) { return; }
+  if (run.Consults != "" && !run.ConsultedWhenStuck) {
+    run.ConsultedWhenStuck = true;
+    run.Failures = 0;
+    var help = Consulted(run, HelpReason.Stuck,
+      "I am stuck on this piece of work: what I tried was refused. What should I do differently?",
+      "What I was asked to do:\n" + JobOf(run) + "\n\nWhat went wrong last:\n" + problem);
+    if (help.Came()) { run.Advice = "Advice from a more capable model, asked because the last attempts failed:\n" + help.Answer; }
+    return;
+  }
+  // The next rung: a person, once — asked when the turn under way has been answered.
+  if (run.PeopleWhenStuck && !run.AskedPersonWhenStuck) {
+    run.AskedPersonWhenStuck = true;
+    run.Failures = 0;
+    run.StuckAsk = problem;
+    return;
+  }
+  End(run, AgentTaskStatus.Failed, "It could not finish: " + problem);
+}
+
+/// What the work is, as the model was told it: the job, and what it was given.
+string JobOf(AgentRun run) {
+  var job = "";
+  foreach (var segment in run.System) { job = job + segment.Content + "\n"; }
+  foreach (var message in run.Messages) {
+    if (message.Role == "user") {
+      foreach (var block in message.Content) { if (block.Kind == LlmBlockKind.Text) { return job + "\n" + (block.Text ?? ""); } }
+    }
+  }
+  return job;
+}
+
+/// Consult the model the agent names, during this piece of work: charged to it, held to its limits, on its record.
+HelpAnswer Consulted(AgentRun run, HelpReason why, string question, string context) {
+  var help = AskModel(run.Agent, run.Consults, why, question, context, run.Task, run.Person, run.Scopes, run.Limits);
+  run.SpentMicros = run.SpentMicros + help.CostMicros;
+  var reason = why == HelpReason.Stuck ? "it was stuck" : why == HelpReason.LowConfidence ? "it was not sure" : "it chose to";
+  Trace(run, new TraceEntry {
+    Kind = TraceKind.AskedForHelp, Help = help.Help, Model = help.Model, Call = help.Call, CostMicros = help.CostMicros,
+    Summary = help.Came()
+      ? $"It asked {run.Consults} for help because {reason}; the advice cost ${Dollars(help.CostMicros)}."
+      : $"It asked {run.Consults} for help because {reason}, and got none: {Clipped(help.Answer, 300)}",
+    PayloadJson = JsonSerializer.Serialize(question),
+  });
+  if (help.CostMicros > 0) { SettleAgentTask(run.Task, new AgentTaskUse { Micros = help.CostMicros, ModelCalls = 1 }); }
+  return help;
+}
+
+/// End the work: the last line of its record, and its receipt closed.
+void End(AgentRun run, AgentTaskStatus status, string outcome) {
+  if (run.Status != AgentTaskStatus.Working) { return; }
+  run.Status = status;
+  if (status != AgentTaskStatus.Done) { run.Problem = outcome; }
+  Trace(run, new TraceEntry {
+    Kind = TraceKind.Ended, Summary = $"{status.Label}. {outcome}",
+    PayloadJson = status == AgentTaskStatus.Done ? run.ResultJson : null,
+  });
+  CloseAgentTask(run.Task, status, outcome, status == AgentTaskStatus.Done ? run.ResultJson : null, run.Attempt >= run.MaxAttempts);
+  // Whoever waits for this work — a workflow that gave it — is let go.
+  ReleaseWorkWait(run.Task);
+  // Work it handed on that is still going is called off; the work that handed THIS on hears that it has ended.
+  WorkHasEnded(run, status, outcome);
+}
+
+void Trace(AgentRun run, TraceEntry entry) { AppendAgentTrace(run.Root, run.Task, entry); }
+
+string Ordinal(int n) { return n == 2 ? "second" : n == 3 ? "third" : n == 4 ? "fourth" : n.ToString() + "th"; }
+
+// ── the two ways to drive it ────────────────────────────────────────────────────────────────────────────────────────
+
+/// What one turn asks of a model.
+class TurnAsk {
+  public LlmRequest Request;
+  public LlmCall Call;
+}
+
+/// What came back from a model for one turn: its answer, or why there is none.
+class TurnAnswer {
+  public LlmResult? Result;
+  /// Why no model answered, and how the work ends for it.
+  public string Refusal = "";
+  public AgentTaskStatus RefusedAs = AgentTaskStatus.Failed;
+  /// The limit that had no room, when that is why: its kind ("task", "agent"…) and its subject.
+  public string SpentScope = "";
+  public string SpentSubject = "";
+}
+
+/// The next turn's request — or null when there is none: the work was called off, its turns ran out, or a guard of
+/// the app's kept the request from the model. The work has then ended.
+TurnAsk? NextAsk(AgentRun run, SkillBase skill) {
+  if (!NextTurn(run)) { return null; }
+  var needs = skill.Needs;
+  var request = RequestOf(run, needs);
+  var refused = GuardBeforeModel(run, request);
+  if (refused != null) { End(run, AgentTaskStatus.Stopped, "A guard stopped it: " + refused!.Why); return null; }
+  return new TurnAsk { Request = request, Call = CallOf(run, needs) };
+}
+
+/// Ask the model. Awaited where it is called it is the plain call; kept, it is in flight beside its caller — how
+/// several pieces of handed-on work have their models answering at once. It writes nothing of the work's: what came
+/// back is handed to `Took`.
+async Task<TurnAnswer> AskTheModel(TurnAsk ask) {
+  var answer = new TurnAnswer();
+  try {
+    answer.Result = await Llm.Complete(ask.Request, ask.Call);
+  } catch (LlmBudgetExceeded e) {
+    answer.Refusal = "Its money ran out: " + e.Message;
+    answer.RefusedAs = AgentTaskStatus.Stopped;
+    answer.SpentScope = e.Scope;
+    answer.SpentSubject = e.Subject;
+  } catch (LlmRefused e) {
+    answer.Refusal = "No model would take it: " + e.Message;
+  } catch (ExternalServiceException e) {
+    answer.Refusal = "The model could not be reached: " + e.Message;
+  }
+  return answer;
+}
+
+/// Take what the model answered: its message and its cost join the work, and the tools it asked for are run. False:
+/// the work does not go on to another turn now — it has ended, or it stopped on a person or on work it handed on.
+bool Took(AgentRun run, SkillBase skill, TurnAnswer answer) {
+  if (answer.Result == null) {
+    // The limit that ran out was a piece of work's above this one: everything under THAT is spent with it.
+    SpentAbove(run, answer);
+    End(run, answer.RefusedAs, answer.Refusal);
+    return false;
+  }
+  var result = answer.Result!;
+  var dropped = GuardAfterModel(run, result.Response);
+  if (dropped != null) {
+    // The call was made and is paid for; what it answered is not kept or acted on.
+    run.SpentMicros = run.SpentMicros + result.CostMicros;
+    SettleAgentTask(run.Task, new AgentTaskUse { Micros = result.CostMicros, ModelCalls = 1, Turns = 1 });
+    End(run, AgentTaskStatus.Stopped, "A guard stopped it: " + dropped!.Why);
+    return false;
+  }
+  Answered(run, result.Response, result.Model, result.RouteRule, result.Call, result.CostMicros, result.Attempts);
+  var asked = AskedFor(result.Response);
+  if (asked.Count == 0) {
+    AnsweredInWords(run, result.Response);
+    if (StuckParks(run)) { return false; }
+    return run.Status == AgentTaskStatus.Working;
+  }
+  if (CalledOffMeanwhile(run)) { return false; }
+  run.Pending = asked;
+  run.Answered = [];
+  if (!FinishTurn(run, skill)) { return false; }
+  return run.Status == AgentTaskStatus.Working;
+}
+
+/// ⭐ DO THE WORK, turn by turn, until it ends. Every way out is a status on the receipt — a model that fails, money
+/// or turns that run out, a result that never fits — never an exception the caller has to tell apart.
+void DriveWork(AgentRun run, SkillBase skill) {
+  // Work that goes on after a wait first answers the rest of the turn it stopped in.
+  if (run.Pending.Count > 0 || run.Answered.Count > 0) {
+    if (!FinishTurn(run, skill)) { return; }
+  }
+  while (run.Status == AgentTaskStatus.Working) {
+    var ask = NextAsk(run, skill);
+    if (ask == null) { return; }
+    var answer = await AskTheModel(ask!);
+    if (!Took(run, skill, answer)) { return; }
+  }
+}
+
+/// The same work, with the answer handed on as it arrives.
+stream<AgentSignal> StreamWork(AgentRun run, SkillBase skill) {
+  var needs = skill.Needs;
+  while (NextTurn(run)) {
+    var response = new LlmResponse();
+    var model = "";
+    var rule = "";
+    Guid? call = null;
+    long cost = 0;
+    var served = false;
+    var text = "";
+    LlmContentBlock? building = null;
+    var refusal = "";
+    var refusedAs = AgentTaskStatus.Failed;
+    var request = RequestOf(run, needs);
+    var kept = GuardBeforeModel(run, request);
+    if (kept != null) { End(run, AgentTaskStatus.Stopped, "A guard stopped it: " + kept!.Why); break; }
+    try {
+      foreach (var e in Llm.Stream(request, CallOf(run, needs))) {
+        if (e.Kind == LlmStreamEventKind.TextDelta) {
+          text = text + (e.Delta ?? "");
+          yield return new AgentSignal { Kind = AgentSignalKind.Text, Text = e.Delta ?? "" };
+        } else if (e.Kind == LlmStreamEventKind.ToolUseStart) {
+          if (text != "") { response.Content.Add(new LlmContentBlock { Kind = LlmBlockKind.Text, Text = text }); text = ""; }
+          building = new LlmContentBlock { Kind = LlmBlockKind.ToolUse, ToolUseId = e.ToolUseId, ToolName = e.ToolName, InputJson = "" };
+        } else if (e.Kind == LlmStreamEventKind.ToolInputDelta) {
+          if (building != null) { building!.InputJson = (building!.InputJson ?? "") + (e.InputDelta ?? ""); }
+        } else if (e.Kind == LlmStreamEventKind.ToolUseEnd) {
+          if (building != null) {
+            if ((building!.InputJson ?? "") == "") { building!.InputJson = "{}"; }
+            response.Content.Add(building!);
+            building = null;
+          }
+        } else if (e.Kind == LlmStreamEventKind.MessageComplete) {
+          response.StopReason = e.StopReason;
+          response.InputTokens = e.InputTokens;
+          response.OutputTokens = e.OutputTokens;
+          response.CacheReadTokens = e.CacheReadTokens;
+          response.CacheCreationTokens = e.CacheCreationTokens;
+          model = e.Model;
+          rule = e.RouteRule;
+          call = e.Call;
+          cost = e.CostMicros;
+          served = true;
+        }
+      }
+    } catch (LlmBudgetExceeded e) {
+      refusal = "Its money ran out: " + e.Message;
+      refusedAs = AgentTaskStatus.Stopped;
+    } catch (LlmRefused e) {
+      refusal = "No model would take it: " + e.Message;
+    } catch (ExternalServiceException e) {
+      refusal = "The model could not be reached: " + e.Message;
+    }
+    if (!served) {
+      End(run, refusedAs, refusal == "" ? "The model's answer ended without its closing event." : refusal);
+      break;
+    }
+    if (text != "") { response.Content.Add(new LlmContentBlock { Kind = LlmBlockKind.Text, Text = text }); }
+    // A streamed answer has been shown as it arrived; a guard here still keeps it from being acted on.
+    var dropped = GuardAfterModel(run, response);
+    if (dropped != null) {
+      run.SpentMicros = run.SpentMicros + cost;
+      SettleAgentTask(run.Task, new AgentTaskUse { Micros = cost, ModelCalls = 1, Turns = 1 });
+      End(run, AgentTaskStatus.Stopped, "A guard stopped it: " + dropped!.Why);
+      break;
+    }
+    Answered(run, response, model, rule, call, cost, 1);
+    var asked = AskedFor(response);
+    if (asked.Count == 0) {
+      AnsweredInWords(run, response);
+      if (StuckParks(run)) { break; }
+      continue;
+    }
+    if (CalledOffMeanwhile(run)) { break; }
+    run.Pending = asked;
+    run.Answered = [];
+    while (run.Pending.Count > 0 && run.Status == AgentTaskStatus.Working) {
+      var ask = run.Pending[0];
+      if (IsHandOn(run, ask)) {
+        yield return new AgentSignal { Kind = AgentSignalKind.ToolStarted, Tool = ask.ToolName ?? "" };
+        if (!HandWorkOn(run)) { break; }
+        yield return new AgentSignal { Kind = AgentSignalKind.ToolFinished, Tool = ask.ToolName ?? "" };
+        continue;
+      }
+      var asking = ask.ToolName == ConsultTool || ask.ToolName == AskPersonTool;
+      yield return new AgentSignal { Kind = asking ? AgentSignalKind.AskedForHelp : AgentSignalKind.ToolStarted,
+                                     Tool = ask.ToolName ?? "", Text = ask.ToolName == ConsultTool ? run.Consults : "" };
+      var back = RunTool(run, skill, ask);
+      if (run.Status == AgentTaskStatus.Waiting) { break; }
+      run.Pending.RemoveAt(0);
+      run.Answered.Add(back);
+      if (!asking) { yield return new AgentSignal { Kind = AgentSignalKind.ToolFinished, Tool = ask.ToolName ?? "", Failed = back.IsError }; }
+    }
+    if (run.Status == AgentTaskStatus.Waiting) { break; }
+    ToolsAnswered(run, run.Answered);
+    run.Answered = [];
+    run.Pending = [];
+    if (StuckParks(run)) { break; }
+  }
+  if (run.Status == AgentTaskStatus.Waiting) { yield return new AgentSignal { Kind = AgentSignalKind.Waiting }; }
+  yield return new AgentSignal { Kind = AgentSignalKind.Done, Reply = ReplyOf(run) };
+}

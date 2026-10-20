@@ -1,0 +1,470 @@
+// The receipt — one row per piece of work an agent was given: who asked, as whom it ran, what it cost, how it ended.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+
+/// How a piece of work reached the agent. ⚠ Appended, never inserted: an enum is stored by position.
+public enum AgentTaskCause {
+  /// Code called `Do` with a skill and its input.
+  [Label("Called")] Call,
+  /// Somebody asked it something: `Ask` or `Stream`.
+  [Label("Asked")] Chat,
+}
+
+/// Where a piece of work stands. ⚠ Appended, never inserted.
+public enum AgentTaskStatus {
+  /// It is being worked on.
+  [Label("Working")] Working,
+  /// It finished, and handed back what the skill promises.
+  [Label("Done")] Done,
+  /// It could not finish: the model failed, the result never fitted, or it went in circles.
+  [Label("Failed")] Failed,
+  /// It was stopped before it finished: its turns or its money ran out.
+  [Label("Stopped")] Stopped,
+  /// Somebody called it off.
+  [Label("Cancelled")] Cancelled,
+  /// It stopped on a person — a proposal to decide, a question to answer — and goes on when they have.
+  [Label("Waiting on a person")] Waiting,
+}
+
+/// ⭐ THE RECEIPT of one piece of work: the agent and the skill, who asked and as whom it ran, what it cost and how
+/// it ended. Every `Do`, `Ask` and `Stream` makes exactly one; nobody writes one by hand.
+///
+/// Made and changed only by this package's own functions. An app reads it — and adds what its own work needs to it
+/// (`partial entity AgentTask { ExpenseReport? Report; }`).
+[Authority(Extensible)]
+public entity AgentTask {
+  /// The agent, by its class's full name, and the skill it was given the work for ("" when it was only asked).
+  [Required, Immutable, MaxLength(200), Index] string Agent;
+  [Immutable, MaxLength(200)] string Skill = "";
+  /// The skill's version when the work started.
+  [Immutable, MaxLength(40)] string SkillVersion = "";
+  /// What people had told the agent when the work started (Instructions.osy): the agent's instruction set by its
+  /// number — 0 before anybody taught it anything —, the instructions this work was sent, by their ids in the order
+  /// they were said, and the SHA-256 of their text exactly as the model was sent it ("" — it was sent none).
+  [Immutable] int InstructionSet = 0;
+  [Immutable] string InstructionsSent = "";
+  [Immutable, MaxLength(64)] string InstructionsHash = "";
+  [Immutable] AgentTaskCause Cause = AgentTaskCause.Call;
+  AgentTaskStatus Status = AgentTaskStatus.Working;
+
+  /// Who it ran as — the agent's own account — and who it ran for. Nobody: it ran for the app itself (a workflow, a
+  /// timer), with the agent's own roles alone — or whoever it was has been taken off it (`AnonymiseAgentWork`).
+  [Required, Immutable] Principal Actor;
+  [Index, Classification(Personal.Identity)] Principal? Requester;
+  /// Who gave it the work: whoever was signed in when it started. The same person as `Requester` unless the work
+  /// was done `For` somebody else; nobody when a process started it.
+  [Index, Classification(Personal.Identity)] Principal? StartedBy;
+
+  /// The work this is part of: the piece of work that handed it on, and the one at the top. Null: this is the top.
+  [Immutable] AgentTask? Parent;
+  [Immutable, Index] AgentTask? Root;
+  [Immutable] int Depth = 0;
+  /// Every piece of work above it, from the nearest up — the agent and the skill of each, by their full names, as
+  /// `Agent|Skill` on a line of its own. Written as the work is opened, from the receipt above it. "": it is the top.
+  [Immutable, MaxLength(4000)] string Lineage = "";
+
+  /// ⭐ THE PROCESS IT IS A STEP OF: the workflow run that gave it the work — by the run's id, the workflow's name, the
+  /// state whose body gave it, the row that run tracks, and the run that started that run from its own body. Read
+  /// where the work was started, never taken from the caller. Nothing: it was not started in a run. Work handed on
+  /// (`Parent`) is part of the same step as the work that handed it on.
+  [Immutable, Index] Guid? Run;
+  [Immutable, MaxLength(200)] string RunWorkflow = "";
+  [Immutable, MaxLength(200)] string RunState = "";
+  [Immutable] Guid? RunItem;
+  [Immutable] Guid? RunStarter;
+  /// Its place among the pieces of work that run gave, from 1, in the order it gave them — what tells two steps of
+  /// one instant apart. 0: it was not started in a run.
+  [Immutable] int RunStep = 0;
+
+  /// What it is about, as a person reads it in a list — "Crate C-104" — and the type of what it was given.
+  [MaxLength(300), Classification(Personal.Content)] string About = "";
+  [Immutable, MaxLength(200)] string Given = "";
+  /// What its caller charged it to beside the agent and the work itself (`AgentRef.On`) — each scope on a line of
+  /// its own, `case:8f1c…`. "": nothing.
+  [Immutable, MaxLength(1000)] string ChargedTo = "";
+
+  /// What it has spent on models, in millionths of a US dollar, and the most it may. Counted by the kit from the
+  /// meter's own figure for each call, as each call returns.
+  long SpentMicros = 0;
+  [Immutable] long LimitMicros = 0;
+  int ModelCalls = 0;
+  int ToolCalls = 0;
+  int Turns = 0;
+  long InputTokens = 0;
+  long OutputTokens = 0;
+  long CacheReadTokens = 0;
+
+  [Immutable] DateTime StartedAt = DateTime.UtcNow;
+  DateTime? EndedAt;
+  /// How it ended, in a sentence — the problem when it failed, why when it was stopped.
+  [MaxLength(600), Classification(Personal.Content)] string Outcome = "";
+  /// What it handed back, as JSON of the skill's result type; the text of an answer when it was only asked.
+  [Classification(Personal.Content)] string? Result;
+
+  /// What it is waiting on, in a few words — "a decision from Signe" — while it waits.
+  [MaxLength(300), Classification(Personal.Content)] string WaitingOn = "";
+  /// The attempt this is (`SkillBase.Retry`), and the failed attempt it follows.
+  [Immutable] int Attempt = 1;
+  [Immutable] AgentTask? RetryOf;
+
+  /// Somebody asked for it to stop; it does at its next step.
+  bool StopAsked = false;
+  [MaxLength(300), Classification(Personal.Content)] string StopWhy = "";
+
+  /// When what it said was erased (`EraseAgentWorkContent`), when who it was for and what it was about were taken
+  /// off it (`AnonymiseAgentWork`), and why. The receipt and the record's chain stay.
+  DateTime? ContentErasedAt;
+  DateTime? AnonymisedAt;
+  [MaxLength(300)] string ErasedWhy = "";
+
+  security {
+    // Whoever it was for reads their own, and so does whoever gave the work; whoever supervises or audits reads all.
+    allow read when UsesAgents where Requester == user || StartedBy == user;
+    // SECURITY-INVARIANT(agents-every-receipt-is-read-only-by-who-the-app-names): the receipt of work that is somebody
+    // else's is read by whoever `ReadsAllAgentWork` admits — whoever supervises or audits, until the app says more —
+    // and whoever decides other people's proposals, and by nobody else; and what the work SAID on its receipt is never
+    // read through those alone (the deny below). Failure mode: anybody who gives agents work reads what was done for a
+    // colleague, or finance reads the words with the cost. Guarded by tests/roles.test.osy
+    // `every_receipt_is_read_by_who_the_app_names_and_its_words_are_not`.
+    allow read when ReadsAllAgentWork || DecidesAgentProposals || ErasesAgentRecords;
+    // SECURITY-INVARIANT(agents-whoever-teaches-reads-the-work-with-what-it-said): whoever the app's `TeachesAgents`
+    // admits reads every piece of work WITH its words — its receipt here, its record, its proposals and its questions
+    // by the same policy on each — because judging whether an agent did the right thing, and correcting it, needs
+    // what it was given and what it said. It is the one policy besides supervising and auditing that opens the
+    // words; a policy that only counts (`ReadsAllAgentWork`) or decides (`DecidesAgentProposals`) does not. What was
+    // erased is erased for a teacher too: it is gone from the row, not hidden. Failure mode both ways — a teacher who
+    // cannot see what they correct, or the words open to whoever merely reads the costs. Guarded by
+    // tests/teaching.test.osy `whoever_teaches_reads_the_work_with_what_it_said_and_nobody_else_gains_by_it`.
+    allow read when TeachesAgents;
+    // Whoever a proposal of the work is put to by name reads its receipt — its figures, not its words (the deny
+    // below): deciding asks the work's own declaration and the work above it, which are read from here.
+    allow read when IsAuthenticated where AgentProposal.Any(p => p.Task.Id == Id && p.DecideBy == user);
+    deny read About, Outcome, Result, WaitingOn, StopWhy when !SupervisesAgents && !AuditsAgents && !TeachesAgents && !ErasesAgentRecords
+      where Requester != user && StartedBy != user;
+    // The kit's own functions run as whoever gives the agent work.
+    allow create when UsesAgents;
+    allow update when UsesAgents where Requester == user || StartedBy == user;
+    allow update when SupervisesAgents;
+    allow update, delete when ErasesAgentRecords;
+    deny create except via OpenAgentTask;
+    deny update SpentMicros, ModelCalls, ToolCalls, Turns, InputTokens, OutputTokens, CacheReadTokens except via SettleAgentTask;
+    deny update Status except via CloseAgentTask, MarkAgentTaskWaiting, MarkAgentTaskWorking;
+    deny update EndedAt except via CloseAgentTask;
+    deny update WaitingOn except via CloseAgentTask, MarkAgentTaskWaiting, MarkAgentTaskWorking, AnonymiseAgentWork;
+    // What it said goes with its content; how it ended, what it was about and whose it was go when it is anonymised.
+    deny update Result except via CloseAgentTask, EraseAgentWorkContent;
+    deny update Outcome except via CloseAgentTask, AnonymiseAgentWork;
+    deny update StopAsked except via StopAgentTask, CallOffAgentWork, CallOffWorkNobodyAwaits;
+    deny update StopWhy except via StopAgentTask, CallOffAgentWork, CallOffWorkNobodyAwaits, AnonymiseAgentWork;
+    deny update Requester, StartedBy, About, AnonymisedAt except via AnonymiseAgentWork;
+    deny update ContentErasedAt except via EraseAgentWorkContent;
+    deny update ErasedWhy except via EraseAgentWorkContent, AnonymiseAgentWork;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+/// An agent's place in the app: who answers for it, and whether it is working.
+///
+/// ⚑ AN AGENT WITHOUT A SPONSOR DOES NOT RUN. The sponsor is the person accountable for what it does; whoever
+///   supervises the agents names one (`SponsorAgent`), and until then every piece of work is refused.
+[Unique(Agent)]
+public entity AgentSeat {
+  /// The agent, by its class's full name.
+  [Required, Immutable, MaxLength(200)] string Agent;
+  /// The person accountable for it.
+  Principal? Sponsor;
+  /// Paused: it takes no new work until it is resumed. Work under way finishes.
+  bool Paused = false;
+  [MaxLength(300)] string PausedWhy = "";
+
+  security {
+    // Who answers for an agent, and whether it is working, is read by everybody who has anything to do with the agents.
+    allow read when UsesAgents || SupervisesAgents || AuditsAgents || SponsorsAgents || PausesAgents || TeachesAgents || ReadsAllAgentWork;
+    // SECURITY-INVARIANT(agents-a-seat-changes-only-by-who-the-app-names): who answers for an agent is written by
+    // `SponsorAgent` alone, for a caller `SponsorsAgents` admits, and whether it works by `PauseAgent` and
+    // `ResumeAgent` alone, for a caller `PausesAgents` admits — each leaving an `AgentSeatChange` that says who.
+    // Failure mode: somebody who may only give agents work names themselves sponsor (and is then put every proposal
+    // of work done for nobody), or resumes an agent its supervisor paused. Guarded by tests/roles.test.osy
+    // `pausing_and_sponsoring_are_for_who_the_app_names_and_each_is_written_down`.
+    allow create, update when SupervisesAgents || SponsorsAgents || PausesAgents;
+    deny create except via SponsorAgent, PauseAgent;
+    deny update Sponsor except via SponsorAgent;
+
+    deny update Paused, PausedWhy except via PauseAgent, ResumeAgent;
+    deny delete;
+  }
+}
+
+// ── in charge of an agent ───────────────────────────────────────────────────────────────────────────────────────────
+
+AgentSeat? SeatOf(string agent) { return AgentSeat.FirstOrDefault(s => s.Agent == agent); }
+
+/// Name the person accountable for an agent — `SponsorAgent(Agents.Of<Auditor>().Name, lead)`. Until an agent has
+/// one, it does not run.
+[Server, Authorize(SponsorsAgents)]
+public void SponsorAgent(string agent, Principal sponsor) {
+  RequireListed(agent);
+  var seat = SeatOf(agent);
+  if (seat == null) { new AgentSeat { Agent = agent, Sponsor = sponsor }; }
+  else { seat.Sponsor = sponsor; }
+  NoteSeatChange(agent, AgentSeatChangeKind.Sponsored, "", sponsor);
+}
+
+/// Pause an agent: it takes no new work until `ResumeAgent`. Work under way finishes; `StopAgentTask` ends that.
+[Server, Authorize(PausesAgents)]
+public void PauseAgent(string agent, string why = "") {
+  RequireListed(agent);
+  var seat = SeatOf(agent);
+  if (seat != null && seat.Paused) { return; }
+  if (seat == null) { new AgentSeat { Agent = agent, Paused = true, PausedWhy = Clipped(why, 300) }; }
+  else { seat.Paused = true; seat.PausedWhy = Clipped(why, 300); }
+  NoteSeatChange(agent, AgentSeatChangeKind.Paused, why, null);
+}
+
+/// Let a paused agent take work again.
+[Server, Authorize(PausesAgents)]
+public void ResumeAgent(string agent, string why = "") {
+  var seat = SeatOf(agent);
+  if (seat == null || !seat.Paused) { return; }
+  seat.Paused = false;
+  seat.PausedWhy = "";
+  NoteSeatChange(agent, AgentSeatChangeKind.Resumed, why, null);
+}
+
+/// Call a piece of work off: it stops at its next step, as `Cancelled`, and keeps what it has done and spent. Whoever
+/// asked for the work may stop it, and so may whoever supervises the agents. Work that was abandoned — the process
+/// doing it is gone (`WasAbandoned`) — has no next step, and is closed at once.
+[Server, Authorize(IsAuthenticated)]
+public void StopAgentTask(AgentTask task, string why = "") {
+  if (task.Status != AgentTaskStatus.Working && task.Status != AgentTaskStatus.Waiting) { return; }
+  // Read before anything is written: calling work off writes on its record, and a record just written on is not quiet.
+  var abandoned = AbandonedAtOrUnder(task);
+  var quietSince = LastStepOf(task);
+  task.StopAsked = true;
+  task.StopWhy = Clipped(why, 300);
+  // Everything it handed on stops with it — each piece at its own next step, and a piece that waits now.
+  var waiting = CallOffAgentWork(task.Id, why == "" ? "The work it was part of was called off." : "The work it was part of was called off: " + why);
+  if (waiting.Count > 0) {
+    UnitOfWork.Commit();
+    foreach (var piece in waiting) { TellWaits(piece); }
+  }
+  // Work that waits on a person is not at a step: its wait is told, and ends it.
+  if (task.Status == AgentTaskStatus.Waiting) { WakeAgentWork(task.Id); }
+  // Work nothing is doing any more never reaches a next step: it, and what is under way beneath it, is closed now.
+  CloseAbandoned(abandoned, quietSince);
+}
+
+// ── the kit's own writes ────────────────────────────────────────────────────────────────────────────────────────────
+// Each is a unit of work of its own: a receipt, and every line of its record, is there whatever becomes of the work
+// it was made for — and is never part of the caller's half-finished work.
+
+/// What a new piece of work is opened with.
+public class AgentTaskOpening {
+  public string Agent = "";
+  public string Skill = "";
+  public string SkillVersion = "";
+  public int InstructionSet = 0;
+  public string InstructionsSent = "";
+  public string InstructionsHash = "";
+  public AgentTaskCause Cause = AgentTaskCause.Call;
+  public Guid Actor;
+  public Guid? Requester;
+  public Guid? Parent;
+  public string About = "";
+  public string Given = "";
+  public long LimitMicros = 0;
+  public string ChargedTo = "";
+  public Guid? RetryOf;
+  public int Attempt = 1;
+  /// The workflow run the work is started in — see `AgentTask.Run`.
+  public Guid? Run;
+  public string RunWorkflow = "";
+  public string RunState = "";
+  public Guid? RunItem;
+  public Guid? RunStarter;
+}
+
+/// ⭐ OPEN THE RECEIPT. Refused — before anything is written — when the agent has no sponsor or is paused.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal Guid OpenAgentTask(AgentTaskOpening opening) {
+  var seat = SeatOf(opening.Agent);
+  var bare = BareName(opening.Agent);
+  if (seat == null || seat.Sponsor == null) {
+    throw new AgentNotSponsored($"{bare} has no sponsor, so it does not run. Whoever supervises the agents names the "
+      + $"person accountable for it: `SponsorAgent(Agents.Of<{bare}>().Name, person)`.");
+  }
+  if (seat.Paused) {
+    throw new AgentPaused(seat.PausedWhy == "" ? $"{bare} is paused." : $"{bare} is paused: {seat.PausedWhy}");
+  }
+  var actor = Principal.Single(p => p.Id == opening.Actor);
+  var requester = opening.Requester == null ? null : Principal.FirstOrDefault(p => p.Id == opening.Requester);
+  // Read here, from the session, and never taken from the caller: who gave the work is not something to be told.
+  var me = Security.CurrentUserId;
+  var startedBy = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+  // SECURITY-INVARIANT(agents-work-for-somebody-else-needs-the-apps-leave): an agent's tools run on behalf of whoever
+  // the work is for, so naming a colleague borrows what THEY may do. A signed-in caller names themselves; anybody else
+  // only when the app's `DirectsAgentsForOthers` admits the caller. Guarded by tests/autonomy.test.osy
+  // `nobody_borrows_a_colleagues_rights_through_an_agent`.
+  var parent = opening.Parent == null ? null : AgentTask.FirstOrDefault(t => t.Id == opening.Parent);
+  var runStep = 0;
+  if (parent != null) { runStep = parent!.RunStep; }
+  else if (opening.Run != null) { runStep = AgentTask.Count(t => t.Run == opening.Run && t.Parent == null) + 1; }
+  if (opening.Parent != null) {
+    // SECURITY-INVARIANT(agents-handed-on-work-is-for-whoever-the-work-above-is-for): a piece of work that is handed
+    // on works for the person the work above it works for — read here from that work's own receipt, never taken from
+    // whoever opens it — so nothing down a tree acts for anybody the top was not given for, and a tree hangs only
+    // under work that is still under way. Failure mode: a child opened "for" somebody else borrows what THEY may do.
+    // Guarded by tests/delegation.test.osy `a_child_never_holds_more_than_its_parent`.
+    if (parent == null || parent!.Status != AgentTaskStatus.Working) {
+      throw new AgentRefused($"{bare} cannot be handed this: the work that hands it on is not under way.");
+    }
+    var forWhom = parent!.Requester == null ? null : parent!.Requester!.Id;
+    var asked = requester == null ? null : requester!.Id;
+    if (forWhom != asked) {
+      throw new AgentRefused($"{bare} is handed this by another piece of work, and works for whoever that work is for — nobody else.");
+    }
+  } else if (requester != null && startedBy != null && requester!.Id != startedBy!.Id && !Security.Authorize(startedBy!, DirectsAgentsForOthers)) {
+    throw new AgentRefused($"You may give {bare} work for yourself, not for somebody else: it would act with what they may do. "
+      + "The app says who may: `policy DirectsAgentsForOthers => …;`.");
+  }
+  var task = new AgentTask {
+    Agent = opening.Agent, Skill = opening.Skill, SkillVersion = opening.SkillVersion, Cause = opening.Cause,
+    InstructionSet = opening.InstructionSet, InstructionsSent = opening.InstructionsSent, InstructionsHash = opening.InstructionsHash,
+    Actor = actor, Requester = requester, StartedBy = startedBy, Parent = parent, Root = parent == null ? null : (parent.Root ?? parent),
+    Depth = parent == null ? 0 : parent.Depth + 1, About = Clipped(opening.About, 300), Given = opening.Given,
+    Lineage = parent == null ? "" : Clipped(parent.Agent + "|" + parent.Skill + (parent.Lineage == "" ? "" : "\n" + parent.Lineage), 4000),
+    LimitMicros = opening.LimitMicros, ChargedTo = Clipped(opening.ChargedTo, 1000), Attempt = opening.Attempt,
+    // Work handed on belongs to the step that handed it on, wherever it is opened.
+    Run = parent == null ? opening.Run : parent.Run, RunWorkflow = parent == null ? opening.RunWorkflow : parent.RunWorkflow,
+    RunState = parent == null ? opening.RunState : parent.RunState, RunItem = parent == null ? opening.RunItem : parent.RunItem,
+    RunStarter = parent == null ? opening.RunStarter : parent.RunStarter, RunStep = runStep,
+    RetryOf = opening.RetryOf == null ? null : AgentTask.FirstOrDefault(t => t.Id == opening.RetryOf),
+  };
+  if (parent == null) { new AgentTraceHead { Root = task.Id }; }
+  Raise(new AgentTaskStarted { Task = task });
+  return task.Id;
+}
+
+/// What one step added to a receipt.
+public class AgentTaskUse {
+  public long Micros = 0;
+  public int ModelCalls = 0;
+  public int ToolCalls = 0;
+  public int Turns = 0;
+  public long InputTokens = 0;
+  public long OutputTokens = 0;
+  public long CacheReadTokens = 0;
+}
+
+/// Count what a step used onto its receipt.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal void SettleAgentTask(Guid id, AgentTaskUse use) {
+  var task = AgentTask.Single(t => t.Id == id);
+  task.SpentMicros = task.SpentMicros + use.Micros;
+  task.ModelCalls = task.ModelCalls + use.ModelCalls;
+  task.ToolCalls = task.ToolCalls + use.ToolCalls;
+  task.Turns = task.Turns + use.Turns;
+  task.InputTokens = task.InputTokens + use.InputTokens;
+  task.OutputTokens = task.OutputTokens + use.OutputTokens;
+  task.CacheReadTokens = task.CacheReadTokens + use.CacheReadTokens;
+}
+
+/// Close the receipt: how it ended, and what it handed back.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal void CloseAgentTask(Guid id, AgentTaskStatus status, string outcome, string? resultJson, bool lastAttempt = true) {
+  var task = AgentTask.Single(t => t.Id == id);
+  if (task.Status != AgentTaskStatus.Working && task.Status != AgentTaskStatus.Waiting) { return; }
+  task.Status = status;
+  task.WaitingOn = "";
+  task.Outcome = Clipped(outcome, 600);
+  task.EndedAt = DateTime.UtcNow;
+  if (resultJson != null) { task.Result = resultJson; }
+  if (status == AgentTaskStatus.Done) { Raise(new AgentTaskFinished { Task = task }); }
+  else if (status == AgentTaskStatus.Failed) {
+    Raise(new AgentTaskFailed { Task = task, Problem = task.Outcome });
+    // Work that was handed on fails to the work that handed it on, which decides what to do; only the top gives up.
+    if (lastAttempt && task.Parent == null) { Raise(new AgentWorkGaveUp { Task = task, Attempts = task.Attempt, Problem = task.Outcome }); }
+  }
+  else { Raise(new AgentTaskStopped { Task = task, Why = task.Outcome }); }
+}
+
+/// The receipt says the work waits, and on what.
+[Server, Authorize(UsesAgents)]
+internal void MarkAgentTaskWaiting(Guid id, string waitingOn) {
+  var task = AgentTask.Single(t => t.Id == id);
+  if (task.Status != AgentTaskStatus.Working) { return; }
+  task.Status = AgentTaskStatus.Waiting;
+  task.WaitingOn = Clipped(waitingOn, 300);
+}
+
+/// The receipt says the work goes on.
+[Server, Authorize(UsesAgents)]
+internal void MarkAgentTaskWorking(Guid id) {
+  var task = AgentTask.Single(t => t.Id == id);
+  if (task.Status != AgentTaskStatus.Waiting) { return; }
+  task.Status = AgentTaskStatus.Working;
+  task.WaitingOn = "";
+}
+
+/// Whether somebody has asked for the work to stop — read from what is stored now, not from what this run remembers.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal string? StopAskedOf(Guid id) {
+  var task = AgentTask.Single(t => t.Id == id);
+  if (!task.StopAsked) { return null; }
+  return task.StopWhy == "" ? "It was called off." : "It was called off: " + task.StopWhy;
+}
+
+/// How a receipt stands where it is stored now.
+class ReceiptNow {
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  public string Outcome = "";
+  /// Why it was called off, when somebody asked for that — else null.
+  public string? Called;
+}
+
+/// How a piece of work stands where it is stored — read each turn by the process doing it, which is how that process
+/// hears what happened to the work meanwhile: that somebody called it off, or that it was closed.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal ReceiptNow ReceiptAsStored(Guid id) {
+  var task = AgentTask.Single(t => t.Id == id);
+  return new ReceiptNow {
+    Status = task.Status, Outcome = task.Outcome,
+    Called = !task.StopAsked ? null : task.StopWhy == "" ? "It was called off." : "It was called off: " + task.StopWhy,
+  };
+}
+
+string Clipped(string text, int max) { return text.Length <= max ? text : text.Substring(0, max); }
+
+/// ⭐ WHAT PEOPLE CALL AN AGENT — what every screen and every sentence a person reads says, in place of its class's
+/// name: the `DisplayName` its class gives it, or the class's own name in words (`InsuranceReader` → "Insurance
+/// reader"). An agent the app no longer lists is still named, by its class. Takes the class's full name or its own.
+public string AgentName(string fullName) {
+  foreach (var agent in App.Setting<AgentsSetup>().Agents) {
+    var full = AgentNameOf(agent);
+    if ((full == fullName || BareName(full) == fullName) && agent.DisplayName != "") { return agent.DisplayName; }
+  }
+  var words = "";
+  foreach (var c in BareName(fullName)) {
+    if (char.IsUpper(c) && words != "") { words = words + " " + char.ToLower(c); }
+    else { words = words + c; }
+  }
+  return words;
+}
+
+/// ⭐ HOW A PIECE OF WORK ENDED, AS A PERSON READS IT — the record's own sentence, except that money which ran out
+/// is said as money: whose limit it was, and how much, never the row of the meter that refused (`task:<id>`).
+public string OutcomeInWords(AgentTask t) {
+  var outcome = t.Outcome ?? "";
+  if (!outcome.StartsWith("Its money ran out")) { return outcome; }
+  return outcome.Contains("task:" + t.Id.ToString()) ? "Its money ran out: it could spend $" + Dollars(t.LimitMicros) + "."
+       : outcome.Contains("agent:") ? "Its money ran out: there was no room left in what the agent may spend in a day."
+       : outcome.Contains("assignment:") ? "Its money ran out: there was no room left in what its assignment may spend."
+       : "Its money ran out: the work above it had no more to spend.";
+}
+
+/// A class's own name, without its namespace.
+public string BareName(string fullName) {
+  var dot = fullName.LastIndexOf(".");
+  return dot < 0 ? fullName : fullName.Substring(dot + 1);
+}

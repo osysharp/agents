@@ -1,0 +1,63 @@
+// What happens to an agent's work, told as events. Hear one with `[On]`: `[On] void TellTheLead(AgentTaskFailed e) { … }`.
+namespace Osysharp.Agents;
+
+/// An agent was given a piece of work.
+[Event("Agent work started")]
+public sealed class AgentTaskStarted { public AgentTask Task; }
+
+/// A piece of work finished, and handed back what its skill promises.
+[Event("Agent work finished")]
+public sealed class AgentTaskFinished { public AgentTask Task; }
+
+/// A piece of work could not be finished.
+[Event("Agent work failed")]
+public sealed class AgentTaskFailed {
+  public AgentTask Task;
+  /// What went wrong, in a sentence.
+  public string Problem = "";
+}
+
+/// A piece of work was stopped before it finished: its turns or its money ran out, or somebody called it off.
+[Event("Agent work stopped")]
+public sealed class AgentTaskStopped {
+  public AgentTask Task;
+  public string Why = "";
+}
+
+/// An agent asked for help — of a more capable model, or of a person.
+[Event("Agent asked for help")]
+public sealed class AgentAskedForHelp { public AgentHelp Help; }
+
+/// A piece of work failed for good: its last attempt did. What a "needs attention" list is filled from.
+[Event("Agent work gave up")]
+public sealed class AgentWorkGaveUp {
+  public AgentTask Task;
+  /// How many attempts were made.
+  public int Attempts = 1;
+  public string Problem = "";
+}
+
+/// A piece of work stopped on a person, and goes on when they have decided or answered.
+[Event("Agent work is waiting on a person")]
+public sealed class AgentTaskWaiting {
+  public AgentTask Task;
+  /// What it waits on, in a few words.
+  public string On = "";
+}
+
+/// The run that was waiting for a piece of work was stopped, or moved on without it: nobody will read what the work
+/// hands back. The kit calls the work off when it hears this.
+[Event("Agent work is no longer awaited")]
+public sealed class AgentWorkNoLongerAwaited { public AgentTask Task; }
+
+/// An agent proposed something it may not do alone: a person decides.
+[Event("Agent proposed an action")]
+public sealed class AgentProposed { public AgentProposal Proposal; }
+
+/// A proposal was decided — approved and run, rejected, or found out of date.
+[Event("Agent proposal decided")]
+public sealed class AgentProposalDecided { public AgentProposal Proposal; }
+
+/// A question an agent put to a person has its answer — or will get none.
+[Event("Agent question closed")]
+public sealed class AgentQuestionClosed { public AgentHelp Question; }

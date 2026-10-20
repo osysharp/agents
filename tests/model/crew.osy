@@ -1,0 +1,193 @@
+// The packhouse's crew: agents that hand work on. The foreman takes a delivery in by handing each crate to the
+// inspector or the clerk; the usher does the same and may change nothing alone; the director and the yardmaster hand
+// whole deliveries to the foreman — the director two levels deep, the yardmaster only one.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Workflow;
+
+/// What comes back for a delivery.
+public class DeliveryNote {
+  /// How many crates were graded, and how many of them were short.
+  public int Graded = 0;
+  public int Short = 0;
+  /// How it went, in a sentence — what could not be done included.
+  public string Summary = "";
+}
+
+/// Takes a grower's delivery in: each crate is handed on to be graded or settled, and the note says how it went.
+public class TakeInDelivery : Skill<string, DeliveryNote> {
+  public override string Description => "Take in a grower's delivery: have each crate graded, then say how the delivery went.";
+  public override List<ActionInfo> Tools => [Actions.Of(CratesOf)];
+  public override StopWhen Stop => new StopWhen { MaxTurns = 6 };
+}
+
+/// The same job with a second chance: tried again once when it fails.
+public class CountDelivery : Skill<string, DeliveryNote> {
+  public override string Description => "Count a grower's delivery.";
+  public override RetryRule Retry => new RetryRule { Attempts = 2 };
+  public override string? Check(DeliveryNote n) => n.Graded < 0 ? "A count is not negative." : null;
+}
+
+/// Runs the yard for a day: hands each delivery to the foreman.
+public class RunTheYard : Skill<string, DeliveryNote> {
+  public override string Description => "See a grower's delivery through the yard.";
+  public override StopWhen Stop => new StopWhen { MaxTurns = 6 };
+}
+
+/// Takes deliveries in. It marks crates by itself and never condemns one — and so nothing it hands on does.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Foreman : Agent {
+  public static Person Principal => new Person { Email = "foreman@packhouse.example", DisplayName = "Foreman" };
+  public override string Purpose => "You take deliveries in at the packhouse.";
+  public override List<SkillBase> Skills => [new TakeInDelivery(), new DescribeDelivery(), new CountDelivery()];
+  public override Permits May => new Permits { Changes = Leave.Alone, Never = [Actions.Of(CondemnCrate)] };
+  public override Delegation Delegates => new Delegation {
+    To = [
+      Specialist.Of<Inspector>(new GradeCrate()),
+      Specialist.Of<Clerk>(new SettleCrate()),
+      // A crate looked at on a small allowance, and a job of its own done apart.
+      Specialist.Of<Inspector>(new QuickLook(), budget: 0.006m),
+      Specialist.Of<Porter>(new CountCrates()),
+      Specialist.Helper(new DescribeDelivery()),
+    ],
+  };
+}
+
+/// Shows deliveries in. It says nothing of what it may do alone — so it proposes every change, and so does whoever
+/// it hands work to. While the yard is closed it flags nothing at all.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Usher : Agent {
+  public static Person Principal => new Person { Email = "usher@packhouse.example", DisplayName = "Usher" };
+  public override string Purpose => "You show deliveries in at the packhouse.";
+  public override List<SkillBase> Skills => [new TakeInDelivery()];
+  public override Permits May => YardIsClosed() ? new Permits { Never = [Actions.Of(FlagCrate)] } : new Permits();
+  public override Delegation Delegates => new Delegation { To = [Specialist.Of<Inspector>(new GradeCrate())] };
+}
+
+/// Runs the yard: hands deliveries to the foreman, who may hand their crates on in turn. It may ask whoever the
+/// work is for a question first.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Director : Agent {
+  public static Person Principal => new Person { Email = "director@packhouse.example", DisplayName = "Director" };
+  public override string Purpose => "You run the packhouse yard.";
+  public override List<SkillBase> Skills => [new RunTheYard()];
+  public override Permits May => Permits.ChangesAlone();
+  public override AsksPeople People => new AsksPeople { MayChoose = true };
+  public override Delegation Delegates => new Delegation {
+    // Taking a delivery in may spend two cents, everything it hands on included.
+    To = [Specialist.Of<Foreman>(new TakeInDelivery(), budget: 0.02m), Specialist.Of<Foreman>(new CountDelivery()), Specialist.Of<Inspector>(new GradeCrate())],
+    MaxDepth = 2,
+  };
+}
+
+/// Runs the yard, and lets work be handed on one level only.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Yardmaster : Agent {
+  // What people call it — the class's name is the code's.
+  public override string DisplayName => "Yard master";
+  public static Person Principal => new Person { Email = "yardmaster@packhouse.example", DisplayName = "Yardmaster" };
+  public override string Purpose => "You keep the packhouse yard.";
+  public override List<SkillBase> Skills => [new RunTheYard()];
+  public override Permits May => Permits.ChangesAlone();
+  public override Delegation Delegates => new Delegation { To = [Specialist.Of<Foreman>(new TakeInDelivery())], MaxDepth = 1 };
+}
+
+/// Walks a delivery through: looks at what came, marks a crate itself when it must, and hands crates on.
+public class WalkDelivery : Skill<string, DeliveryNote> {
+  public override string Description => "Walk a grower's delivery through the packhouse.";
+  public override List<ActionInfo> Tools => [Actions.Of(CratesOf), Actions.Of(FlagCrate)];
+  public override StopWhen Stop => new StopWhen { MaxTurns = 6 };
+}
+
+/// Walks deliveries through. It says nothing of what it may do alone, so it proposes every change — its own, and
+/// what it hands on. It hands crates on only while the yard is open.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Steward : Agent {
+  public static Person Principal => new Person { Email = "steward@packhouse.example", DisplayName = "Steward" };
+  public override string Purpose => "You walk deliveries through the packhouse.";
+  public override List<SkillBase> Skills => [new WalkDelivery()];
+  public override Delegation Delegates => YardIsClosed()
+    ? new Delegation()
+    : new Delegation { To = [Specialist.Of<Inspector>(new GradeCrate()), Specialist.Of<Clerk>(new SettleCrate())] };
+}
+
+/// Whether the yard has been closed for the day.
+public bool YardIsClosed() { return Heard.Any(h => h.What == "yard closed"); }
+public void CloseTheYard() { new Heard { What = "yard closed" }; }
+
+public AgentOutcome<DeliveryNote> TakeIn(string growerEmail) {
+  return await Agents.Of<Foreman>().Do(new TakeInDelivery(), growerEmail, about: "Delivery of " + growerEmail);
+}
+public AgentOutcome<DeliveryNote> ShowIn(string growerEmail) {
+  return await Agents.Of<Usher>().Do(new TakeInDelivery(), growerEmail, about: "Delivery of " + growerEmail);
+}
+public AgentOutcome<DeliveryNote> WalkThrough(string growerEmail) {
+  return await Agents.Of<Steward>().Do(new WalkDelivery(), growerEmail, about: "Delivery of " + growerEmail);
+}
+public AgentOutcome<DeliveryNote> RunYard(string growerEmail) {
+  return await Agents.Of<Director>().Do(new RunTheYard(), growerEmail, about: "Yard for " + growerEmail);
+}
+public AgentOutcome<DeliveryNote> KeepYard(string growerEmail) {
+  return await Agents.Of<Yardmaster>().Do(new RunTheYard(), growerEmail, about: "Yard for " + growerEmail);
+}
+/// Ask the foreman something and watch the answer arrive: the signals, as words.
+public List<string> WatchForeman(string question) {
+  List<string> seen = [];
+  await foreach (var s in Agents.Of<Foreman>().Stream(question)) {
+    if (s.Kind == AgentSignalKind.Text) { seen.Add("text:" + s.Text); }
+    else if (s.Kind == AgentSignalKind.Done) { seen.Add("done:" + s.Reply!.Text); }
+    else { seen.Add(s.Kind.Name + ":" + s.Tool + (s.Failed ? ":failed" : "")); }
+  }
+  return seen;
+}
+
+/// The same, for a grower, charged to the delivery — and held to what it may spend.
+public AgentOutcome<DeliveryNote> TakeInOn(string growerEmail, string delivery, decimal limit) {
+  return await Agents.Of<Foreman>().On("delivery:" + delivery, limit).Do(new TakeInDelivery(), growerEmail, about: "Delivery " + delivery);
+}
+
+/// Note something from inside a model's answer — in a unit of work of its own, so it is there whichever piece of
+/// work, on whichever thread, the model was answering for.
+[Server, OwnUnitOfWork]
+public void NoteApart(string what, string about) { new Heard { What = what, About = about }; }
+
+/// A model that takes a moment to answer: it notes that it was asked, waits, and notes that it answered — so a test
+/// can tell whether two models were answering at the same time.
+public void TakeAMoment(string who) {
+  NoteApart("asked " + who, DateTime.UtcNow.Ticks.ToString());
+  await Task.Delay(TimeSpan.FromMilliseconds(400));
+  NoteApart("answered " + who, DateTime.UtcNow.Ticks.ToString());
+}
+
+// ── a process whose step is a whole tree ────────────────────────────────────────────────────────────────────────────
+
+public enum IntakeStage { Open, Closed }
+
+/// A delivery on its way in, seen through the yard by the director as a step of a process.
+entity Intake {
+  [Required, MaxLength(200)] string GrowerEmail;
+  IntakeStage Stage = IntakeStage.Open;
+  [MaxLength(400)] string Note = "";
+  security { allow read, create, update when IsAuthenticated; }
+}
+
+workflow IntakeFlow {
+  Tracks = Intake.Stage; Autostart = false; Initial = Open;
+  state Open {
+    enter {
+      var outcome = await Agents.Of<Director>().Do(new RunTheYard(), this.Item.GrowerEmail, about: "Intake for " + this.Item.GrowerEmail);
+      this.Item.Note = outcome.Done ? outcome.Result.Summary : outcome.Status.Name + ": " + outcome.Problem;
+      goto Closed;
+    }
+  }
+  terminal success Closed { }
+}
+
+public void OpenIntake(string growerEmail) {
+  var intake = new Intake { GrowerEmail = growerEmail };
+  UnitOfWork.Commit();
+  Workflow.Run(intake);
+}

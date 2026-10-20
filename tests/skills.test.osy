@@ -1,0 +1,146 @@
+// Osysharp.Agents — the catalogue: every skill the app's agents hold, described from its own declaration.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Packhouse;
+
+[Test(Yard)]
+[runas(Ada)]
+void the_catalogue_lists_every_skill_of_every_agent_the_app_lists() {
+  var all = Skills.Catalog();
+  Assert.Equal([
+    "Packhouse.Inspector/Packhouse.GradeCrate", "Packhouse.Inspector/Packhouse.DescribeDelivery", "Packhouse.Inspector/Packhouse.QuickLook",
+    "Packhouse.Inspector/Packhouse.ReadTheLedger", "Packhouse.Inspector/Packhouse.MarkDelivery",
+    "Packhouse.Sorter/Packhouse.GradeCrate", "Packhouse.Trainee/Packhouse.GradeCrate",
+    "Packhouse.Clerk/Packhouse.SettleCrate",
+    "Packhouse.Porter/Packhouse.SettleCrate", "Packhouse.Porter/Packhouse.SettleByTheBook", "Packhouse.Porter/Packhouse.CountCrates",
+    "Packhouse.Understudy/Packhouse.LearnAlone", "Packhouse.Understudy/Packhouse.GradeCrate",
+    "Packhouse.Foreman/Packhouse.TakeInDelivery", "Packhouse.Foreman/Packhouse.DescribeDelivery", "Packhouse.Foreman/Packhouse.CountDelivery",
+    "Packhouse.Usher/Packhouse.TakeInDelivery", "Packhouse.Director/Packhouse.RunTheYard", "Packhouse.Yardmaster/Packhouse.RunTheYard",
+    "Packhouse.Steward/Packhouse.WalkDelivery", "Packhouse.Warden/Packhouse.SettleForQuality",
+  ], all.Select(s => s.Agent + "/" + s.Skill).ToList());
+  Assert.Equal(["Packhouse.Inspector", "Packhouse.Sorter", "Packhouse.Trainee", "Packhouse.Clerk", "Packhouse.Porter", "Packhouse.Understudy",
+                "Packhouse.Foreman", "Packhouse.Usher", "Packhouse.Director", "Packhouse.Yardmaster", "Packhouse.Steward", "Packhouse.Warden"], Agents.Names());
+  // What each agent may hand on, and to whom — nothing, unless its class says.
+  Assert.Equal(0, Delegations.Of("Packhouse.Inspector").Count);
+  Assert.Equal(["Inspector: Grade crate", "Clerk: Settle crate", "Inspector: Quick look", "Porter: Count crates", "Foreman: Describe delivery"],
+    Delegations.Of("Packhouse.Foreman").Select(d => BareName(d.To) + ": " + d.Label).ToList());
+  var look = Delegations.Of("Packhouse.Foreman")[2];
+  Assert.Equal(0.006m, look.Budget);
+  Assert.False(Delegations.Of("Packhouse.Foreman")[0].Helper);
+  Assert.True(Delegations.Of("Packhouse.Foreman")[4].Helper);
+  Assert.Equal(2, Delegations.DepthOf("Packhouse.Director"));
+  // Each tool says what the agent's declaration lets it do with it: the clerk, who says nothing, weighs alone and
+  // proposes the rest; the porter flags alone, proposes a change of line every time, and never condemns.
+  var clerk = Skills.Find("Packhouse.Clerk", "Packhouse.SettleCrate")!;
+  Assert.Equal(["Alone", "Propose", "Propose", "Propose"], clerk.Tools.Select(t => t.Leave.Name).ToList());
+  var porter = Skills.Find("Packhouse.Porter", "Packhouse.SettleCrate")!;
+  Assert.Equal(["Alone", "Alone", "Never", "ProposeEveryTime"], porter.Tools.Select(t => t.Leave.Name).ToList());
+  // An agent the app does not list has no skills here.
+  Assert.Equal(0, Skills.Of("Packhouse.Stowaway").Count);
+  Assert.Equal(5, Skills.Of("Packhouse.Inspector").Count);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_skill_is_described_by_what_it_takes_and_what_it_hands_back() {
+  var grade = Skills.Find("Packhouse.Inspector", "Packhouse.GradeCrate")!;
+  Assert.Equal("Grade crate", grade.Label);
+  Assert.Equal("Grade one crate of fruit.", grade.Description);
+  Assert.Equal("3", grade.Version);
+  Assert.Equal("Packhouse.Crate", grade.Takes);
+  Assert.Equal("Packhouse.Grade", grade.HandsBack);
+  // The schema of the result is the type's own: its members, and the words written on them.
+  Assert.StartsWith("{\"type\":\"object\"", grade.HandsBackSchema);
+  Assert.Contains("\"Score\":{\"type\":\"integer\"", grade.HandsBackSchema);
+  Assert.Contains("0 (unusable) to 10 (perfect).", grade.HandsBackSchema);
+  Assert.Contains("\"Short\":{\"type\":\"boolean\"}", grade.HandsBackSchema);
+
+  // A job that takes and answers words.
+  var describe = Skills.Find("Packhouse.Inspector", "Packhouse.DescribeDelivery")!;
+  Assert.Equal("System.String", describe.Takes);
+  Assert.Equal("System.String", describe.HandsBack);
+  Assert.Null(Skills.Find("Packhouse.Sorter", "Packhouse.DescribeDelivery"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_skills_tools_say_what_each_one_does_as_the_compiler_proved_it() {
+  var tools = Skills.Find("Packhouse.Inspector", "Packhouse.GradeCrate")!.Tools;
+  Assert.Equal(["Packhouse.Weigh", "Packhouse.FlagCrate", "Packhouse.CondemnCrate"], tools.Select(t => t.Action).ToList());
+
+  Assert.Equal("Weigh the crate", tools[0].Label);
+  Assert.Equal("What a crate weighs, in kilograms.", tools[0].Description);
+  Assert.True(tools[0].ReadsOnly);
+  Assert.False(tools[0].Changes);
+
+  Assert.False(tools[1].ReadsOnly);
+  Assert.True(tools[1].Changes);
+  Assert.False(tools[1].Sends);
+  Assert.Contains("\"flag\":{\"type\":\"string\"}", tools[1].ParametersSchema);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void the_model_is_offered_exactly_the_skills_tools_described_by_their_own_schemas() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  ScriptedAnswer.Stub((model, request) => {
+    NoteOffer(request, "offered");
+    new Heard { What = "choice", About = request.ToolChoice.Name };
+    new Heard { What = "told", About = request.SystemSegments[0].Content + " // " + request.SystemSegments[1].Content };
+    new Heard { What = "schema", About = request.Tools[1].InputSchemaJson };
+    new Heard { What = "brief", About = Scripted.Asked(request) };
+    return Says.HandBack(new Grade { Score = 7 });
+  });
+
+  Inspect(crate);
+
+  // The skill's three tools and the way to hand the result back — held to calling one of them.
+  Assert.Equal("Weigh,FlagCrate,CondemnCrate,hand_back", Heard.Single(h => h.What == "offered").About);
+  Assert.Equal("Any", Heard.Single(h => h.What == "choice").About);
+  // Who it is, then the job: the agent's purpose, the skill's description and instructions.
+  var told = Heard.Single(h => h.What == "told").About;
+  Assert.StartsWith("You are Inspector. You grade the fruit that arrives at the packhouse, one crate at a time. // Grade one crate of fruit.", told);
+  Assert.Contains("A crate under 10 kg is short", told);
+  Assert.Contains("hand the result back by calling `hand_back`", told);
+  // A tool's arguments are the action's own schema; what it is given is the skill's brief of the input.
+  Assert.Equal(Actions.Of(FlagCrate).ParametersSchema, Heard.Single(h => h.What == "schema").About);
+  Assert.Equal($"Crate A-1. Its id is {crate.Id}.", Heard.Single(h => h.What == "brief").About);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void the_results_of_old_tool_calls_are_cleared_once_the_conversation_is_long() {
+  // Six pages of the ledger, each over a thousand characters; the skill keeps about six thousand in all.
+  ScriptedAnswer.Stub((model, request) => {
+    var turn = request.Messages.Count(m => m.Role == "assistant");
+    if (turn == 6) { NoteCleared(request); return Says.Words("Forty crates a page, all weighed."); }
+    return Says.Tool(Actions.Of(ReadLedger), "{\"page\":" + (turn + 1).ToString() + "}");
+  });
+
+  var outcome = ReadLedgerThrough();
+
+  Assert.True(outcome.Done);
+  // Five pages passed the threshold: the three oldest became one line each, which brought the conversation back
+  // under it — so on the seventh turn those three are lines and the three newest are there in full.
+  Assert.Equal(3, Heard.Count(h => h.What == "cleared"));
+  Assert.Equal(3, Heard.Count(h => h.What == "kept"));
+  // Every page was still read, and the record holds each one whole.
+  Assert.Equal(6, AgentTask.Single().ToolCalls);
+  Assert.Equal(6, TraceEvent.Count(e => e.Kind == TraceKind.ToolResult && e.Payload != null && e.Payload!.Length > 1000));
+}
+
+[Test(Yard)]
+void an_agent_is_called_what_its_class_says_people_call_it_or_its_name_in_words() {
+  // Its own name, given by the class.
+  Assert.Equal("Yard master", AgentName("Packhouse.Yardmaster"));
+  Assert.Equal("Yard master", AgentName("Yardmaster"));
+  // None given: the class's name in words.
+  Assert.Equal("Foreman", AgentName("Packhouse.Foreman"));
+  Assert.Equal("Usher", AgentName("Packhouse.Usher"));
+  // An agent the app no longer lists is still named, by its class.
+  Assert.Equal("Night watchman", AgentName("Packhouse.NightWatchman"));
+  // What is written in the record is the class's full name, whatever people call it.
+  Assert.Equal("Packhouse.Yardmaster", Agents.Of<Yardmaster>().Name);
+}

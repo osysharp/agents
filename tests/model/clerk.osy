@@ -1,0 +1,175 @@
+// The packhouse's clerk and porter: two agents that do not do everything alone. The clerk says nothing about what it
+// may do — so it looks things up alone and proposes the rest — and turns to a person when it must. The porter moves
+// crates by itself, proposes a change of line every time, and never condemns a crate.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Workflow;
+
+// Growers and the lead may tell an agent "from now on, alone" for their own work; only the lead gives an agent work
+// for somebody else.
+policy WidensAgentAutonomy    => IsGrower || IsLead;
+policy DirectsAgentsForOthers => IsLead;
+
+/// Send a crate to one of the lines.
+[Action("Send the crate to a line")]
+public string MoveToLine(Crate crate, string line) {
+  crate.Line = line;
+  return $"{crate.Code} goes to {line}.";
+}
+
+/// The crate a tool's arguments name, from their JSON.
+public Crate? CrateIn(string argumentsJson) {
+  var values = JsonSerializer.Deserialize<Dictionary<string, Json>>(argumentsJson);
+  if (!values.ContainsKey("crate")) { return null; }
+  var id = Guid.Parse(values["crate"].ToString().Replace("\"", ""));
+  return Crate.FirstOrDefault(c => c.Id == id);
+}
+
+/// Settles one crate: weighs it, marks what it finds, sends it on.
+public class SettleCrate : Skill<Crate, Grade> {
+  public override string Description => "Settle one crate: weigh it, mark what you find, and send it to a line.";
+  public override List<ActionInfo> Tools => [Actions.Of(Weigh), Actions.Of(FlagCrate), Actions.Of(CondemnCrate), Actions.Of(MoveToLine)];
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+  // A yes to a proposal covers the crate as it was weighed: weighed again, it is another crate.
+  public override string VersionOf(string action, string argumentsJson) {
+    var crate = CrateIn(argumentsJson);
+    return crate == null ? "" : crate!.Kilos.ToString();
+  }
+  public override string HandedSchema() => HandOn.ById("The crate to settle.");
+  public override Crate Handed(string inputJson) {
+    var id = HandOn.IdIn(inputJson);
+    return Crate.Single(c => c.Id == id);
+  }
+}
+
+/// The same job, by the book: here even a flag is proposed, whatever the agent may do elsewhere.
+public class SettleByTheBook : Skill<Crate, Grade> {
+  public override string Description => "Settle one crate, by the book.";
+  public override List<ActionInfo> Tools => [Actions.Of(Weigh), Actions.Of(FlagCrate), Actions.Of(MoveToLine)];
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+  public override Permits? May => new Permits { Changes = Leave.Alone, Propose = [Actions.Of(FlagCrate)] };
+}
+
+/// A job that fails the first time it is tried.
+public class CountCrates : Skill<string, Grade> {
+  public override string Description => "Count a grower's crates.";
+  public override RetryRule Retry => new RetryRule { Attempts = 2 };
+  public override string? Check(Grade g) => g.Score < 0 ? "A count is not negative." : null;
+}
+
+/// Says nothing about what it may do alone.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Clerk : Agent {
+  public static Person Principal => new Person { Email = "clerk@packhouse.example", DisplayName = "Clerk" };
+  public override string Purpose => "You settle the crates that arrive at the packhouse.";
+  public override List<SkillBase> Skills => [new SettleCrate()];
+  public override AsksPeople People => new AsksPeople { MayChoose = true, WhenStuck = true, Most = 2 };
+}
+
+/// Moves crates by itself — but a change of line is proposed every time, and it never condemns.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Porter : Agent {
+  public static Person Principal => new Person { Email = "porter@packhouse.example", DisplayName = "Porter" };
+  public override string Purpose => "You carry crates where they belong.";
+  public override List<SkillBase> Skills => [new SettleCrate(), new SettleByTheBook(), new CountCrates()];
+  public override Permits May => new Permits {
+    Changes = Leave.Alone, ProposeEveryTime = [Actions.Of(MoveToLine)], Never = [Actions.Of(CondemnCrate)],
+  };
+}
+
+public AgentOutcome<Grade> Settle(Crate crate) {
+  return await Agents.Of<Clerk>().Do(new SettleCrate(), crate, about: "Crate " + crate.Code);
+}
+public AgentOutcome<Grade> SettleFor(Person grower, Crate crate) {
+  return await Agents.Of<Clerk>().For(grower).Do(new SettleCrate(), crate, about: "Crate " + crate.Code);
+}
+public AgentOutcome<Grade> Carry(Crate crate) {
+  return await Agents.Of<Porter>().Do(new SettleCrate(), crate, about: "Crate " + crate.Code);
+}
+public AgentOutcome<Grade> CarryByTheBook(Crate crate) {
+  return await Agents.Of<Porter>().Do(new SettleByTheBook(), crate, about: "Crate " + crate.Code);
+}
+public AgentOutcome<Grade> CountFor(string growerEmail) { return await Agents.Of<Porter>().Do(new CountCrates(), growerEmail); }
+public AgentReply AskClerk(string question) { return await Agents.Of<Clerk>().Ask(question); }
+
+// ── a process that gives the clerk work, and waits with it ──────────────────────────────────────────────────────────
+
+public enum ClaimStage { Open, Settled, Withdrawn }
+
+/// A grower's claim about a crate, settled by the clerk.
+entity Claim {
+  [Required] Crate Crate;
+  ClaimStage Stage = ClaimStage.Open;
+  [MaxLength(400)] string Finding = "";
+  /// The run that settles it, as the run itself says.
+  Guid? Run;
+  security { allow read, create, update when IsAuthenticated; }
+}
+
+workflow ClaimFlow {
+  Tracks = Claim.Stage; Autostart = false; Initial = Open;
+  /// The grower takes the claim back.
+  event Withdraw();
+  state Open {
+    subscribe Withdraw();
+    enter {
+      this.Item.Run = Workflow.Current?.Id;
+      var outcome = await Agents.Of<Clerk>().Do(new SettleCrate(), this.Item.Crate, about: "Claim on " + this.Item.Crate.Code);
+      this.Item.Finding = outcome.Done ? outcome.Result.Finding : outcome.Status.Name + ": " + outcome.Problem;
+      goto Settled;
+    }
+    on Withdraw { goto Withdrawn; }
+  }
+  terminal success Settled { }
+  terminal cancel  Withdrawn { Message = "the grower took the claim back"; }
+}
+
+/// Take a claim back while it is being settled.
+public void WithdrawClaim(Claim claim) { ClaimFlow.RaiseWithdraw(claim); }
+
+public void OpenClaim(Crate crate) {
+  var claim = new Claim { Crate = crate };
+  UnitOfWork.Commit();
+  Workflow.Run(claim);
+}
+
+// ── the packhouse's own checks ──────────────────────────────────────────────────────────────────────────────────────
+
+public string AskedOf(LlmRequest request) { return Scripted.Asked(request); }
+
+/// Nothing marked "embargoed" goes to a model or into a tool, and no tool's answer that names the vault reaches one.
+public class Embargo : AgentGuard {
+  public override GuardVerdict BeforeModel(GuardedWork work, LlmRequest request) {
+    return AskedOf(request).Contains("embargoed") ? GuardVerdict.Block("Embargoed fruit is not discussed with a model.") : GuardVerdict.Allow();
+  }
+  public override GuardVerdict BeforeTool(GuardedWork work, ActionInfo tool, string argumentsJson) {
+    return argumentsJson.Contains("contraband") ? GuardVerdict.Block("Nothing is flagged contraband by an agent.") : GuardVerdict.Allow();
+  }
+  public override GuardVerdict AfterTool(GuardedWork work, ActionInfo tool, string resultJson) {
+    return resultJson.Contains("vault") ? GuardVerdict.Block("What is in the vault stays there.") : GuardVerdict.Allow();
+  }
+}
+
+[On] void WorkWaits(AgentTaskWaiting e)        { new Heard { What = "waiting", About = e.On }; }
+[On] void WorkGaveUp(AgentWorkGaveUp e)        { new Heard { What = "gave up", About = e.Attempts.ToString() + ": " + e.Problem }; }
+[On] void Proposed(AgentProposed e)            { new Heard { What = "proposed", About = BareName(e.Proposal.Action) }; }
+[On] void Decided(AgentProposalDecided e)      { new Heard { What = "decided", About = e.Proposal.Status.Name }; }
+[On] void NoLongerAwaited(AgentWorkNoLongerAwaited e) { new Heard { What = "no longer awaited", About = e.Task.About }; }
+
+// ── what app code is not able to do ─────────────────────────────────────────────────────────────────────────────────
+
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AgentProposal { }
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AgentHelp { }
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AgentStandingRule { }
+
+/// A proposal marked approved by hand, and one made up.
+public void ForgeApproval(AgentProposal proposal) { proposal.Status = ProposalStatus.Done; }
+public void ForgeProposal(AgentTask task) { new AgentProposal { Task = task, Agent = task.Agent, Action = "Packhouse.CondemnCrate" }; }
+/// An answer written straight onto a question, and a standing rule made up.
+public void ForgeAnswer(AgentHelp question) { question.Answer = "Do as you like."; question.Status = HelpStatus.Answered; }
+public void ForgeRule(Person me) { new AgentStandingRule { Agent = "Packhouse.Clerk", Action = "Packhouse.CondemnCrate", GrantedBy = me }; }
+/// The app's own relay, called by somebody signed in.
+public void RelayByHand(AgentProposal proposal, Person by) { RelayProposalDecision(proposal, true, "", by); }

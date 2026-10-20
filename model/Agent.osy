@@ -1,0 +1,355 @@
+// Agents — declared as classes, given typed work.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// ⭐ AN AGENT: a principal of the app with a purpose, the skills it holds, and what it may spend.
+///
+///     /// Grades the fruit that arrives at the packhouse.
+///     [Actor(Roles = [PackhouseRole.Grader])]
+///     public class Inspector : Agent {
+///       public static Person Principal => new Person { Email = "inspector@packhouse.example", DisplayName = "Inspector" };
+///       public override string Purpose => "Grade each crate that arrives, and flag the ones that are short.";
+///       public override List<SkillBase> Skills => [new GradeCrate()];
+///       public override AgentLimits Limits => new AgentLimits { PerTask = 0.25m, Daily = 5 };
+///     }
+///
+///     app.Agents = new AgentsSetup { Agents = [new Inspector()] };
+///
+/// ⚑ `[Actor]` IS WHO IT IS: the account the platform makes for it, holding exactly the roles the declaration names.
+///   Whatever one of its tools does is done as that account — and, when it works for a person, never past what that
+///   person could do themselves.
+public class Agent {
+  /// What people call it, wherever a person reads its name: an inbox item, a run's history, the pages about its
+  /// work. "" (the default): its class's own name in words — `InsuranceReader` reads "Insurance reader".
+  public virtual string DisplayName => "";
+  /// What it is for, in a sentence or two. The first thing the model is told.
+  public virtual string Purpose => "";
+  /// Standing instructions that hold for everything it does, whichever skill.
+  public virtual string Instructions => "";
+  /// The skills it holds. It can be given work only for one of these, and can use only their tools.
+  public virtual List<SkillBase> Skills => [];
+  /// What it may spend.
+  public virtual AgentLimits Limits => new AgentLimits();
+  /// What it needs of the model when it is simply asked something (`Ask`, `Stream`). A skill says its own.
+  public virtual ModelNeeds Needs => new ModelNeeds { Kind = LlmTaskKind.Converse, Latency = LlmLatencySensitivity.Interactive };
+
+  /// ⭐ WHO IT ASKS WHEN IT IS UNSURE: one of the app's models, by name — a more capable one than does its everyday
+  /// work. "" (the default): nobody, and nothing of its work is ever sent to another model. With one named, the
+  /// model doing the work may consult it on a focused question; work that is stuck consults it once before giving
+  /// up (`StuckAfter`); and a decision it is not sure enough of is asked of it again (`ConfidenceFloor`).
+  public virtual string Consults => "";
+  /// How many times in a row a step may fail — a tool that refuses, a result that does not fit — before the work is
+  /// stuck: it then consults once, when it has somebody to consult, and fails the next time.
+  public virtual int StuckAfter => 2;
+  /// A decision (`Decide<T>`) the model is less sure of than this is asked again of the model it consults.
+  /// 0: never.
+  public virtual decimal ConfidenceFloor => 0;
+
+  /// ⭐ WHAT IT MAY DO ALONE, what it proposes to a person first, and what it never does — see `Permits`. Said
+  /// nothing, it looks things up alone and proposes everything else.
+  public virtual Permits May => new Permits();
+  /// ⭐ WHEN IT TURNS TO A PERSON — see `AsksPeople`. Said nothing, it asks nobody.
+  public virtual AsksPeople People => new AsksPeople();
+  /// ⭐ WHAT IT MAY HAND ON TO OTHER AGENTS — see `Delegation`. Said nothing, it hands nothing on.
+  public virtual Delegation Delegates => new Delegation();
+  /// Whether it may SUGGEST an instruction for itself while it works — "from now on, weigh before grading" — with
+  /// the `suggest_instruction` tool. What it suggests is only ever proposed: a person reads it, and nothing the agent
+  /// is told changes until that person makes it active (Instructions.osy). Said nothing, it suggests none.
+  public virtual bool SuggestsInstructions => false;
+}
+
+/// How a piece of work ended, and what it handed back.
+public class AgentOutcome<T> {
+  /// What the skill promises, when `Status` is `Done`.
+  public T Result;
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  /// The receipt's id — `AgentTask.Single(t => t.Id == outcome.Task)`.
+  public Guid Task;
+  /// What it spent on models, in millionths of a US dollar.
+  public long CostMicros = 0;
+  /// The problem, when it did not finish.
+  public string Problem = "";
+
+  public bool Done => Status == AgentTaskStatus.Done;
+  /// It stopped on a person — a proposal to decide, a question to answer — and goes on when they have. `Task` is its
+  /// receipt; its end is told as an event (`AgentTaskFinished`, `AgentTaskFailed`, `AgentTaskStopped`). Inside a
+  /// workflow `Do` never answers this: the run waits with the work.
+  public bool Waiting => Status == AgentTaskStatus.Waiting;
+}
+
+/// A piece of work whose receipt is written and which has not run yet — what `Open` answers.
+public class AgentWork<TIn, TOut> {
+  /// The receipt's id. It is stored: `StopAgentTask(AgentTask.Single(t => t.Id == work.Task))` reaches the work
+  /// from anywhere while it is under way.
+  public Guid Task;
+  public Skill<TIn, TOut> Skill;
+  public AgentRun State;
+  /// What it was opened with, for another attempt (`SkillBase.Retry`).
+  public AgentRef Agent;
+  public TIn Input;
+  public string About = "";
+
+  /// Do the work. Answers what `Do` answers.
+  ///
+  /// Work that fails is tried again, from the start and on a receipt of its own, as many times as its skill says
+  /// (`Retry`); `Task` stays the first attempt's, the outcome names the last. Work that stops on a person: inside
+  /// a workflow this waits with it, however long; anywhere else it answers at once with `Waiting`.
+  public async Task<AgentOutcome<TOut>> Run() {
+    DriveWork(State, Skill);
+    while (State.Status == AgentTaskStatus.Failed && State.Attempt < State.MaxAttempts) {
+      State = StartWork(Agent, Skill, Skill.Brief(Input), About, State.Task, State.Attempt + 1);
+      DriveWork(State, Skill);
+    }
+    if (State.Status == AgentTaskStatus.Waiting && Workflow.InRun) {
+      await WorkEnds(State.Task);
+      var end = ReceiptEndOf(State.Task);
+      var held = new AgentOutcome<TOut> { Status = end.Status, Task = State.Task, CostMicros = end.SpentMicros,
+                                          Problem = end.Status == AgentTaskStatus.Done ? "" : end.Outcome };
+      if (end.Status == AgentTaskStatus.Done) { held.Result = Skill.Read(end.ResultJson); }
+      return held;
+    }
+    var outcome = new AgentOutcome<TOut> { Status = State.Status, Task = State.Task, CostMicros = State.SpentMicros, Problem = State.Problem };
+    if (State.Status == AgentTaskStatus.Done) { outcome.Result = Skill.Read(State.ResultJson); }
+    return outcome;
+  }
+}
+
+/// One turn of a conversation handed to `Ask`: who said it — "user" or "assistant" — and what.
+public class AgentTurn {
+  public string Role = "user";
+  public string Text = "";
+}
+
+/// What an agent answered when it was asked.
+public class AgentReply {
+  public string Text = "";
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  public Guid Task;
+  public long CostMicros = 0;
+  public string Problem = "";
+
+  public bool Done => Status == AgentTaskStatus.Done;
+  /// It stopped on a person, and goes on when they have decided or answered: the answer will be on the receipt.
+  public bool Waiting => Status == AgentTaskStatus.Waiting;
+}
+
+/// What one signal of a streamed answer is.
+public enum AgentSignalKind {
+  /// More of the answer's text. Uses `Text`.
+  Text,
+  /// It is running a tool. Uses `Tool`.
+  ToolStarted,
+  /// The tool answered. Uses `Tool` and `Failed`.
+  ToolFinished,
+  /// It asked for help. Uses `Tool` ("consult") and `Text` (of whom).
+  AskedForHelp,
+  /// ⛔ THE LAST SIGNAL OF EVERY STREAM. Uses `Reply`.
+  Done,
+  /// The work stopped on a person — a proposal, a question — and goes on when they have decided or answered. `Done`
+  /// follows, with a reply whose `Status` is `Waiting`.
+  Waiting,
+}
+
+/// One signal of a streamed answer.
+public class AgentSignal {
+  public AgentSignalKind Kind = AgentSignalKind.Text;
+  public string Text = "";
+  public string Tool = "";
+  public bool Failed = false;
+  public AgentReply? Reply;
+}
+
+/// ⭐ ONE OF THE APP'S AGENTS, ready to be given work — what `Agents.Of<Auditor>()` answers.
+public class AgentRef {
+  /// The agent, by its class's full name — what receipts and budgets know it by.
+  public string Name = "";
+  /// Its own account: the principal its tools run as.
+  public Principal Actor;
+  /// Who the work is done for when the caller says (`For(person)`); otherwise whoever is signed in.
+  public Principal? Person;
+  public bool ForSomebody = false;
+  /// What the caller charges the work to beside the agent and the piece of work itself — see `On`.
+  public List<LlmLimit> ChargedTo = [];
+
+  /// The same agent, working for `person` — and so never past what that person may do — rather than for whoever is
+  /// signed in. For work the app starts itself: a workflow acting for the customer who placed the order.
+  ///
+  /// ⚑ A SIGNED-IN CALLER NAMES THEMSELVES, AND NOBODY ELSE — unless the app says they may:
+  ///   `policy DirectsAgentsForOthers => IsLead;`. Otherwise the work is refused before anything runs.
+  public AgentRef For(Principal person) {
+    return new AgentRef { Name = Name, Actor = Actor, Person = person, ForSomebody = true, ChargedTo = ChargedTo };
+  }
+
+  /// ⭐ THE SAME AGENT, ITS WORK CHARGED TO SOMETHING OF THE CALLER'S — a case, an order, a project — and held to
+  /// what that may still spend. Every model call of the work names `scope` (`"case:" + c.Id`), so the cost is counted
+  /// there as it happens; with a `limit`, in US dollars, room is reserved against it before each call leaves and work
+  /// that would pass it is stopped where it stands. The receipt records what it was charged to (`AgentTask.ChargedTo`).
+  ///
+  ///     var outcome = await Agents.Of<Tracer>().On("case:" + c.Id, limit: 2.00m).Do(new TraceParcel(), order);
+  public AgentRef On(string scope, decimal? limit = null) {
+    return On(new LlmLimit { Scope = scope, LimitMicros = limit == null ? UnlimitedMicros() : Micros(limit!) });
+  }
+
+  /// The same, with the limit said in full — its window, its figure in millionths of a dollar, what to do at it.
+  public AgentRef On(LlmLimit charge) {
+    if (charge.Scope.Trim() == "" || !charge.Scope.Contains(":")) {
+      throw new ValidationException("Work is charged to a kind and a subject: `\"case:\" + c.Id`.");
+    }
+    List<LlmLimit> all = [];
+    foreach (var c in ChargedTo) { if (c.Scope != charge.Scope) { all.Add(c); } }
+    all.Add(charge);
+    return new AgentRef { Name = Name, Actor = Actor, Person = Person, ForSomebody = ForSomebody, ChargedTo = all };
+  }
+
+  /// ⭐ GIVE IT A PIECE OF WORK: a skill it holds, and the skill's input. Answers a task that ends when the work
+  /// has — with the skill's typed result when it finished.
+  ///
+  ///     var outcome = await Agents.Of<Inspector>().Do(new GradeCrate(), crate);
+  ///     if (outcome.Done && outcome.Result.Score < 4) { Reject(crate); }
+  ///
+  /// Awaited where it is called, it is the plain call. Kept (`var a = inspector.Do(…); var b = inspector.Do(…);`),
+  /// two pieces of work are in flight at once and each is awaited where its result is needed.
+  ///
+  /// `about` is what the receipt says the work is about, as a person reads it in a list.
+  public async Task<AgentOutcome<TOut>> Do<TIn, TOut>(Skill<TIn, TOut> skill, TIn input, string about = "") {
+    var work = Open(skill, input, about);
+    return await work.Run();
+  }
+
+  /// ⭐ THE SAME IN TWO STEPS, for a caller that needs the receipt before the work runs — to note what it is waiting
+  /// on, or to be able to call the work off while it is under way. `Open` checks everything `Do` checks and writes
+  /// the receipt (`work.Task`); nothing has been asked of a model yet. `Run` does the work.
+  ///
+  ///     var work = Agents.Of<Tracer>().Open(new TraceParcel(), order);
+  ///     Remember(work.Task);                       // …so `StopAgentTask` can reach it
+  ///     var outcome = await work.Run();
+  public AgentWork<TIn, TOut> Open<TIn, TOut>(Skill<TIn, TOut> skill, TIn input, string about = "") {
+    var run = StartWork(this, skill, skill.Brief(input), about, null, 1);
+    return new AgentWork<TIn, TOut> { Task = run.Task, Skill = skill, State = run, Agent = this, Input = input, About = about };
+  }
+
+  /// Ask it something. It answers in words, using the tools of the skills it holds.
+  public async Task<AgentReply> Ask(string question) {
+    List<AgentTurn> turns = [ new AgentTurn { Role = "user", Text = question } ];
+    return await Ask(turns);
+  }
+
+  /// The same, with the conversation so far — the turns the app chooses to hand it.
+  public async Task<AgentReply> Ask(List<AgentTurn> turns) {
+    var skill = new Conversation();
+    var run = StartChat(this, skill, turns);
+    DriveWork(run, skill);
+    return ReplyOf(run);
+  }
+
+  /// Ask it something, and watch the answer arrive: its text as it is written, each tool as it runs, and — last —
+  /// `Done` with the whole reply.
+  public stream<AgentSignal> Stream(string question) {
+    List<AgentTurn> turns = [ new AgentTurn { Role = "user", Text = question } ];
+    foreach (var s in Stream(turns)) { yield return s; }
+  }
+
+  /// The same, with the conversation so far.
+  public stream<AgentSignal> Stream(List<AgentTurn> turns) {
+    var skill = new Conversation();
+    var run = StartChat(this, skill, turns);
+    foreach (var s in StreamWork(run, skill)) { yield return s; }
+  }
+
+  /// ⭐ A TYPED DECISION, with a second opinion when the first is not sure enough: `input` in, a `T` out with how
+  /// sure the model is. When the agent names a model to consult and the confidence is under its `ConfidenceFloor`,
+  /// the same question is asked once of that model, and its answer is the one handed back (`Decision.Model` says who
+  /// answered). Both calls are charged to the agent.
+  public async Task<Decision<T>> Decide<T>(string input, string question = "") {
+    var agent = Definition(Name);
+    var scopes = AgentScopes(Name);
+    var limits = AgentLimitsOf(Name, agent);
+    var first = await Llm.Decide<T>(input, question, new LlmCall { Kind = LlmTaskKind.Decide, Scopes = scopes, Limits = limits, Purpose = "decide" });
+    var consults = agent.Consults;
+    if (consults == "" || first.Confidence >= agent.ConfidenceFloor || !MayConsult()) { return first; }
+    var record = new HelpRecord {
+      Agent = Name, Requester = Security.CurrentUserId, From = HelpFrom.Model, Why = HelpReason.LowConfidence,
+      AskedModel = consults, Question = question, Context = input,
+    };
+    try {
+      var second = await Llm.Decide<T>(input, question, new LlmCall {
+        Model = consults, Kind = LlmTaskKind.Decide, Step = LlmStep.Consult, Scopes = scopes, Limits = limits,
+        Purpose = "consult", OnLimit = LlmOnLimit.Stop,
+      });
+      record.Status = HelpStatus.Answered;
+      record.Answer = $"Decided with confidence {second.Confidence}; the first answer had {first.Confidence}.";
+      record.CostMicros = second.CostMicros;
+      RecordAgentHelp(record);
+      return second;
+    } catch (LlmRefused e) {
+      record.Status = HelpStatus.Refused;
+      record.Answer = consults + " could not be consulted: " + e.Message;
+    } catch (ExternalServiceException e) {
+      record.Status = HelpStatus.Unavailable;
+      record.Answer = consults + " could not be reached: " + e.Message;
+    }
+    RecordAgentHelp(record);
+    return first;
+  }
+}
+
+/// ⭐ THE APP'S AGENTS. `Agents.Of<Auditor>()` answers one, ready to be given work.
+public class Agents {
+  /// The agent declared by the class `T` — one of those listed in `app.Agents`.
+  public static AgentRef Of<T>() {
+    var name = typeof(T).FullName;
+    RequireListed(name);
+    return new AgentRef { Name = name, Actor = Actor.Of<T>() };
+  }
+
+  /// Every agent the app lists, by its class's full name.
+  public static List<string> Names() {
+    List<string> names = [];
+    foreach (var agent in App.Setting<AgentsSetup>().Agents) { names.Add(AgentNameOf(agent)); }
+    return names;
+  }
+}
+
+/// The free-text job behind `Ask` and `Stream`: the conversation in, words out, with every tool the agent's skills hold.
+public class Conversation : Skill<string, string> {
+  public override string Description => "Answer what is asked, using the tools at hand when they help.";
+  public override ModelNeeds Needs => new ModelNeeds { Kind = LlmTaskKind.Converse, Latency = LlmLatencySensitivity.Interactive };
+}
+
+/// The agent's declaration, by its class's full name.
+Agent Definition(string name) {
+  foreach (var agent in App.Setting<AgentsSetup>().Agents) {
+    if (AgentNameOf(agent) == name) { return agent; }
+  }
+  throw new AgentNotListed($"{BareName(name)} is not one of this app's agents. List it where the app is configured: "
+    + $"`app.Agents = new AgentsSetup {{ Agents = [new {BareName(name)}()] }};`");
+}
+
+void RequireListed(string name) { Definition(name); }
+
+/// What an agent's calls are charged to beside the app and whoever asked.
+List<string> AgentScopes(string name) { return ["agent:" + name]; }
+
+/// The limits an agent's own declaration puts on every call it makes.
+List<LlmLimit> AgentLimitsOf(string name, Agent agent) {
+  List<LlmLimit> limits = [];
+  var daily = agent.Limits.Daily;
+  if (daily != null) {
+    limits.Add(new LlmLimit { Scope = "agent:" + name, Window = LlmBudgetWindow.Day, LimitMicros = Micros(daily!) });
+  }
+  return limits;
+}
+
+/// US dollars as millionths of one.
+long Micros(decimal dollars) { return (long)Math.Round(dollars * 1000000m); }
+
+/// A limit nothing reaches: work charged to a scope with no limit of its own is counted there, and not held.
+long UnlimitedMicros() { return 1000000000000000; }
+
+AgentReply ReplyOf(AgentRun run) {
+  var reply = new AgentReply { Status = run.Status, Task = run.Task, CostMicros = run.SpentMicros, Problem = run.Problem };
+  if (run.Status == AgentTaskStatus.Done) { reply.Text = run.Text; }
+  return reply;
+}

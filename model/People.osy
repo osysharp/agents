@@ -1,0 +1,165 @@
+// Asking a person — the last rung of the ladder of help. The work stops where it stands until they have answered.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// The name of the tool a model asks a person with.
+const string AskPersonTool = "ask_person";
+
+/// What the model asks a person with.
+public class PersonAsk {
+  /// The one question, as the person will read it.
+  public string Question = "";
+  /// What they need to know to answer it: they see nothing else of the work.
+  public string Context = "";
+  /// The answers to choose between, when the question has a few. Leave it empty for an answer in words.
+  public List<string> Options = [];
+}
+
+/// ⭐ WHEN AN AGENT TURNS TO A PERSON.
+///
+///     public override AsksPeople People => new AsksPeople {
+///       MayChoose = true,                                         // the model may ask when it judges it should
+///       WhenStuck = true,                                         // …and is made to, when it is stuck and no model helped
+///       About = "Anything over 500 EUR, and any refusal to a customer.",   // …and for these, before it does anything
+///     };
+///
+/// Who is asked is the person the work is for; the agent's sponsor when it is for nobody. An agent that says nothing
+/// asks nobody.
+public class AsksPeople {
+  /// The model doing the work may ask a person one focused question, as it may consult a stronger model.
+  public bool MayChoose = false;
+  /// Work that is stuck — after the model it consults has been asked, when it names one — asks a person once before
+  /// it gives up.
+  public bool WhenStuck = false;
+  /// Kinds of decision that are a person's: said to the model, which then asks before it decides one.
+  public string About = "";
+  /// The most questions one piece of work may put to a person.
+  public int Most = 3;
+
+  public bool Any() { return MayChoose || WhenStuck || About.Trim() != ""; }
+}
+
+/// Who a piece of work asks: the person it is for; the agent's sponsor when it is for nobody. Work that was handed
+/// on asks whoever the work at the TOP would: the person that is for, or the sponsor of the agent at the top.
+Guid? PersonToAsk(AgentRun run) {
+  if (run.Person != null) { return run.Person; }
+  return SponsorOf(run.Above.Count == 0 ? run.Agent : TopAgentOf(run.Task));
+}
+
+/// The agent's sponsor, read where it is stored.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal Guid? SponsorOf(string agent) {
+  var seat = SeatOf(agent);
+  if (seat == null || seat!.Sponsor == null) { return null; }
+  return seat!.Sponsor!.Id;
+}
+
+/// Put a question to a person and record that it waits. Answers the row's id.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal Guid AskAgentQuestion(HelpRecord record, Guid person) {
+  var me = Security.CurrentUserId;
+  var help = new AgentHelp {
+    StartedBy = me == null ? null : Principal.FirstOrDefault(p => p.Id == me),
+    Agent = record.Agent, Task = record.Task == null ? null : AgentTask.FirstOrDefault(t => t.Id == record.Task),
+    Requester = record.Requester == null ? null : Principal.FirstOrDefault(p => p.Id == record.Requester),
+    From = HelpFrom.Person, Why = record.Why, AskedPerson = Principal.Single(p => p.Id == person),
+    Question = record.Question, Context = record.Context, OptionsJson = JsonSerializer.Serialize(record.Options), Status = HelpStatus.Waiting,
+    AskedThrough = Clipped(record.AskedThrough, 600),
+  };
+  Raise(new AgentAskedForHelp { Help = help });
+  return help.Id;
+}
+
+/// ⭐ ANSWER A QUESTION AN AGENT PUT TO YOU. Its work goes on from where it stood, with your answer. For the person
+/// who was asked, and whoever supervises the agents.
+[Server, Authorize(IsAuthenticated)]
+public void AnswerAgentQuestion(AgentHelp question, string answer) {
+  var me = Security.CurrentUserId;
+  var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+  if (person == null) { throw new AgentRefused("A question is answered by a person: nobody is signed in."); }
+  var theirs = (question.AskedPerson != null && question.AskedPerson!.Id == person!.Id) || Security.Authorize(person!, SupervisesAgents);
+  if (!theirs) { throw new AgentRefused("This question is not put to you."); }
+  SettleAgentQuestion(question.Id, answer, person!.Id);
+}
+
+/// An answer a person gave somewhere else — on a request in their inbox, through a link — carried to the question
+/// by the code that received it. For code that runs as the app only.
+[Server, Authorize(IsTheApp)]
+public void RelayAnswerToAgent(AgentHelp question, string answer, Principal? by) {
+  SettleAgentQuestion(question.Id, answer, by == null ? null : by!.Id);
+}
+
+/// A question nobody will answer — its request was called off or ran out of time. The work is told so, and goes on
+/// without. For code that runs as the app only.
+[Server, Authorize(IsTheApp)]
+public void RelayNoAnswerToAgent(AgentHelp question, string why) {
+  CloseAgentQuestion(question.Id, HelpStatus.Unavailable, why == "" ? "Nobody answered." : why, null);
+  if (question.Task != null) { WakeAgentWork(question.Task!.Id); }
+}
+
+void SettleAgentQuestion(Guid id, string answer, Guid? by) {
+  if (answer.Trim() == "") { throw new ValidationException("Write your answer: the agent goes on from it."); }
+  var question = AgentHelp.Single(h => h.Id == id);
+  if (question.From != HelpFrom.Person) { throw new AgentRefused("That request for help was put to a model, not to a person."); }
+  if (question.Status != HelpStatus.Waiting) { throw new AgentRefused("This question has already been answered."); }
+  CloseAgentQuestion(id, HelpStatus.Answered, answer.Trim(), by);
+  if (question.Task != null) { WakeAgentWork(question.Task!.Id); }
+}
+
+/// The one place a question's answer is written.
+[Server, Authorize(IsAuthenticated)]
+internal void CloseAgentQuestion(Guid id, HelpStatus status, string answer, Guid? by) {
+  var question = AgentHelp.Single(h => h.Id == id);
+  if (question.Status != HelpStatus.Waiting) { return; }
+  question.Status = status;
+  question.Answer = answer;
+  question.AnsweredAt = DateTime.UtcNow;
+  if (by != null) { question.AnsweredBy = Principal.FirstOrDefault(p => p.Id == by); }
+  UnitOfWork.Commit();
+  Raise(new AgentQuestionClosed { Question = question });
+}
+
+/// The questions waiting for whoever is signed in.
+public List<AgentHelp> QuestionsForMe() {
+  var me = Security.CurrentUserId;
+  if (me == null) { return []; }
+  return AgentHelp.Where(h => h.From == HelpFrom.Person && h.Status == HelpStatus.Waiting && h.AskedPerson.Id == me).OrderBy(h => h.At).Take(200).ToList();
+}
+
+/// The person answered: the line of the record, and what the model is told — as the answer of its `ask_person`
+/// when it chose to ask; as advice before its next turn when it was stuck.
+void PersonAnswered(AgentRun run, AgentHelp question, long waitedSeconds) {
+  var who = question.AskedPerson == null ? "A person" : NameOfPrincipal(question.AskedPerson!);
+  var came = question.Status == HelpStatus.Answered;
+  Trace(run, new TraceEntry {
+    Kind = TraceKind.AskedForHelp, Help = question.Id,
+    Summary = came ? $"{who} answered after {WaitWords(waitedSeconds)}." : $"{who} did not answer: {Clipped(question.Answer, 300)}",
+    PayloadJson = JsonSerializer.Serialize(question.Answer),
+  });
+  if (question.Why == HelpReason.Stuck) {
+    // Asked because the work was stuck, between two turns: the answer is advice, and the model tries again.
+    run.Failures = 0;
+    var advice = came ? $"{who} was asked because the last attempts failed, and says:\n{question.Answer}"
+                      : "A person was asked for help, and nobody answered. Finish as well as you can, or say what you cannot do.";
+    var last = run.Messages[run.Messages.Count - 1];
+    if (last.Role == "user") { last.Content.Add(new LlmContentBlock { Kind = LlmBlockKind.Text, Text = advice }); }
+    else { run.Messages.Add(UserSays(advice)); }
+    return;
+  }
+  var back = new LlmContentBlock { Kind = LlmBlockKind.ToolResult, ToolUseId = run.WaitingToolUse, IsError = !came };
+  back.ResultJson = JsonSerializer.Serialize(came ? question.Answer : "Nobody answered. Go on without, or say what you cannot do.");
+  if (came) { run.Failures = 0; }
+  AnswerPending(run, back);
+}
+
+/// How long somebody took, as a person says it: "4 minutes", "3 days".
+string WaitWords(long seconds) {
+  if (seconds < 90) { return seconds <= 1 ? "a moment" : seconds.ToString() + " seconds"; }
+  if (seconds < 5400) { return (seconds / 60).ToString() + " minutes"; }
+  if (seconds < 172800) { return (seconds / 3600).ToString() + " hours"; }
+  return (seconds / 86400).ToString() + " days";
+}
+
+string NameOfPrincipal(Principal p) { return p.DisplayName != "" ? p.DisplayName : p.Email; }

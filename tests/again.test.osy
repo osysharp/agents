@@ -1,0 +1,109 @@
+// Osysharp.Agents — trying a piece of work again by hand: the same agent, skill and brief, from the beginning, on a
+// receipt of its own — for whoever may read what the work was given, and for the same person only when the caller
+// may give work for them.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+[TestFixture]
+void YardWithAReader() {
+  Yard();
+  // Uma grows fruit and audits the agents: she gives them work, and reads what any work said — but she may not
+  // give an agent work for somebody else.
+  var uma = new Person { Email = "uma@packhouse.example", DisplayName = "Uma" };
+  new RoleGrant { Member = uma, Role = PackhouseRole.Grower };
+  new RoleGrant { Member = uma, Role = PackhouseRole.Auditor };
+}
+
+principal Uma => Person.Single(p => p.Email == "uma@packhouse.example");
+
+/// The first line of a piece of work's record: what it was given.
+string GivenTo(Guid task) {
+  return TraceEvent.Where(e => e.Task.Id == task && e.Kind == TraceKind.Started).OrderBy(e => e.Seq).First().Payload ?? "";
+}
+
+/// ⭐ ONLY WHAT YOU MAY READ IS YOURS TO RUN AGAIN. Ada's work was called off. The lead reads that it happened and not
+/// what it was given: she cannot have it run again. Uma reads what it was given, and may not give the clerk work for
+/// Ada. Ada tries it again herself: the same brief, a receipt of its own, the second attempt.
+[Test(YardWithAReader)]
+void work_is_tried_again_only_by_who_may_read_what_it_was_given() {
+  Guid first;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool("It weighs 8 kg, and a full crate holds 10.", Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    first = Settle(crate).Task;
+    // Under way, it is not tried again: it is called off first.
+    var underWay = Assert.Throws<AgentRefused>(() => RetryAgentWork(AgentTask.Single()));
+    Assert.StartsWith("It is still under way.", underWay.Message);
+    StopAgentTask(AgentTask.Single(), "The crate was weighed wrong.");
+    UnitOfWork.Commit();
+    Workflow.Settle(AgentWait.Where(w => w.Task.Id == first).OrderByDescending(w => w.Since).First());
+    Assert.Equal(AgentTaskStatus.Cancelled, AgentTask.Single().Status);
+  }
+  // The lead supervises: she reads the receipt, and not what the work was given. So it is not hers to run again —
+  // though she may give the clerk work for anybody.
+  runas (Dana) {
+    Assert.Equal("", GivenTo(first));
+    var refused = Assert.Throws<AgentRefused>(() => RetryAgentWork(AgentTask.Single()));
+    Assert.StartsWith("Trying it again starts from what it was given, and that is not yours to read", refused.Message);
+    Assert.Equal(1, AgentTask.Count());
+  }
+  // Uma reads what it was given. It would run for Ada again, and giving the clerk work for Ada is not Uma's to do.
+  runas (Uma) {
+    Assert.Contains("Crate A-2", GivenTo(first));
+    var refused = Assert.Throws<AgentRefused>(() => RetryAgentWork(AgentTask.Single()));
+    Assert.StartsWith("You may give Clerk work for yourself, not for somebody else", refused.Message);
+    Assert.Equal(1, AgentTask.Count());
+  }
+  // The auditor reads everything and gives the agents no work: trying work again is not his at all.
+  runas (Omar) { Assert.Denied(() => RetryAgentWork(AgentTask.Single())); }
+  // Ada tries it again. A new receipt, the second attempt, for her — given exactly what the first was given.
+  runas (Ada) {
+    var again = RetryAgentWork(AgentTask.Single(t => t.Id == first));
+    var second = AgentTask.Single(t => t.Id == again);
+    Assert.Equal(2, second.Attempt);
+    Assert.Equal(first, second.RetryOf!.Id);
+    Assert.Equal(Ada.Id, second.Requester!.Id);
+    Assert.Equal("Packhouse.Clerk", second.Agent);
+    Assert.Equal("Packhouse.SettleCrate", second.Skill);
+    Assert.Equal(AgentTask.Single(t => t.Id == first).About, second.About);
+    Assert.Equal(GivenTo(first), GivenTo(again));
+    // It ran like any piece of work: the flag is proposed again, to her.
+    Assert.Equal(AgentTaskStatus.Waiting, second.Status);
+    Assert.Equal(Ada.Id, AgentProposal.Single(p => p.Status == ProposalStatus.Waiting).DecideBy!.Id);
+    // Once: the first attempt has been tried again, and says so.
+    var twice = Assert.Throws<AgentRefused>(() => RetryAgentWork(AgentTask.Single(t => t.Id == first)));
+    Assert.Equal("It has been tried again already. Open the attempt that followed it.", twice.Message);
+    // She says yes; it finishes — and work that finished is not tried again.
+    ApproveAgentProposal(AgentProposal.Single(p => p.Status == ProposalStatus.Waiting));
+    Workflow.Settle(AgentWait.Where(w => w.Task.Id == again).OrderByDescending(w => w.Since).First());
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single(t => t.Id == again).Status);
+    var done = Assert.Throws<AgentRefused>(() => RetryAgentWork(AgentTask.Single(t => t.Id == again)));
+    Assert.StartsWith("It finished.", done.Message);
+    Assert.Equal(2, AgentTask.Count());
+  }
+}
+
+/// A piece of work another piece handed on is not tried again by itself: the work above it was told how it ended.
+[Test(YardWithAReader)]
+void a_piece_that_was_handed_on_is_not_tried_again_by_itself() {
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    // The inspector's result never fits what its skill promises, so its piece fails; the foreman is told, and goes on.
+    var cast = AgentCast.Of()
+      .Plays<Foreman>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(crate.Id)), Says.HandBack(new DeliveryNote { Summary = "A-1 could not be graded." })))
+      .Plays<Inspector>(AgentScript.Of(Says.HandBackJson("{\"Score\":\"high\"}"), Says.HandBackJson("{\"Score\":\"high\"}"), Says.HandBackJson("{\"Score\":\"high\"}"), Says.HandBackJson("{\"Score\":\"high\"}")));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    Assert.True(TakeIn("ada@packhouse.example").Done);
+    var piece = AgentTask.Single(t => t.Parent != null);
+    Assert.Equal(AgentTaskStatus.Failed, piece.Status);
+    var refused = Assert.Throws<AgentRefused>(() => RetryAgentWork(piece));
+    Assert.StartsWith("It was handed on by another piece of work", refused.Message);
+  }
+}

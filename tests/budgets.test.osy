@@ -1,0 +1,188 @@
+// Osysharp.Agents — money: every piece of work has a hard limit, reserved against before each call leaves; an agent's
+// own daily limit and the budgets the app's managers set bind the same calls; and what a receipt says was spent is
+// what the meter says.
+//
+// The numbers. The everyday model costs $1 a million tokens in and $5 out, and an answer may run to 1000 tokens — so
+// each call reserves a little over 5000 millionths of a dollar before it leaves, whatever it then really costs.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Packhouse;
+
+[Test(Yard)]
+[runas(Ada)]
+void a_piece_of_work_is_stopped_when_its_money_runs_out_and_keeps_what_it_did() {
+  // A quick look may spend 12000. Two calls at 4000 each leave 4000 — less than a third call reserves.
+  var a1 = Crate.Single(c => c.Code == "A-1");
+  var a2 = Crate.Single(c => c.Code == "A-2");
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(FlagCrate), "{\"crate\":\"" + a1.Id.ToString() + "\",\"flag\":\"bruised\"}", 1000, 600),
+    Says.Tool(Actions.Of(Weigh), "{\"crate\":\"" + a2.Id.ToString() + "\"}", 1000, 600),
+    Says.HandBack(new Grade { Score = 5 }));
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return script.Answer(model, request); });
+
+  var outcome = Glance(a1);
+
+  Assert.Equal(AgentTaskStatus.Stopped, outcome.Status);
+  Assert.StartsWith("Its money ran out: There is no room left in the limit set for task:", outcome.Problem);
+  Assert.Contains("($0.01). Nothing was sent.", outcome.Problem);
+  // The model heard two calls, not three.
+  Assert.Equal(2, Heard.Count(h => h.What == "asked"));
+  var receipt = AgentTask.Single();
+  Assert.Equal(12000, receipt.LimitMicros);
+  Assert.Equal(8000, receipt.SpentMicros);
+  Assert.Equal(2, receipt.ModelCalls);
+  // What it had done stays done, and its record is whole.
+  Assert.Equal("bruised", Crate.Single(c => c.Code == "A-1").Flag);
+  Assert.True(VerifyTrace(receipt).Intact);
+  Assert.Equal("Ended", Trajectory.Kinds(receipt.Id)[Trajectory.Kinds(receipt.Id).Count - 1]);
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.What == "stopped"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void the_limit_of_a_piece_of_work_is_the_skills_then_the_agents_then_the_apps() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  ScriptedAnswer.Stub((model, request) => Says.HandBack(new Grade { Score = 5 }));
+
+  // The skill says 0.012; the sorter says 0.10 for a piece of its work; the packhouse says 0.05 for the rest.
+  Assert.Equal(12000, AgentTask.Single(t => t.Id == Glance(crate).Task).LimitMicros);
+  Assert.Equal(100000, AgentTask.Single(t => t.Id == InspectCarefully(crate).Task).LimitMicros);
+  Assert.Equal(50000, AgentTask.Single(t => t.Id == Inspect(crate).Task).LimitMicros);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void an_agents_own_daily_limit_binds_every_piece_of_its_work() {
+  // The sorter may spend 0.30 a day. Each piece of work here is one call at 60000.
+  var crate = Crate.Single(c => c.Code == "A-1");
+  ScriptedAnswer.Stub((model, request) => Says.HandBack(new Grade { Score = 5 }, 10000, 10000));
+
+  for (var i = 0; i < 5; i++) { Assert.True(InspectCarefully(crate).Done); }
+  var sixth = InspectCarefully(crate);
+
+  Assert.Equal(AgentTaskStatus.Stopped, sixth.Status);
+  Assert.Contains("no room left in the limit set for agent:Packhouse.Sorter for today ($0.30)", sixth.Problem);
+  Assert.Equal(0, sixth.CostMicros);
+  // The inspector's work is not the sorter's: it goes on.
+  Assert.True(Inspect(crate).Done);
+}
+
+[Test(Yard)]
+void a_budget_the_apps_manager_sets_binds_an_agents_work_too() {
+  ScriptedAnswer.Stub((model, request) => Says.HandBack(new Grade { Score = 5 }));
+  // The lead allows the inspector a tenth of a cent a day — less than one call reserves.
+  runas (Dana) { SetBudget("agent", "Packhouse.Inspector", LlmBudgetWindow.Day, 0.001m); UnitOfWork.Commit(); }
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var outcome = Inspect(crate);
+    Assert.Equal(AgentTaskStatus.Stopped, outcome.Status);
+    Assert.Contains("no room left in the agent budget for Packhouse.Inspector for today", outcome.Problem);
+    // The sorter falls under no such budget.
+    Assert.True(InspectCarefully(crate).Done);
+  }
+}
+
+[Test(Yard)]
+void what_a_receipt_says_was_spent_is_what_the_meter_says() {
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(Weigh), "{\"crate\":\"" + crate.Id.ToString() + "\"}", 700, 30),
+      Says.HandBack(new Grade { Score = 4, Short = true }, 900, 80));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = Inspect(crate).Task;
+    // 700 + 150 and 900 + 400.
+    Assert.Equal(2150, AgentTask.Single().SpentMicros);
+    // What the work has used of its own limit, as the model kit counted it.
+    Assert.Equal(0.00215m, SpentAgainst("task:" + task.ToString()));
+  }
+  runas (Dana) {
+    Assert.Equal(0.00215m, SpentOn("task:" + task.ToString()));
+    Assert.Equal(0.00215m, SpentOn("agent:Packhouse.Inspector"));
+    Assert.Equal(0.00215m, SpentOn("skill:Packhouse.GradeCrate"));
+    Assert.Equal(2, ModelCall.Count(c => c.Purpose == "GradeCrate" && c.Requester == Ada.Id));
+  }
+}
+
+// ── charged to something of the caller's ────────────────────────────────────────────────────────────────────────────
+
+/// Work charged to a delivery (`On`) is counted there as each call returns — not afterwards — and the receipt says
+/// what it was charged to.
+[Test(Yard)]
+void work_charged_to_something_of_the_callers_is_counted_there_call_by_call() {
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(Weigh), "{\"crate\":\"" + crate.Id.ToString() + "\"}", 700, 30),
+      Says.HandBack(new Grade { Score = 4, Short = true }, 900, 80));
+    // What the delivery has been charged when the second call arrives: the first call's 850, already.
+    ScriptedAnswer.Stub((model, request) => {
+      new Heard { What = "charged so far", About = SpentAgainst("delivery:D-7").ToString() };
+      return script.Answer(model, request);
+    });
+    var outcome = InspectOn(crate, "D-7", null);
+    task = outcome.Task;
+    Assert.True(outcome.Done);
+    Assert.Equal(["0", "0.00085"], Heard.Where(h => h.What == "charged so far").OrderBy(h => h.About).ToList().Select(h => h.About).ToList());
+    Assert.Equal(0.00215m, SpentAgainst("delivery:D-7"));
+    Assert.Equal("delivery:D-7", AgentTask.Single().ChargedTo);
+  }
+  runas (Dana) {
+    Assert.Equal(0.00215m, SpentOn("delivery:D-7"));
+    Assert.Contains("delivery:D-7", ModelCall.First(c => c.Purpose == "GradeCrate").Scopes);
+  }
+}
+
+/// With a limit, the work is held to it WHILE it runs: a call that does not fit what the delivery has left is never
+/// sent, and the work is stopped with what it did.
+[Test(Yard)]
+[runas(Ada)]
+void work_is_held_to_the_callers_limit_while_it_runs() {
+  // The delivery may spend 0.008 — less than the work's own 0.05. One call at 4000 leaves 4000; the next reserves 5012.
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(FlagCrate), "{\"crate\":\"" + crate.Id.ToString() + "\",\"flag\":\"bruised\"}", 1000, 600),
+    Says.HandBack(new Grade { Score = 5 }));
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return script.Answer(model, request); });
+
+  var outcome = InspectOn(crate, "D-8", 0.008m);
+
+  Assert.Equal(AgentTaskStatus.Stopped, outcome.Status);
+  Assert.Contains("no room left in the limit set for delivery:D-8 ($0.0080)", outcome.Problem);
+  Assert.Equal(1, Heard.Count(h => h.What == "asked"));
+  Assert.Equal(4000, AgentTask.Single().SpentMicros);
+  Assert.Equal("bruised", Crate.Single(c => c.Code == "A-1").Flag);
+  // The same work with room to spare finishes.
+  Assert.True(InspectOn(Crate.Single(c => c.Code == "A-2"), "D-9", 1m).Done);
+}
+
+/// `Open` writes the receipt before the work runs, so the work can be reached — and called off — while it is under
+/// way: here the model's first answer arrives after somebody stopped it, and the work ends at its next step.
+[Test(Yard)]
+[runas(Ada)]
+void work_opened_first_can_be_called_off_while_it_is_under_way() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(Weigh), "{\"crate\":\"" + crate.Id.ToString() + "\"}"),
+    Says.HandBack(new Grade { Score = 5 }));
+  ScriptedAnswer.Stub((model, request) => {
+    // While the model is "thinking", the work is already there to be found, and somebody calls it off.
+    CallOffTheNotedWork("The delivery was turned away.");
+    return script.Answer(model, request);
+  });
+
+  var outcome = InspectNoted(crate);
+
+  Assert.Equal(AgentTaskStatus.Cancelled, outcome.Status);
+  Assert.Equal("It was called off: The delivery was turned away.", outcome.Problem);
+  // One model call was made — and paid for — and the tool it asked for never ran. (Counted where it is stored: this
+  // unit of work read the receipt before the call was counted on it.)
+  Assert.Equal(1, AgentTask.Count(t => t.ModelCalls == 1 && t.ToolCalls == 0));
+  Assert.Equal(12.5m, Weigh(crate));
+  Assert.Equal(outcome.Task.ToString(), Heard.Single(h => h.What == "opened").About);
+}

@@ -1,0 +1,63 @@
+// Trying a piece of work again, by hand — after it failed, was stopped or was called off.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// ⭐ TRY A PIECE OF WORK AGAIN: the same agent, the same skill, the same brief — started from the beginning, on a
+/// receipt of its own that says which attempt it follows (`RetryOf`, `Attempt`), for the person the first was for.
+/// Answers the new receipt's id.
+///
+///     var again = RetryAgentWork(AgentTask.Single(t => t.Id == failed));
+///
+/// ⚑ ONLY WHAT YOU MAY READ IS YOURS TO RUN AGAIN. It starts from what the work was given, which is the work's
+///   content: the person it was for and whoever gave it read that, and so does an auditor who gives agents work. Somebody who
+///   reads only that the work happened is refused — and so is anybody trying somebody else's work again without the
+///   app's leave to give an agent work for others (`DirectsAgentsForOthers`), because it runs for that person again.
+///
+/// Refused for work that is still under way or that finished; for a piece another piece of work handed on, and for
+/// a step of a process — each of those was told how it ended and went on from there; and for work that has been
+/// tried again already.
+[Server, Authorize(UsesAgents)]
+public Guid RetryAgentWork(AgentTask task) {
+  var bare = BareName(task.Agent);
+  if (task.Status == AgentTaskStatus.Working || task.Status == AgentTaskStatus.Waiting) {
+    throw new AgentRefused("It is still under way. Call it off first, if it should start again from the beginning.");
+  }
+  if (task.Status == AgentTaskStatus.Done) { throw new AgentRefused($"It finished. Give {bare} the work again where it is given, if it should be done twice."); }
+  if (task.Skill == "") { throw new AgentRefused($"{bare} was asked something, not given a job. Ask it again."); }
+  if (task.Parent != null) {
+    throw new AgentRefused("It was handed on by another piece of work, which was told how it ended and went on. Try the work at the top again.");
+  }
+  if (task.Run != null) {
+    throw new AgentRefused("It was a step of a process, which was told how it ended and has gone on from there. The process says what happens after a step fails.");
+  }
+  if (AgentTask.Any(t => t.RetryOf == task)) { throw new AgentRefused("It has been tried again already. Open the attempt that followed it."); }
+  SkillBase? skill = null;
+  foreach (var s in Definition(task.Agent).Skills) { if (SkillNameOf(s) == task.Skill) { skill = s; } }
+  if (skill == null) { throw new SkillNotHeld($"{bare} no longer holds the skill {BareName(task.Skill)}."); }
+
+  // SECURITY-INVARIANT(agents-work-is-tried-again-only-from-what-its-reader-may-read): the brief is read here as
+  // whoever is calling, under the record's own rule — never handed in, and never read for them. A caller who may not
+  // read what the work was given cannot have it run again, so trying again never shows or reuses content its caller
+  // could not see; and the new work is opened like any other, so it is for the same person only when the caller may
+  // give work for them. Guarded by tests/again.test.osy `work_is_tried_again_only_by_who_may_read_what_it_was_given`.
+  var first = TraceEvent.Where(e => e.Task == task && e.Kind == TraceKind.Started).OrderBy(e => e.Seq).FirstOrDefault();
+  var given = first == null ? null : first!.Payload;
+  if (given == null || given == "") {
+    throw new AgentRefused("Trying it again starts from what it was given, and that is not yours to read, or has been erased. "
+      + "Whoever the work was for can try it again, and so can whoever audits the agents.");
+  }
+  // The record keeps the brief as a JSON string; read it back exactly, as the one member of an object.
+  var brief = JsonSerializer.Deserialize<GivenBrief>("{\"Text\":" + given! + "}").Text;
+  var who = new AgentRef { Name = task.Agent, Actor = task.Actor, Person = task.Requester, ForSomebody = task.Requester != null };
+  // Charged to what the first was charged to. The limits those carried were the caller's to say then, and are not
+  // kept; the attempt is held by its own.
+  foreach (var scope in task.ChargedTo.Split("\n")) { if (scope.Trim() != "") { who = who.On(scope.Trim()); } }
+  var run = StartWork(who, skill!, brief, task.About, task.Id, task.Attempt + 1);
+  DriveWork(run, skill!);
+  return run.Task;
+}
+
+/// What a piece of work was given, read back from its record.
+class GivenBrief { public string Text = ""; }

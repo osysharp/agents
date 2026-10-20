@@ -1,0 +1,46 @@
+// Osysharp.Agents — an AI agent given a real job inside an app, and trusted with it.
+//
+//     [Actor(Roles = [PackhouseRole.Grader])]
+//     public class Inspector : Agent {
+//       public static Person Principal => new Person { Email = "inspector@packhouse.example" };
+//       public override string Purpose => "Grade each crate that arrives.";
+//       public override List<SkillBase> Skills => [new GradeCrate()];
+//     }
+//     public class GradeCrate : Skill<Crate, Grade> {
+//       public override List<ActionInfo> Tools => [Actions.Of(Weigh), Actions.Of(FlagCrate)];
+//     }
+//
+//     var outcome = Agents.Of<Inspector>().Do(new GradeCrate(), crate);      // typed in, typed out, checked
+//
+// ⚑ AN AGENT IS A DECLARED ACTOR: an account of the app holding exactly the roles its class names. Its tools are the
+//   app's own `[Action]` functions, run as that account and — when it works for a person — never past what that
+//   person may do themselves.
+//
+// ⚑ EVERY PIECE OF WORK LEAVES A RECEIPT AND A RECORD: one `AgentTask` (who asked, as whom, what it cost, how it
+//   ended) and its `TraceEvent` lines (each model call with the model and why, each tool, each request for help),
+//   chained so a changed line is found. Only this package writes them.
+//
+// ⚑ THE APP SAYS THREE THINGS, each nobody's until it does:
+//     policy UsesAgents       => IsStaff;      // gives agents work and reads their own runs
+//     policy SupervisesAgents => IsLead;       // sponsors, pauses and stops them; reads every run
+//     policy AuditsAgents     => IsAuditor;    // reads every run with its content
+package Osysharp.Agents {
+  version     "1.6.0";
+  minPlatform "0.14.0";
+  summary     "AI agents as typed classes: skills with a typed input and a checked, typed result; tools that are the app's own actions, run as the agent and never past the person it works for; a hard budget per piece of work; a receipt and a tamper-evident record of every step; a gate that says what it does alone, what it proposes to a person first and what it never does; a ladder of help — a more capable model first, then a person, whom the work waits for; corrections people make of its work, drawn into instructions that reach it only once a person has made them active, in numbered sets a piece of work records and an agent can be put back to; and handing typed pieces of its work on to other agents — several at once — each with its own receipt under the one that handed it on, done for the same person, never doing alone what any piece of work above it must propose, and spending out of what is left above it.";
+
+  model "model/*.osy";
+  tests "tests";
+  // The personal data its own fields hold (`[Classification(Personal.X)]`): who a piece of work was for, and what it
+  // said — which can be about anybody.
+  personal Identity;
+  personal Content;
+  // Calling a model: routed, held to its budgets and metered.
+  use Osysharp.Llm@2;
+  // Who an agent is, and who it works for.
+  use Osysharp.Identity@0;
+  // Work that waits for a person is held by a run of its own, and goes on from it.
+  use Osysharp.Workflow;
+  // An agent's changes are always on the change trail.
+  use Osysharp.Observability;
+}

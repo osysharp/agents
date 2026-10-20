@@ -1,0 +1,14 @@
+// The producer's test project for Osysharp.Agents — a packhouse where fruit arrives by the crate and an inspector grades
+// it. No model is ever called: its models are scripted (`ScriptedModel`), and a test writes their answers — with
+// Osysharp.Agents.Testing's Says and AgentScript, which this app CARRIES (model/vendored, kept identical by
+// scripts/release/vendored_test_sources.py) rather than `use`s: that kit uses this one, so a test app here that used
+// it would need each released before the other.
+app Packhouse {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Agents@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+}

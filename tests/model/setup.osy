@@ -1,0 +1,26 @@
+// The packhouse's agents and models. In a file of its own with no `namespace`, because an `app.X = …` statement's
+// value is resolved outside the file's namespace.
+using Osysharp.Agents;
+using Osysharp.Llm;
+using Packhouse;
+
+app.Llm = new LlmSetup {
+  Models = [
+    // The everyday model, and a stronger, dearer one that is only ever consulted.
+    new LlmModel { Name = "Small",  Client = new ScriptedModel { Name = "Small" },  Model = "scripted-small",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000 },
+    new LlmModel { Name = "Strong", Client = new ScriptedModel { Name = "Strong" }, Model = "scripted-strong",
+                   Price = new LlmPrice { Input = 10, Output = 50 }, MaxOutputTokens = 1000 },
+  ],
+  Default = "Small",
+};
+
+app.Agents = new AgentsSetup {
+  Agents = [new Inspector(), new Sorter(), new Trainee(), new Clerk(), new Porter(), new Understudy(),
+            new Foreman(), new Usher(), new Director(), new Yardmaster(), new Steward(), new Warden()],
+  TaskBudget = 0.05m,
+  Guards = [new Embargo()],
+};
+
+// A piece of work is sent at most three of the instructions people have given its agent.
+app.AgentTeaching = new TeachingSetup { MostInstructions = 3 };

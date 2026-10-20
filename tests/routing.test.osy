@@ -1,0 +1,130 @@
+// Osysharp.Agents — where a proposal is put. By default: the person the work is for. A skill may send what it proposes
+// for a tool somewhere else — to a work queue, to one person it names — and then the person the work is for reads it
+// and does not decide it.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+[TestFixture]
+void YardWithQuality() {
+  Yard();
+  // Gus is the head grader: he may mark and move any crate, gives agents no work and supervises nothing.
+  var gus = new Person { Email = "gus@packhouse.example", DisplayName = "Gus" };
+  new RoleGrant { Member = gus, Role = PackhouseRole.Grader };
+}
+
+principal Gus => Person.Single(p => p.Email == "gus@packhouse.example");
+
+void LetTheWardenGoOn() {
+  for (var i = 0; i < 3; i++) {
+    Background.Settle();
+    foreach (var wait in AgentWait.Where(w => w.Status == AgentWaitStatus.Waiting).ToList()) { Workflow.Settle(wait); }
+  }
+}
+
+/// ⭐ A SKILL SAYS WHO DECIDES WHAT IT PROPOSES — and whoever the work is for does not. The warden settles Ada's crate.
+/// Its flag is put to the Quality queue: Ada reads the proposal and cannot say yes or no to it; the lead, who decides
+/// agents' proposals, can, and it runs as her. Its change of line is put to the head grader by name: again not
+/// Ada's, and it runs as him.
+[Test(YardWithQuality)]
+void a_proposal_a_skill_sends_elsewhere_is_not_decided_by_who_the_work_is_for() {
+  Guid task = Guid.Empty;
+  runas (Ada) {
+    var a2 = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool("It weighs 8 kg, and a full crate holds 10.", Actions.Of(FlagCrate), FlagArgs(a2, "short")),
+      Says.Tool("A short crate goes to juice.", Actions.Of(MoveToLine), LineArgs(a2, "Juice")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short; sent to juice.", Short = true }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+    var outcome = SettleForQC(a2);
+    task = outcome.Task;
+
+    // 1. It waits — on the queue the skill names, not on Ada.
+    Assert.True(outcome.Waiting);
+    var proposal = AgentProposal.Single();
+    Assert.True(proposal.Routed);
+    Assert.Equal("Quality", proposal.DecideQueue);
+    Assert.Null(proposal.DecideBy);
+    Assert.Equal("a decision from the Quality queue", AgentTask.Single().WaitingOn);
+    Assert.Contains("It asked for FlagCrate (changes data); its declaration says it is proposed first, so it was put to the Quality queue.", Trajectory.Said(task));
+    Assert.Equal("the Quality queue", RouteWords(proposal));
+
+    // 2. Ada asked for the work. The decision is not hers — neither a yes nor a no.
+    var yes = Assert.Throws<AgentRefused>(() => ApproveAgentProposal(AgentProposal.Single()));
+    Assert.Equal("This proposal is decided by the Quality queue: the skill that proposed it says so. The work is for you; the decision is not yours.", yes.Message);
+    Assert.Throws<AgentRefused>(() => RejectAgentProposal(AgentProposal.Single(), "I would rather not."));
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+    Assert.Equal(0, Crate.Count(c => c.Flag == "short"));
+  }
+  // 3. Whoever the app says decides agents' proposals still may: the lead says yes, and it runs as her.
+  runas (Dana) {
+    var flag = AgentProposal.Single().Id;
+    var decided = ApproveAgentProposal(AgentProposal.Single());
+    Assert.Equal(ProposalStatus.Done, decided.Status);
+    Assert.Equal(Dana.Id, AgentProposal.Single(p => p.Id == flag).DecidedBy!.Id);
+    UnitOfWork.Commit();
+  }
+  LetTheWardenGoOn();
+  runas (Ada) {
+    Assert.Equal(1, Crate.Count(c => c.Code == "A-2" && c.Flag == "short"));
+    // 4. The next proposal is the change of line: put to the head grader, by name.
+    var move = AgentProposal.Single(p => p.Status == ProposalStatus.Waiting);
+    Assert.True(move.Routed);
+    Assert.Equal("", move.DecideQueue);
+    Assert.Equal(Gus.Id, move.DecideBy!.Id);
+    Assert.Equal("a decision from Gus", AgentTask.Single().WaitingOn);
+    var refused = Assert.Throws<AgentRefused>(() => ApproveAgentProposal(AgentProposal.Single(p => p.Status == ProposalStatus.Waiting)));
+    Assert.Equal("This proposal is decided by Gus: the skill that proposed it says so. The work is for you; the decision is not yours.", refused.Message);
+  }
+  runas (Gus) {
+    var decided = ApproveAgentProposal(AgentProposal.Single(p => p.Status == ProposalStatus.Waiting));
+    Assert.Equal(ProposalStatus.Done, decided.Status);
+    UnitOfWork.Commit();
+  }
+  LetTheWardenGoOn();
+  runas (Ada) {
+    Assert.Equal("Juice", Crate.Single(c => c.Code == "A-2").Line);
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Contains("Gus approved MoveToLine, and it ran as them.", Trajectory.Said(task));
+    Assert.True(VerifyTrace(receipt).Intact);
+    Assert.Equal(0, AgentProposal.Count(p => p.Status == ProposalStatus.Waiting));
+  }
+}
+
+/// A tool the agent never runs is never proposed — wherever its skill sends proposals. The warden's skill sends
+/// everything it proposes to the Quality queue; the warden never condemns a crate; so nothing is put to anybody.
+[Test(YardWithQuality)]
+[runas(Ada)]
+void a_tool_the_agent_never_runs_is_not_proposed_wherever_its_skill_sends_proposals() {
+  var a1 = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Tool("There is mould.", Actions.Of(CondemnCrate), CondemnArgs(a1)),
+    Says.HandBack(new Grade { Score = 1, Finding = "Mould; it could not be condemned." }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = SettleForQC(a1);
+
+  Assert.True(outcome.Done);
+  Assert.Equal(0, AgentProposal.Count());
+  Assert.False(Crate.Single(c => c.Code == "A-1").Condemned);
+  // It is not among the tools the work is offered at all, so asking for it runs nothing and proposes nothing.
+  Assert.Contains("It asked for `CondemnCrate`, which is not one of its tools. Nothing ran.", Trajectory.Said(outcome.Task));
+}
+
+/// The catalogue says where each tool's proposals go, for whoever draws a page about the agent.
+[Test(YardWithQuality)]
+[runas(Ada)]
+void the_catalogue_says_where_a_tools_proposals_are_put() {
+  var skill = Skills.Find("Packhouse.Warden", "Packhouse.SettleForQuality")!;
+  // Said of what is proposed: a tool it runs alone, or never, is put to nobody.
+  Assert.Equal(["Weigh:", "FlagCrate:Quality", "CondemnCrate:", "MoveToLine:(one person)"],
+    skill.Tools.Select(t => BareName(t.Action) + ":" + (t.DecidedByOnePerson ? "(one person)" : t.DecidedByQueue)).ToList());
+  // A skill that says nothing sends its proposals to the person the work is for.
+  var plain = Skills.Find("Packhouse.Clerk", "Packhouse.SettleCrate")!;
+  Assert.True(plain.Tools.All(t => t.DecidedByQueue == "" && !t.DecidedByOnePerson));
+}

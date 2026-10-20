@@ -1,0 +1,97 @@
+// Guards — the app's own checks on what goes to a model, what comes back, what a tool is given and what it answers.
+namespace Osysharp.Agents;
+
+using Osysharp.Llm;
+
+/// What a guard says about one step.
+public class GuardVerdict {
+  public bool Blocked = false;
+  /// Why, in a sentence — kept on the record, and said to the model when a tool was stopped.
+  public string Why = "";
+
+  public static GuardVerdict Allow() { return new GuardVerdict(); }
+  public static GuardVerdict Block(string why) { return new GuardVerdict { Blocked = true, Why = why }; }
+}
+
+/// The piece of work a guard is asked about.
+public class GuardedWork {
+  /// The agent and the skill, each by its full name ("" for work that was only asked).
+  public string Agent = "";
+  public string Skill = "";
+  public Guid Task;
+  /// Who the work is for. Null: nobody.
+  public Guid? Person;
+}
+
+/// ⭐ A GUARD: a class of the app's that is asked at four points of every piece of work, and may stop the step.
+///
+///     public class NoCardNumbers : AgentGuard {
+///       public override GuardVerdict BeforeModel(GuardedWork work, LlmRequest request) {
+///         return LooksLikeACard(Scripted.Asked(request)) ? GuardVerdict.Block("A card number may not be sent to a model.") : GuardVerdict.Allow();
+///       }
+///     }
+///     app.Agents = new AgentsSetup { Agents = […], Guards = [new NoCardNumbers()] };
+///
+/// The kit ships none: what is worth stopping is the app's to say. Each guard is asked in the order listed; the
+/// first that blocks decides, and its reason is a line of the record.
+///
+/// | asked | when it blocks |
+/// |---|---|
+/// | `BeforeModel` | nothing is sent; the work is stopped with the reason |
+/// | `AfterModel` | the answer is dropped; the work is stopped with the reason |
+/// | `BeforeTool` | the tool does not run; the model is told why and goes on |
+/// | `AfterTool` | what the tool answered is kept from the model, which is told why |
+public class AgentGuard {
+  /// Before a request leaves for a model.
+  public virtual GuardVerdict BeforeModel(GuardedWork work, LlmRequest request) { return GuardVerdict.Allow(); }
+  /// After a model answered, before anything is done with the answer.
+  public virtual GuardVerdict AfterModel(GuardedWork work, LlmResponse response) { return GuardVerdict.Allow(); }
+  /// Before a tool runs — and before it is proposed: `argumentsJson` is what it would run with.
+  public virtual GuardVerdict BeforeTool(GuardedWork work, ActionInfo tool, string argumentsJson) { return GuardVerdict.Allow(); }
+  /// After a tool answered, before the model is shown what it said.
+  public virtual GuardVerdict AfterTool(GuardedWork work, ActionInfo tool, string resultJson) { return GuardVerdict.Allow(); }
+}
+
+GuardedWork GuardedOf(AgentRun run) {
+  return new GuardedWork { Agent = run.Agent, Skill = run.Skill, Task = run.Task, Person = run.Person };
+}
+
+/// The first guard that blocks a request, or null.
+GuardVerdict? GuardBeforeModel(AgentRun run, LlmRequest request) {
+  foreach (var guard in App.Setting<AgentsSetup>().Guards) {
+    var verdict = guard.BeforeModel(GuardedOf(run), request);
+    if (verdict.Blocked) { return Guarded(run, guard, "kept the request from the model", verdict); }
+  }
+  return null;
+}
+
+GuardVerdict? GuardAfterModel(AgentRun run, LlmResponse response) {
+  foreach (var guard in App.Setting<AgentsSetup>().Guards) {
+    var verdict = guard.AfterModel(GuardedOf(run), response);
+    if (verdict.Blocked) { return Guarded(run, guard, "dropped the model's answer", verdict); }
+  }
+  return null;
+}
+
+GuardVerdict? GuardBeforeTool(AgentRun run, ActionInfo tool, string argumentsJson) {
+  foreach (var guard in App.Setting<AgentsSetup>().Guards) {
+    var verdict = guard.BeforeTool(GuardedOf(run), tool, argumentsJson);
+    if (verdict.Blocked) { return Guarded(run, guard, $"stopped {BareName(tool.Name)}", verdict); }
+  }
+  return null;
+}
+
+GuardVerdict? GuardAfterTool(AgentRun run, ActionInfo tool, string resultJson) {
+  foreach (var guard in App.Setting<AgentsSetup>().Guards) {
+    var verdict = guard.AfterTool(GuardedOf(run), tool, resultJson);
+    if (verdict.Blocked) { return Guarded(run, guard, $"kept what {BareName(tool.Name)} answered from the model", verdict); }
+  }
+  return null;
+}
+
+/// A guard blocked a step: the line of the record.
+GuardVerdict Guarded(AgentRun run, AgentGuard guard, string did, GuardVerdict verdict) {
+  var name = BareName(guard.GetType().FullName);
+  Trace(run, new TraceEntry { Kind = TraceKind.Guarded, Tool = name, Summary = $"{Words(name)} {did}: {Clipped(verdict.Why, 400)}" });
+  return verdict;
+}

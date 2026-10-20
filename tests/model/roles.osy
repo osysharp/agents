@@ -1,0 +1,30 @@
+// Who is in charge of what at the packhouse, beyond the lead: whoever is on call may pause an agent at night; the
+// bookkeeper reads what every piece of work cost, and not a word of it; and the lead's deputy decides proposals
+// that were put to somebody else.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+
+policy IsOnCall     => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.OnCall);
+policy IsBookkeeper => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Bookkeeper);
+policy IsDeputy     => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Deputy);
+policy IsPatron     => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Patron);
+
+// Each of the kit's four that start out as "whoever supervises", answered: the growers' patron may name who answers
+// for an agent — and that is all the patron may do.
+policy SponsorsAgents        => SupervisesAgents || IsPatron;
+policy PausesAgents          => SupervisesAgents || IsOnCall;
+policy ReadsAllAgentWork     => SupervisesAgents || AuditsAgents || IsBookkeeper;
+policy DecidesAgentProposals => SupervisesAgents || IsDeputy;
+
+/// An agent's place changed by hand — what the kit's own functions are there instead of.
+public void PauseByHand(AgentSeat seat) { seat.Paused = true; seat.PausedWhy = "By hand."; }
+public void ResumeByHand(AgentSeat seat) { seat.Paused = false; }
+public void SponsorByHand(AgentSeat seat, Person sponsor) { seat.Sponsor = sponsor; }
+/// A standing rule's count of its own uses, written by hand.
+public void CountRuleByHand(AgentStandingRule rule) { rule.Used = 40; }
+/// A line of the record of who paused what, made up.
+public void ForgeSeatChange(string agent, Person by) {
+  new AgentSeatChange { Agent = agent, What = AgentSeatChangeKind.Resumed, By = by, Why = "Made up." };
+}

@@ -1,0 +1,527 @@
+// Osysharp.Agents — giving an agent work: a typed job in, a checked typed result out, its tools run as the agent and
+// never past whoever asked, and one receipt for every piece of work — whatever became of it.
+//
+// The numbers. The everyday model costs $1 a million tokens in and $5 out, so a scripted answer of 100 in and 20 out
+// costs 200 millionths of a dollar.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Packhouse;
+
+string CrateArg(Crate crate) { return "{\"crate\":\"" + crate.Id.ToString() + "\"}"; }
+string FlagArgs(Crate crate, string flag) { return "{\"crate\":\"" + crate.Id.ToString() + "\",\"flag\":\"" + flag + "\"}"; }
+string CondemnArgs(Crate crate) { return "{\"crate\":\"" + crate.Id.ToString() + "\",\"why\":\"mould\"}"; }
+
+// ── a typed job ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void a_typed_job_runs_its_tools_and_hands_back_a_checked_result() {
+  var crate = Crate.Single(c => c.Code == "A-2");
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(Weigh), CrateArg(crate)),
+    Says.Tool(Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+    Says.HandBack(new Grade { Score = 4, Finding = "Eight kilos: a short crate.", Short = true }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = Inspect(crate);
+
+  Assert.True(outcome.Done);
+  Assert.Equal(4, outcome.Result.Score);
+  Assert.True(outcome.Result.Short);
+  Assert.Equal("Eight kilos: a short crate.", outcome.Result.Finding);
+  // The tools really ran, on the crate, in the order the model asked for them.
+  Assert.Equal("short", Crate.Single(c => c.Code == "A-2").Flag);
+  Assert.Equal(["Weigh", "FlagCrate"], Trajectory.Of(outcome.Task));
+  Assert.Equal(600, outcome.CostMicros);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void every_piece_of_work_leaves_one_receipt() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(crate), 400, 40), Says.HandBack(new Grade { Score = 9, Finding = "Sound." }, 500, 60));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = Inspect(crate);
+
+  var receipt = AgentTask.Single();
+  Assert.Equal(outcome.Task, receipt.Id);
+  Assert.Equal("Packhouse.Inspector", receipt.Agent);
+  Assert.Equal("Packhouse.GradeCrate", receipt.Skill);
+  Assert.Equal("3", receipt.SkillVersion);
+  Assert.Equal(AgentTaskCause.Call, receipt.Cause);
+  Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+  Assert.Equal("Crate A-1", receipt.About);
+  Assert.Equal("Packhouse.Crate", receipt.Given);
+  // Who it ran as, and for whom.
+  Assert.Equal(Actor.Of<Inspector>().Id, receipt.Actor.Id);
+  Assert.Equal(Ada.Id, receipt.Requester!.Id);
+  // What it took: 400 + 5×40 and 500 + 5×60 millionths of a dollar.
+  Assert.Equal(1400, receipt.SpentMicros);
+  Assert.Equal(50000, receipt.LimitMicros);
+  Assert.Equal(2, receipt.ModelCalls);
+  Assert.Equal(2, receipt.Turns);
+  Assert.Equal(1, receipt.ToolCalls);
+  Assert.Equal(900, receipt.InputTokens);
+  Assert.Equal(100, receipt.OutputTokens);
+  Assert.NotNull(receipt.EndedAt);
+  Assert.Contains("\"Score\":9", receipt.Result!);
+
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.What == "started" && h.About == "Packhouse.Inspector"));
+  Assert.Equal(1, Heard.Count(h => h.What == "wrapped up" && h.About == "Crate A-1"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_result_that_breaks_the_skills_check_is_sent_back_with_the_reason() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.HandBack(new Grade { Score = 14, Finding = "Excellent." }),
+    Says.HandBack(new Grade { Score = 10, Finding = "Excellent." }));
+  ScriptedAnswer.Stub((model, request) => {
+    // What the model is told on its second turn is the reason, as the result of its hand-back.
+    NoteLastResult(request, "sent back");
+    return script.Answer(model, request);
+  });
+
+  var outcome = Inspect(crate);
+
+  Assert.True(outcome.Done);
+  Assert.Equal(10, outcome.Result.Score);
+  Assert.Equal("error: \"A score is from 0 to 10.\"", Heard.Single(h => h.What == "sent back").About);
+  Assert.Contains("SentBack", Trajectory.Kinds(outcome.Task));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_result_that_never_fits_ends_the_work_as_failed_and_says_why() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.HandBackJson("{\"Score\":\"plenty\"}"),
+    Says.HandBack(new Grade { Score = -3 }),
+    Says.HandBack(new Grade { Score = 5 }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = Inspect(crate);
+
+  // Two misses in a row, and the inspector has nobody to consult: it is over. The third answer is never asked for.
+  Assert.False(outcome.Done);
+  Assert.Equal(AgentTaskStatus.Failed, outcome.Status);
+  Assert.Contains("It could not finish: A score is from 0 to 10.", outcome.Problem);
+  Assert.Equal(2, AgentTask.Single().ModelCalls);
+  Assert.Equal(AgentTaskStatus.Failed, AgentTask.Single().Status);
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.What == "failed"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_job_that_answers_in_words_hands_back_the_words() {
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(CratesOf), "{\"growerEmail\":\"ada@packhouse.example\"}"),
+    Says.Words("Two crates, one of them short."));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = Describe("ada@packhouse.example");
+
+  Assert.True(outcome.Done);
+  Assert.Equal("Two crates, one of them short.", outcome.Result);
+}
+
+// ── as the agent, and never past whoever asked ──────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void a_tool_reads_only_what_the_agent_and_whoever_asked_may_both_read() {
+  // The inspector — a grader — may read every crate. Asked by Ada, it finds Ben's crates no more than she could.
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(CratesOf), "{\"growerEmail\":\"ben@packhouse.example\"}"),
+    Says.Words("Done."));
+  ScriptedAnswer.Stub((model, request) => {
+    NoteLastResult(request, "crates");
+    return script.Answer(model, request);
+  });
+
+  runas (Ada) { Describe("ben@packhouse.example"); Assert.Equal("[]", Heard.Single(h => h.What == "crates").About); }
+  // Asked by the lead, who may read them, it finds them.
+  runas (Dana) { Describe("ben@packhouse.example"); Assert.Equal(1, Heard.Count(h => h.What == "crates" && h.About == "[\"B-1\"]")); }
+}
+
+[Test(Yard)]
+[runas(Dana)]
+void a_tool_changes_only_what_the_agent_and_whoever_asked_may_both_change() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(Says.Tool(Actions.Of(CondemnCrate), CondemnArgs(crate)), Says.HandBack(new Grade { Score = 0, Finding = "Mould." }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  // A grader may condemn a crate; a grower may not. For Ada, the inspector cannot either — and is told so.
+  runas (Ada) {
+    var outcome = Inspect(crate);
+    Assert.True(outcome.Done);
+    Assert.False(Crate.Single(c => c.Code == "A-1").Condemned);
+    Assert.True(Trajectory.Said(outcome.Task).Any(s => s.StartsWith("CondemnCrate did not run: not allowed.")));
+  }
+  // For the lead, who may, it does — and the change is the agent's, made for her, for this piece of work.
+  runas (Dana) {
+    var outcome = Inspect(crate);
+    var condemned = Crate.Single(c => c.Code == "A-1");
+    Assert.True(condemned.Condemned);
+    Assert.Equal("mould", condemned.CondemnedWhy);
+    Assert.Equal(Actor.Of<Inspector>().Id, condemned.ChangedBy);
+  }
+}
+
+[Test(Yard)]
+void rows_a_tool_is_handed_in_a_list_are_looked_up_with_the_same_rights() {
+  // The model names two crates in one call: Ada's and Ben's. The inspector may read both; Ada may not read Ben's.
+  Guid ada, ben;
+  runas (Dana) { ada = Crate.Single(c => c.Code == "A-1").Id; ben = Crate.Single(c => c.Code == "B-1").Id; }
+  var both = "{\"crates\":[\"" + ada.ToString() + "\",\"" + ben.ToString() + "\"],\"flag\":\"bruised\"}";
+  var script = AgentScript.Of(Says.Tool(Actions.Of(FlagCrates), both), Says.Words("Done."));
+  ScriptedAnswer.Stub((model, request) => { NoteLastResult(request, "result"); return script.Answer(model, request); });
+
+  runas (Ada) {
+    Assert.True(Mark("today's").Done);
+    // For Ada, Ben's crate is not there — so the tool did not run at all, and her own crate is untouched.
+    Assert.True(Heard.Single(h => h.What == "result").About.StartsWith("error: "));
+    Assert.Contains("No Crate with id " + ben.ToString(), Heard.Single(h => h.What == "result").About);
+  }
+  runas (Dana) {
+    Assert.Equal("", Crate.Single(c => c.Code == "A-1").Flag);
+    Assert.Equal("", Crate.Single(c => c.Code == "B-1").Flag);
+    // Asked by the lead, who may read and change both, the same call flags both.
+    Assert.True(Mark("today's").Done);
+    Assert.Equal("bruised", Crate.Single(c => c.Code == "A-1").Flag);
+    Assert.Equal("bruised", Crate.Single(c => c.Code == "B-1").Flag);
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_tool_the_skill_does_not_list_never_runs_whatever_the_model_calls_it() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Tool("BurnCrate", CrateArg(crate)),
+    Says.Tool("Packhouse.BurnCrate", CrateArg(crate)));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = Inspect(crate);
+
+  Assert.Equal(AgentTaskStatus.Failed, outcome.Status);
+  Assert.Contains("is not one of your tools", outcome.Problem);
+  Assert.Equal(1, Crate.Count(c => c.Code == "A-1"));
+  Assert.Equal(0, AgentTask.Single().ToolCalls);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void two_pieces_of_work_started_together_each_leave_their_own_receipt_and_record() {
+  ScriptedAnswer.Stub((model, request) => Says.HandBack(new Grade { Score = 7, Finding = "Sound." }));
+
+  var both = InspectBoth(Crate.Single(c => c.Code == "A-1"), Crate.Single(c => c.Code == "A-2"));
+
+  Assert.True(both[0].Done);
+  Assert.True(both[1].Done);
+  Assert.NotEqual(both[0].Task, both[1].Task);
+  Assert.Equal(["Crate A-1", "Crate A-2"], AgentTask.OrderBy(t => t.About).ToList().Select(t => t.About).ToList());
+  // Each was metered and limited on its own, and each record is a chain of its own.
+  Assert.Equal(200, both[0].CostMicros);
+  Assert.Equal(200, both[1].CostMicros);
+  foreach (var receipt in AgentTask.ToList()) {
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Equal(200, receipt.SpentMicros);
+    Assert.True(VerifyTrace(receipt).Intact);
+    Assert.Equal(["Started", "ModelCall", "Ended"], Trajectory.Kinds(receipt.Id));
+  }
+}
+
+[Test(Yard)]
+void whoever_gave_work_for_somebody_else_reads_it_and_so_does_the_person_it_was_for() {
+  // The lead is who the packhouse lets give an agent work for somebody else. She has the inspector look at a crate
+  // for Ben.
+  Guid task;
+  runas (Dana) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(crate)), Says.HandBack(new Grade { Score = 7 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var outcome = InspectFor(Ben, crate);
+    task = outcome.Task;
+    // The work ran to its end — its receipt and every line of its record were written though they are Ben's.
+    Assert.Equal(AgentTaskStatus.Done, outcome.Status);
+    var receipt = AgentTask.Single();
+    Assert.Equal(Ben.Id, receipt.Requester!.Id);
+    Assert.Equal(Dana.Id, receipt.StartedBy!.Id);
+    Assert.True(VerifyTrace(receipt).Intact);
+    Assert.NotNull(TraceEvent.First(e => e.Task.Id == task && e.Kind == TraceKind.Started).Payload);
+  }
+  runas (Ben) {
+    Assert.Equal(1, AgentTask.Count(t => t.Id == task));
+    Assert.NotNull(TraceEvent.First(e => e.Task.Id == task && e.Kind == TraceKind.Started).Payload);
+  }
+}
+
+[Test(Yard)]
+[runas(Dana)]
+void work_can_be_done_for_a_person_who_is_not_the_one_signed_in() {
+  var crate = Crate.Single(c => c.Code == "B-1");
+  var script = AgentScript.Of(Says.Tool(Actions.Of(FlagCrate), FlagArgs(crate, "bruised")), Says.HandBack(new Grade { Score = 6 }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  runas (Dana) {
+    var ben = Person.Single(p => p.Email == "ben@packhouse.example");
+    var outcome = InspectFor(ben, crate);
+    Assert.True(outcome.Done);
+    Assert.Equal(ben.Id, AgentTask.Single().Requester!.Id);
+    Assert.Equal("bruised", Crate.Single(c => c.Code == "B-1").Flag);
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_step_of_a_process_is_an_ordinary_call_and_the_agent_works_with_its_own_rights() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(Says.Tool(Actions.Of(FlagCrate), FlagArgs(crate, "sound")), Says.HandBack(new Grade { Score = 8 }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  Workflow.Run(crate);
+  Workflow.Settle(crate);
+
+  Assert.Equal(CrateStage.Accepted, Crate.Single(c => c.Code == "A-1").Stage);
+  Assert.Equal("sound", Crate.Single(c => c.Code == "A-1").Flag);
+  // It ran for nobody: the receipt names no requester, and so is the supervisor's to read, not the grower's.
+  Assert.Equal(0, AgentTask.Count());
+  runas (Dana) {
+    var receipt = AgentTask.Single();
+    Assert.Null(receipt.Requester);
+    Assert.Equal("Intake of A-1", receipt.About);
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+  }
+}
+
+// ── asked, and watched ──────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void an_agent_that_is_asked_answers_in_words_with_the_tools_of_its_skills() {
+  var crate = Crate.Single(c => c.Code == "A-2");
+  var script = AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(crate)), Says.Words("A-2 weighs 8 kg."));
+  ScriptedAnswer.Stub((model, request) => {
+    if (request.Messages.Count == 1) { NoteOffer(request, "offered"); }
+    return script.Answer(model, request);
+  });
+
+  var reply = AskInspector("What does A-2 weigh?");
+
+  Assert.True(reply.Done);
+  Assert.Equal("A-2 weighs 8 kg.", reply.Text);
+  // Every tool of every skill it holds, once — and no way to hand back a typed result, for there is none.
+  Assert.Equal("Weigh,FlagCrate,CondemnCrate,CratesOf,ReadLedger,FlagCrates", Heard.Single(h => h.What == "offered").About);
+  var receipt = AgentTask.Single();
+  Assert.Equal(AgentTaskCause.Chat, receipt.Cause);
+  Assert.Equal("", receipt.Skill);
+  Assert.Equal("What does A-2 weigh?", receipt.About);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void an_answer_can_be_watched_as_it_arrives() {
+  var crate = Crate.Single(c => c.Code == "A-2");
+  var script = AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(crate)), Says.Words("A-2 weighs 8 kg."));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var seen = WatchInspector("What does A-2 weigh?");
+
+  Assert.Equal(["ToolStarted:Weigh", "ToolFinished:Weigh", "text:A-2 weighs 8 kg.", "done:A-2 weighs 8 kg."], seen);
+  // The same receipt and the same cost as an answer that was not watched.
+  var receipt = AgentTask.Single();
+  Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+  Assert.Equal(400, receipt.SpentMicros);
+  Assert.Equal(["Small", "Small"], Trajectory.Models(receipt.Id));
+}
+
+// ── work that does not finish ───────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void a_model_that_cannot_be_reached_is_a_failed_piece_of_work_not_an_exception() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(Says.HandBack(new Grade { Score = 5 })).IsDown("Small");
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = Inspect(crate);
+
+  Assert.Equal(AgentTaskStatus.Failed, outcome.Status);
+  Assert.Contains("The model could not be reached: Small is down.", outcome.Problem);
+  Assert.Equal(AgentTaskStatus.Failed, AgentTask.Single().Status);
+  Assert.Equal(0, AgentTask.Single().SpentMicros);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void work_is_stopped_when_its_turns_run_out() {
+  // The skill allows three turns; the model keeps looking things up.
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(CratesOf), "{\"growerEmail\":\"a\"}"), Says.Tool(Actions.Of(CratesOf), "{\"growerEmail\":\"b\"}"),
+    Says.Tool(Actions.Of(CratesOf), "{\"growerEmail\":\"c\"}"), Says.Words("Never said."));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = Describe("anyone");
+
+  Assert.Equal(AgentTaskStatus.Stopped, outcome.Status);
+  Assert.Equal("It was stopped after 3 turns without finishing.", outcome.Problem);
+  Assert.Equal(3, AgentTask.Single().ModelCalls);
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.What == "stopped"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void work_that_goes_in_circles_is_ended() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var again = Says.Tool(Actions.Of(Weigh), CrateArg(crate));
+  var script = AgentScript.Of(again, again, again, again);
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = Inspect(crate);
+
+  Assert.Equal(AgentTaskStatus.Failed, outcome.Status);
+  Assert.Equal("It went in circles: it asked for Weigh with the same arguments 3 times.", outcome.Problem);
+  // The third time, the tool did not run.
+  Assert.Equal(2, AgentTask.Single().ToolCalls);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void work_that_is_called_off_stops_at_its_next_step() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(crate)), Says.HandBack(new Grade { Score = 5 }));
+  ScriptedAnswer.Stub((model, request) => {
+    // While the model is answering its first turn, Ada calls the work off.
+    var task = AgentTask.Single();
+    if (!task.StopAsked) { StopAgentTask(task, "the crate was withdrawn"); UnitOfWork.Commit(); }
+    return script.Answer(model, request);
+  });
+
+  var outcome = Inspect(crate);
+
+  Assert.Equal(AgentTaskStatus.Cancelled, outcome.Status);
+  Assert.Equal("It was called off: the crate was withdrawn", outcome.Problem);
+  // The turn under way finished — its tool ran — and nothing was asked of the model after it.
+  Assert.Equal(1, AgentTask.Single().ModelCalls);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_receipt_and_its_record_stay_though_the_work_they_were_made_for_failed() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(Says.Tool(Actions.Of(FlagCrate), FlagArgs(crate, "bruised")), Says.HandBack(new Grade { Score = 6 }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  Assert.Throws<ValidationException>(() => InspectThenFail(crate));
+  UnitOfWork.Discard();
+
+  // The agent's work happened: it is on its receipt, on its record, and on the meter.
+  var receipt = AgentTask.Single();
+  Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+  Assert.Equal(400, receipt.SpentMicros);
+  Assert.True(VerifyTrace(receipt).Intact);
+  Assert.Equal("bruised", Crate.Single(c => c.Code == "A-1").Flag);
+}
+
+// ── who an agent answers to ─────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Dana)]
+void an_agent_without_a_sponsor_does_not_run() {
+  // The trainee is one of the packhouse's agents, and nobody answers for it yet.
+  var crate = Crate.Single(c => c.Code == "A-1");
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return Says.HandBack(new Grade { Score = 5 }); });
+  runas (Ada) {
+    var refused = Assert.Throws<AgentNotSponsored>(() => TraineeInspects(crate));
+    Assert.Contains("Trainee has no sponsor, so it does not run.", refused.Message);
+    // Nothing was asked of a model, and there is no receipt.
+    Assert.Equal(0, Heard.Count(h => h.What == "asked"));
+    Assert.Equal(0, AgentTask.Count());
+  }
+  // The lead names herself; now it runs.
+  runas (Dana) { SponsorAgent(Agents.Of<Trainee>().Name, Dana); UnitOfWork.Commit(); }
+  runas (Ada) { Assert.True(TraineeInspects(crate).Done); }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_class_the_app_does_not_list_is_not_one_of_its_agents() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var refused = Assert.Throws<AgentNotListed>(() => UseTheStowaway(crate));
+  Assert.Contains("Stowaway is not one of this app's agents", refused.Message);
+  Assert.Equal(0, AgentTask.Count());
+}
+
+[Test(Yard)]
+[runas(Dana)]
+void sponsoring_pausing_and_resuming_are_the_supervisors() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  ScriptedAnswer.Stub((model, request) => Says.HandBack(new Grade { Score = 5 }));
+  // A grower cannot name a sponsor or pause an agent.
+  runas (Ada) {
+    Assert.Denied(() => SponsorAgent("Packhouse.Inspector", Ada));
+    Assert.Denied(() => PauseAgent("Packhouse.Inspector", "I would rather it did not"));
+  }
+  runas (Dana) { PauseAgent("Packhouse.Inspector", "the scales are being recalibrated"); UnitOfWork.Commit(); }
+  runas (Ada) {
+    var paused = Assert.Throws<AgentPaused>(() => Inspect(crate));
+    Assert.Equal("Inspector is paused: the scales are being recalibrated", paused.Message);
+    Assert.Equal(0, AgentTask.Count());
+  }
+  runas (Dana) { ResumeAgent("Packhouse.Inspector"); UnitOfWork.Commit(); }
+  runas (Ada) { Assert.True(Inspect(crate).Done); }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void an_agent_is_given_work_only_for_a_skill_it_holds() {
+  ScriptedAnswer.Stub((model, request) => Says.Words("…"));
+  var refused = Assert.Throws<SkillNotHeld>(() => SorterDescribes());
+  Assert.Contains("Sorter does not hold the skill DescribeDelivery", refused.Message);
+  Assert.Equal(0, AgentTask.Count());
+}
+
+[Test(Yard)]
+[runas(Dana)]
+void who_may_give_an_agent_work_is_the_apps_answer() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return Says.HandBack(new Grade { Score = 5 }); });
+  // The auditor reads what agents did; giving them work is not his.
+  runas (Omar) { Assert.Denied(() => Inspect(crate)); }
+  Assert.Equal(0, Heard.Count(h => h.What == "asked"));
+}
+
+// ── what only the kit writes ────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void a_receipt_is_written_only_by_the_kit() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  ScriptedAnswer.Stub((model, request) => Says.HandBack(new Grade { Score = 5 }));
+  Inspect(crate);
+  var receipt = AgentTask.Single();
+
+  Assert.Denied(() => { ForgeReceipt(); UnitOfWork.Commit(); });
+  UnitOfWork.Discard();
+  Assert.Denied(() => { RewriteReceipt(receipt); UnitOfWork.Commit(); });
+  UnitOfWork.Discard();
+  Assert.Denied(() => { receipt.Delete(); UnitOfWork.Commit(); });
+  UnitOfWork.Discard();
+  Assert.Equal(200, AgentTask.Single().SpentMicros);
+  Assert.Equal("It handed back its result.", AgentTask.Single().Outcome);
+}
+
+[Test(Yard)]
+void who_answers_for_an_agent_is_named_only_through_the_kit() {
+  runas (Dana) {
+    Assert.Denied(() => { ForgeSeat(Dana); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Equal(0, AgentSeat.Count(s => s.Agent == "Packhouse.Stowaway"));
+  }
+}

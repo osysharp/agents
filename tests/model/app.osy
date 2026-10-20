@@ -1,0 +1,411 @@
+// A packhouse: growers bring fruit by the crate, and an inspector — an agent — grades each one. A sorter decides
+// which line a crate goes to, and asks a stronger model when it is not sure.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Workflow;
+
+[Role] enum PackhouseRole { Authenticator, Grower, Lead, Auditor, Grader, Records, Teacher, OnCall, Bookkeeper, Deputy, Patron }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsGrower  => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Grower);
+policy IsLead    => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Lead);
+policy IsAuditor => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Auditor);
+policy IsGrader  => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Grader);
+policy IsRecords => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Records);
+
+// The kit's questions, answered: growers and the lead give the agents work; the lead is in charge of them; the
+// auditor reads everything they did.
+policy UsesAgents       => IsGrower || IsLead || IsDeputy;
+policy SupervisesAgents => IsLead;
+policy AuditsAgents     => IsAuditor;
+// The records clerk erases what a piece of work said when its time is up, or when the grower it was for asks.
+policy ErasesAgentRecords => IsRecords;
+// The lead and the auditor read what the models cost; the lead sets what they may.
+policy ReadsModelUsage   => IsLead || IsAuditor;
+policy ManagesModelSpend => IsLead;
+// One grower has been told the agents may not ask a stronger model on his account.
+policy AgentsMayConsult => !Person.Any(p => p == user && p.NoSecondOpinions);
+
+/// Somebody at the packhouse — and the agents' own accounts.
+entity Person : Principal {
+  bool NoSecondOpinions = false;
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+  }
+}
+
+/// Where a crate is on its way in.
+public enum CrateStage { Arrived, Accepted, Rejected }
+
+/// One crate of fruit.
+entity Crate {
+  [Required, Unique, MaxLength(40)] string Code;
+  CrateStage Stage = CrateStage.Arrived;
+  /// Who brought it.
+  [Required] Person Grower;
+  decimal Kilos;
+  /// What the inspector found: "", "short", "bruised".
+  [MaxLength(40)] string Flag = "";
+  /// Who changed the crate last.
+  [ModifiedBy] Guid? ChangedBy;
+  /// Not fit to pack. Only the lead says so.
+  bool Condemned = false;
+  [MaxLength(300)] string CondemnedWhy = "";
+  /// Which line it goes to.
+  [MaxLength(40)] string Line = "";
+  security {
+    // A grower sees and annotates the crates they brought; the lead and the graders see every crate.
+    allow read, update when IsGrower where Grower == user;
+    allow read, update when IsLead || IsGrader;
+    allow read when IsAuditor;
+    allow create when IsGrower || IsLead;
+    // The lead and the graders may condemn a crate; a grower may not — and so nobody may for a grower.
+    deny update Condemned, CondemnedWhy when !IsLead && !IsGrader;
+  }
+}
+
+/// What the inspector hands back for one crate.
+public class Grade {
+  /// 0 (unusable) to 10 (perfect).
+  public int Score;
+  /// What was found, in a sentence.
+  public string Finding = "";
+  public bool Short;
+}
+
+/// Which line a crate goes to.
+public enum Line { Fresh, Juice, Compost }
+
+// ── what can be done to a crate ─────────────────────────────────────────────────────────────────────────────────────
+
+/// What a crate weighs, in kilograms.
+[Action("Weigh the crate", Query)]
+public decimal Weigh(Crate crate) { return crate.Kilos; }
+
+/// The crates a grower has brought, by their codes.
+[Action("List a grower's crates", Query)]
+public List<string> CratesOf(string growerEmail) {
+  return Crate.Where(c => c.Grower.Email == growerEmail).OrderBy(c => c.Code).ToList().Select(c => c.Code).ToList();
+}
+
+/// Mark what was found on a crate: "short", "bruised".
+[Action("Flag the crate")]
+public string FlagCrate(Crate crate, string flag) {
+  crate.Flag = flag;
+  return $"{crate.Code} is flagged {flag}.";
+}
+
+/// Declare a crate unfit to pack.
+[Action("Condemn the crate")]
+public string CondemnCrate(Crate crate, string why) {
+  crate.Condemned = true;
+  crate.CondemnedWhy = why;
+  return $"{crate.Code} is condemned.";
+}
+
+/// Mark several crates at once.
+[Action("Flag several crates")]
+public string FlagCrates(List<Crate> crates, string flag) {
+  foreach (var c in crates) { c.Flag = flag; }
+  return $"{crates.Count} flagged {flag}.";
+}
+
+/// One page of the packhouse's ledger — a long one.
+[Action("Read the ledger", Query)]
+public string ReadLedger(int page) {
+  var text = $"Page {page}: ";
+  for (var i = 0; i < 40; i++) { text = text + "crate received and weighed; "; }
+  return text;
+}
+
+/// Not an action — and so never a tool, whatever a model calls it.
+public void BurnCrate(Crate crate) { crate.Delete(); }
+
+// ── the skills ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Judges one crate.
+public class GradeCrate : Skill<Crate, Grade> {
+  public override string Description => "Grade one crate of fruit.";
+  public override string Instructions => "Weigh the crate first. A crate under 10 kg is short: flag it \"short\" and say so in the grade.";
+  public override List<ActionInfo> Tools => [Actions.Of(Weigh), Actions.Of(FlagCrate), Actions.Of(CondemnCrate)];
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+  public override string? Check(Grade g) => g.Score < 0 || g.Score > 10 ? "A score is from 0 to 10." : null;
+  public override string Version => "3";
+  // Handed on by another agent, the crate is named by its id.
+  public override string HandedSchema() => HandOn.ById("The crate to grade.");
+  public override Crate Handed(string inputJson) {
+    var id = HandOn.IdIn(inputJson);
+    return Crate.Single(c => c.Id == id);
+  }
+}
+
+/// Says what a grower's delivery looks like, in a sentence.
+public class DescribeDelivery : Skill<string, string> {
+  public override string Description => "Say in one sentence what this grower has brought.";
+  public override List<ActionInfo> Tools => [Actions.Of(CratesOf)];
+  public override StopWhen Stop => new StopWhen { MaxTurns = 3 };
+}
+
+/// Reads the ledger through — and keeps only its last pages in full.
+public class ReadTheLedger : Skill<string, string> {
+  public override string Description => "Read the ledger and say what it shows.";
+  public override List<ActionInfo> Tools => [Actions.Of(ReadLedger)];
+  public override StopWhen Stop => new StopWhen { MaxTurns = 10, ClearResultsPast = 1500 };
+}
+
+/// Marks a whole delivery — its tool takes the crates as a list.
+public class MarkDelivery : Skill<string, string> {
+  public override string Description => "Mark every crate of a delivery.";
+  public override List<ActionInfo> Tools => [Actions.Of(FlagCrates)];
+}
+
+/// A job with a budget of its own, far under the packhouse's.
+public class QuickLook : Skill<Crate, Grade> {
+  public override string Description => "Grade a crate at a glance.";
+  public override List<ActionInfo> Tools => [Actions.Of(Weigh), Actions.Of(FlagCrate)];
+  public override decimal? Budget => 0.012m;
+  public override string HandedSchema() => HandOn.ById("The crate to look at.");
+  public override Crate Handed(string inputJson) {
+    var id = HandOn.IdIn(inputJson);
+    return Crate.Single(c => c.Id == id);
+  }
+}
+
+// ── the agents ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Grades the fruit that arrives.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Inspector : Agent {
+  public static Person Principal => new Person { Email = "inspector@packhouse.example", DisplayName = "Inspector" };
+  public override string Purpose => "You grade the fruit that arrives at the packhouse, one crate at a time.";
+  public override List<SkillBase> Skills => [new GradeCrate(), new DescribeDelivery(), new QuickLook(), new ReadTheLedger(), new MarkDelivery()];
+  // It marks crates by itself: nothing it does leaves the packhouse.
+  public override Permits May => Permits.ChangesAlone();
+}
+
+/// Decides which line a crate goes to — and asks the stronger model when it is unsure or stuck.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Sorter : Agent {
+  public static Person Principal => new Person { Email = "sorter@packhouse.example", DisplayName = "Sorter" };
+  public override string Purpose => "You decide which line each crate goes to.";
+  public override List<SkillBase> Skills => [new GradeCrate()];
+  public override AgentLimits Limits => new AgentLimits { PerTask = 0.10m, Daily = 0.30m };
+  public override string Consults => "Strong";
+  public override decimal ConfidenceFloor => 0.8m;
+  public override Permits May => Permits.ChangesAlone();
+}
+
+/// An agent the packhouse lists, and nobody answers for yet.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Trainee : Agent {
+  public static Person Principal => new Person { Email = "trainee@packhouse.example", DisplayName = "Trainee" };
+  public override List<SkillBase> Skills => [new GradeCrate()];
+  public override Permits May => Permits.ChangesAlone();
+}
+
+/// An agent nobody listed in `app.Agents`.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Stowaway : Agent {
+  public static Person Principal => new Person { Email = "stowaway@packhouse.example" };
+}
+
+// ── what the packhouse does with them ───────────────────────────────────────────────────────────────────────────────
+
+/// Have the inspector grade a crate, for whoever asks.
+public AgentOutcome<Grade> Inspect(Crate crate) {
+  return await Agents.Of<Inspector>().Do(new GradeCrate(), crate, about: "Crate " + crate.Code);
+}
+
+/// The same, by the sorter — who has somebody to consult.
+public AgentOutcome<Grade> InspectCarefully(Crate crate) {
+  return await Agents.Of<Sorter>().Do(new GradeCrate(), crate, about: "Crate " + crate.Code);
+}
+
+/// The same, at a glance and on a small budget.
+public AgentOutcome<Grade> Glance(Crate crate) {
+  return await Agents.Of<Inspector>().Do(new QuickLook(), crate, about: "Crate " + crate.Code);
+}
+
+/// Two crates graded at once: both pieces of work are in flight, and each is awaited where its result is wanted.
+public List<AgentOutcome<Grade>> InspectBoth(Crate first, Crate second) {
+  var a = Agents.Of<Inspector>().Do(new GradeCrate(), first, about: "Crate " + first.Code);
+  var b = Agents.Of<Inspector>().Do(new GradeCrate(), second, about: "Crate " + second.Code);
+  return [await a, await b];
+}
+
+/// Grade a crate, and then the grower's own work on it fails.
+public void InspectThenFail(Crate crate) {
+  crate.Line = "Fresh";
+  Inspect(crate);
+  throw new ValidationException("The line is closed.");
+}
+
+/// A sentence about what a grower has brought.
+public AgentOutcome<string> Describe(string growerEmail) {
+  return await Agents.Of<Inspector>().Do(new DescribeDelivery(), growerEmail);
+}
+
+/// Mark a delivery's crates.
+public AgentOutcome<string> Mark(string delivery) { return await Agents.Of<Inspector>().Do(new MarkDelivery(), delivery); }
+
+/// What the ledger shows.
+public AgentOutcome<string> ReadLedgerThrough() { return await Agents.Of<Inspector>().Do(new ReadTheLedger(), "this season"); }
+
+/// Ask the inspector something.
+public AgentReply AskInspector(string question) { return await Agents.Of<Inspector>().Ask(question); }
+
+/// The same, watched as it arrives: the signals, as words.
+public List<string> WatchInspector(string question) {
+  List<string> seen = [];
+  await foreach (var s in Agents.Of<Inspector>().Stream(question)) {
+    if (s.Kind == AgentSignalKind.Text) { seen.Add("text:" + s.Text); }
+    else if (s.Kind == AgentSignalKind.Done) { seen.Add("done:" + s.Reply!.Text); }
+    else { seen.Add(s.Kind.Name + ":" + s.Tool + (s.Failed ? ":failed" : "")); }
+  }
+  return seen;
+}
+
+/// Which line a crate goes to, decided by the sorter.
+public Decision<Line> LineFor(string whatWasFound) {
+  return await Agents.Of<Sorter>().Decide<Line>(whatWasFound, "Which line does this crate go to?");
+}
+
+/// The same, by the inspector, who consults nobody.
+public Decision<Line> LineByInspector(string whatWasFound) {
+  return await Agents.Of<Inspector>().Decide<Line>(whatWasFound, "Which line does this crate go to?");
+}
+
+public AgentOutcome<Grade> TraineeInspects(Crate crate) { return await Agents.Of<Trainee>().Do(new GradeCrate(), crate); }
+
+/// An agent the packhouse never listed, and a skill the sorter does not hold.
+public void UseTheStowaway(Crate crate) { await Agents.Of<Stowaway>().Do(new GradeCrate(), crate); }
+public void SorterDescribes() { await Agents.Of<Sorter>().Do(new DescribeDelivery(), "anyone"); }
+
+/// For a grower who is not the one signed in.
+public AgentOutcome<Grade> InspectFor(Person grower, Crate crate) {
+  return await Agents.Of<Inspector>().For(grower).Do(new GradeCrate(), crate);
+}
+
+/// Grade a crate, charged to the delivery it came with — and held to what the delivery may spend, in dollars.
+public AgentOutcome<Grade> InspectOn(Crate crate, string delivery, decimal? limit) {
+  return await Agents.Of<Inspector>().On("delivery:" + delivery, limit).Do(new GradeCrate(), crate, about: "Crate " + crate.Code);
+}
+
+/// The same in two steps: the receipt is noted before the work runs, so the work can be reached while under way.
+public AgentOutcome<Grade> InspectNoted(Crate crate) {
+  var work = Agents.Of<Inspector>().Open(new GradeCrate(), crate, about: "Crate " + crate.Code);
+  new Heard { What = "opened", About = work.Task.ToString() };
+  UnitOfWork.Commit();
+  return await work.Run();
+}
+
+/// Call off the piece of work that was noted as opened.
+public void CallOffTheNotedWork(string why) {
+  var id = Guid.Parse(Heard.Single(h => h.What == "opened").About);
+  StopAgentTask(AgentTask.Single(t => t.Id == id), why);
+  UnitOfWork.Commit();
+}
+
+// ── a process with an agent step ────────────────────────────────────────────────────────────────────────────────────
+
+/// A crate's way in: the inspector grades it, and the grade decides. The step is an ordinary call; nobody is signed
+/// in while a process runs, so the inspector works with its own rights alone.
+workflow Intake {
+  Tracks = Crate.Stage; Autostart = false; Initial = Arrived;
+  state Arrived {
+    enter {
+      var outcome = await Agents.Of<Inspector>().Do(new GradeCrate(), this.Item, about: "Intake of " + this.Item.Code);
+      if (outcome.Done && outcome.Result.Score >= 5) { goto Accepted; }
+      goto Rejected;
+    }
+  }
+  terminal success Accepted { }
+  terminal cancel  Rejected { Message = "the crate did not make the grade"; }
+}
+
+// ── what the packhouse hears ────────────────────────────────────────────────────────────────────────────────────────
+
+/// Something the packhouse was told: a model it asked, an event it heard. Written by the scripts and the handlers, so
+/// a test can read what happened.
+entity Heard {
+  [Required, MaxLength(40)] string What;
+  [MaxLength(4000)] string About = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}
+
+/// Note what the last message of a request tells the model its tools answered — what a script sees on its next turn.
+public void NoteLastResult(LlmRequest request, string what) {
+  if (request.Messages.Count == 0) { return; }
+  foreach (var b in request.Messages[request.Messages.Count - 1].Content) {
+    if (b.Kind == LlmBlockKind.ToolResult) { new Heard { What = what, About = (b.IsError ? "error: " : "") + (b.ResultJson ?? "") }; }
+  }
+}
+
+/// Note, for each tool result a request carries, whether it is there in full or was cleared to a line.
+public void NoteCleared(LlmRequest request) {
+  foreach (var m in request.Messages) {
+    foreach (var b in m.Content) {
+      if (b.Kind == LlmBlockKind.ToolResult) { new Heard { What = (b.ResultJson ?? "").StartsWith("\"[cleared") ? "cleared" : "kept", About = (b.ResultJson ?? "").Length.ToString() }; }
+    }
+  }
+}
+
+/// Note that a model was asked: how many tools it was offered and what it was asked — and, when the request carries
+/// them, what its tools answered and the advice it was given.
+public void NoteAsked(string model, LlmRequest request) {
+  new Heard { What = "asked:" + model, About = $"{request.Tools.Count} tools | {Scripted.Asked(request)}" };
+  NoteLastResult(request, "result");
+  var said = Scripted.Asked(request);
+  if (said.StartsWith("Advice from a more capable model")) { new Heard { What = "advice", About = said }; }
+}
+
+/// Note the tools a request offers the model, and what it is told to be.
+public void NoteOffer(LlmRequest request, string what) {
+  new Heard { What = what, About = string.Join(",", request.Tools.Select(t => t.Name)) };
+}
+
+[On] void WorkStarted(AgentTaskStarted e)   { new Heard { What = "started", About = e.Task.Agent }; }
+[On] void WorkFinished(AgentTaskFinished e) { new Heard { What = "wrapped up", About = e.Task.About }; }
+[On] void WorkFailed(AgentTaskFailed e)     { new Heard { What = "failed", About = e.Problem }; }
+[On] void WorkStopped(AgentTaskStopped e)   { new Heard { What = "stopped", About = e.Why }; }
+[On] void HelpAsked(AgentAskedForHelp e)    { new Heard { What = "help", About = e.Help.AskedModel + " " + e.Help.Why.Name }; }
+
+// ── what app code is not able to do ─────────────────────────────────────────────────────────────────────────────────
+
+/// A receipt made up by the app.
+public void ForgeReceipt() {
+  new AgentTask { Agent = "Packhouse.Inspector", Actor = Session.CurrentUser as Person };
+}
+
+/// A receipt's cost turned back, and its ending rewritten.
+public void RewriteReceipt(AgentTask task) {
+  task.SpentMicros = 0;
+  task.Outcome = "Nothing to see.";
+}
+
+// The packhouse means to leave the record as the kit guards it; `RewriteLine` below is there to be refused.
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity TraceEvent { }
+
+/// A line of a record made up, and one rewritten.
+public void ForgeLine(AgentTask task) {
+  new TraceEvent { Task = task, Root = task, Seq = 99, Summary = "It was told to." };
+}
+public void RewriteLine(TraceEvent line) { line.Payload = "\"nothing\""; }
+/// A line's content blanked, and its sentence rewritten, without the kit.
+public void BlankLine(TraceEvent line) { line.Payload = null; }
+public void RewriteSentence(TraceEvent line) { line.Summary = "Nothing happened."; }
+
+/// A sponsor named without `SponsorAgent`.
+public void ForgeSeat(Person who) {
+  new AgentSeat { Agent = "Packhouse.Stowaway", Sponsor = who };
+}
+
+/// A request for help made up.
+public void ForgeHelp() {
+  new AgentHelp { Agent = "Packhouse.Sorter", Question = "?" };
+}

@@ -1,0 +1,258 @@
+// Osysharp.Agents — erasing: what a piece of work said can go, and who it was for can be taken off it, while the
+// record of what happened — every step, its model, its tool, its cost, in order — stays and still checks.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Packhouse;
+
+string WeighArgs(Crate crate) { return "{\"crate\":\"" + crate.Id.ToString() + "\"}"; }
+string ShortArgs(Crate crate) { return "{\"crate\":\"" + crate.Id.ToString() + "\",\"flag\":\"short\"}"; }
+
+/// One crate graded for whoever is signed in: weighed, flagged, handed back. Nine lines on its record.
+Guid Graded(string code) {
+  var crate = Crate.Single(c => c.Code == code);
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(Weigh), WeighArgs(crate), 400, 40),
+    Says.Tool(Actions.Of(FlagCrate), ShortArgs(crate), 500, 40),
+    Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true }, 600, 60));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  return Inspect(crate).Task;
+}
+
+[Test(Yard)]
+void the_chain_verifies_after_what_a_piece_of_work_said_is_erased() {
+  Guid task;
+  runas (Ada) { task = Graded("A-2"); }
+  // Before: the auditor reads what each tool was given, and what was handed back.
+  runas (Omar) {
+    Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == task && e.Payload != null && e.Payload != ""));
+    Assert.NotNull(AgentTask.Single(t => t.Id == task).Result);
+  }
+
+  runas (Rita) { Assert.Equal(9, EraseAgentWorkContent(AgentTask.Single(t => t.Id == task), "Ada asked for it to be erased.")); }
+
+  runas (Omar) {
+    var receipt = AgentTask.Single(t => t.Id == task);
+    // What was said is gone — for the auditor too, who reads everything there is.
+    Assert.Equal(0, TraceEvent.Count(e => e.Task.Id == task && e.Payload != null && e.Payload != ""));
+    Assert.Null(receipt.Result);
+    Assert.NotNull(receipt.ContentErasedAt);
+    Assert.Equal("Ada asked for it to be erased.", receipt.ErasedWhy);
+    // What happened is all still there, in words, with what it cost.
+    Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == task));
+    Assert.Equal("Inspector was given grade crate: Crate A-2.", TraceEvent.Single(e => e.Task.Id == task && e.Seq == 1).Summary);
+    Assert.Equal(2200, receipt.SpentMicros);
+    // And the chain checks: it holds each content's hash, not the content.
+    var check = VerifyTrace(receipt);
+    Assert.True(check.Intact);
+    Assert.Equal(9, check.Lines);
+    Assert.Equal(0, check.Erased);
+  }
+  // Whoever asked still reads the receipt of their own work.
+  runas (Ada) { Assert.Equal(1, AgentTask.Count()); }
+}
+
+[Test(Yard)]
+void the_chain_verifies_after_the_person_is_taken_off_the_work() {
+  Guid task;
+  runas (Ada) { task = Graded("A-2"); }
+
+  runas (Rita) {
+    var receipt = AgentTask.Single(t => t.Id == task);
+    EraseAgentWorkContent(receipt, "Ada asked to be erased.");
+    AnonymiseAgentWork(receipt, "Ada asked to be erased.");
+  }
+
+  runas (Omar) {
+    var receipt = AgentTask.Single(t => t.Id == task);
+    // Nobody's, about nothing, and not a sentence left on its record.
+    Assert.Null(receipt.Requester);
+    Assert.Null(receipt.StartedBy);
+    Assert.Equal("", receipt.About);
+    Assert.Equal("", receipt.Outcome);
+    Assert.NotNull(receipt.AnonymisedAt);
+    Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == task && e.Summary == "Erased." && e.ErasedAt != null));
+    Assert.Equal(0, TraceEvent.Count(e => e.Task.Id == task && e.Payload != null && e.Payload != ""));
+    // What stays: that the inspector graded a crate, each step's kind, model, tool and cost, and how it ended.
+    Assert.Equal("Packhouse.Inspector", receipt.Agent);
+    Assert.Equal("Packhouse.GradeCrate", receipt.Skill);
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Equal(2200, receipt.SpentMicros);
+    Assert.Equal(["Started", "ModelCall", "ToolCall", "ToolResult", "ModelCall", "ToolCall", "ToolResult", "ModelCall", "Ended"],
+                 Trajectory.Kinds(task));
+    Assert.Equal("Small", TraceEvent.Single(e => e.Task.Id == task && e.Seq == 2).Model);
+    Assert.Equal(600, TraceEvent.Single(e => e.Task.Id == task && e.Seq == 2).CostMicros);
+    Assert.Equal("Packhouse.Weigh", TraceEvent.Single(e => e.Task.Id == task && e.Seq == 3).Tool);
+    // The chain checks, and says how many lines no longer say what they said.
+    var check = VerifyTrace(receipt);
+    Assert.True(check.Intact);
+    Assert.Equal(9, check.Lines);
+    Assert.Equal(9, check.Erased);
+  }
+  // It is no longer Ada's: she reads none of it.
+  runas (Ada) {
+    Assert.Equal(0, AgentTask.Count());
+    Assert.Equal(0, TraceEvent.Count());
+  }
+}
+
+[Test(Yard)]
+void a_changed_line_is_still_found_after_an_erasure() {
+  Guid task;
+  runas (Ada) { task = Graded("A-2"); }
+  runas (Rita) {
+    var receipt = AgentTask.Single(t => t.Id == task);
+    EraseAgentWorkContent(receipt, "Ada asked to be erased.");
+    AnonymiseAgentWork(receipt, "Ada asked to be erased.");
+  }
+  runas (Omar) {
+    var receipt = AgentTask.Single(t => t.Id == task);
+    Assert.True(CheckChain(TraceOf(receipt)).Intact);
+
+    // What a call cost, turned down.
+    var lines = TraceOf(receipt);
+    lines[1].CostMicros = 6;
+    var cheaper = CheckChain(lines);
+    Assert.False(cheaper.Intact);
+    Assert.Equal(2, cheaper.BrokenAt);
+    Assert.Equal("Line 2 is not as it was written.", cheaper.Problem);
+
+    // Which tool ran, swapped.
+    lines = TraceOf(receipt);
+    lines[2].Tool = "Packhouse.CondemnCrate";
+    Assert.Equal(3, CheckChain(lines).BrokenAt);
+
+    // A sentence written where an erased one was.
+    lines = TraceOf(receipt);
+    lines[3].Summary = "Weigh was never asked for.";
+    var written = CheckChain(lines);
+    Assert.Equal(4, written.BrokenAt);
+    Assert.Equal("Line 4 was erased, and something was written in its place.", written.Problem);
+
+    // An erased line passed off as never erased.
+    lines = TraceOf(receipt);
+    lines[3].Erased = false;
+    Assert.Equal(4, CheckChain(lines).BrokenAt);
+
+    // Content put back that is not what was there.
+    lines = TraceOf(receipt);
+    lines[2].Payload = "{\"crate\":\"another\"}";
+    var swapped = CheckChain(lines);
+    Assert.Equal(3, swapped.BrokenAt);
+    Assert.Equal("The content of line 3 is not what was written.", swapped.Problem);
+
+    // A line taken out, and the last line replaced by one with a hash of its own making.
+    lines = TraceOf(receipt);
+    lines.RemoveAt(5);
+    Assert.Equal("Line 6 is missing.", CheckChain(lines).Problem);
+    lines = TraceOf(receipt);
+    lines[8].Hash = Crypto.Sha256Hex("made up");
+    Assert.Equal(9, CheckChain(lines).BrokenAt);
+  }
+}
+
+[Test(Yard)]
+void a_line_that_was_not_erased_cannot_be_passed_off_as_erased() {
+  Guid task;
+  runas (Ada) { task = Graded("A-2"); }
+  runas (Omar) {
+    // Positive control: untouched, it checks.
+    var lines = TraceOf(AgentTask.Single(t => t.Id == task));
+    Assert.True(CheckChain(lines).Intact);
+    // Marked erased with its sentence still there: found.
+    lines[0].Erased = true;
+    var marked = CheckChain(lines);
+    Assert.Equal(1, marked.BrokenAt);
+    Assert.Equal("Line 1 was erased, and something was written in its place.", marked.Problem);
+  }
+}
+
+[Test(Yard)]
+void what_was_asked_of_a_stronger_model_goes_with_the_content() {
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Consult("Is a crate of 9.8 kg short?", "The rule: a crate under 10 kg is short."),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true }))
+      .Advises("Strong", "Yes. Under 10 kg is short: flag it and say so.");
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = InspectCarefully(crate).Task;
+    Assert.Equal("Is a crate of 9.8 kg short?", AgentHelp.Single().Question);
+  }
+  runas (Rita) {
+    var receipt = AgentTask.Single(t => t.Id == task);
+    EraseAgentWorkContent(receipt, "Its time is up.");
+    AnonymiseAgentWork(receipt, "Its time is up.");
+  }
+  runas (Omar) {
+    var help = AgentHelp.Single();
+    Assert.Equal("", help.Question);
+    Assert.Equal("", help.Context);
+    Assert.Equal("", help.Answer);
+    Assert.Null(help.Requester);
+    Assert.Null(help.StartedBy);
+    Assert.NotNull(help.ErasedAt);
+    // That help was asked for, of whom, and what it cost stays.
+    Assert.Equal("Strong", help.AskedModel);
+    Assert.Equal(4500, help.CostMicros);
+    Assert.True(VerifyTrace(AgentTask.Single(t => t.Id == task)).Intact);
+  }
+}
+
+[Test(Yard)]
+void only_whoever_the_app_names_erases_and_only_through_the_kit() {
+  Guid task;
+  runas (Ada) {
+    task = Graded("A-2");
+    // Whoever asked for the work does not erase its record…
+    Assert.Denied(() => EraseAgentWorkContent(AgentTask.Single(t => t.Id == task), "I would rather it were gone."));
+    Assert.Denied(() => AnonymiseAgentWork(AgentTask.Single(t => t.Id == task), "I would rather it were gone."));
+    Assert.Denied(() => ForgetAgentWork(AgentTask.Single(t => t.Id == task)));
+  }
+  // …nor does whoever supervises the agents, nor the auditor.
+  runas (Dana) { Assert.Denied(() => AnonymiseAgentWork(AgentTask.Single(t => t.Id == task), "Tidying up.")); }
+  runas (Omar) { Assert.Denied(() => EraseAgentWorkContent(AgentTask.Single(t => t.Id == task), "Tidying up.")); }
+  runas (Rita) {
+    // The records clerk may — through the kit's functions, and no other way: a line blanked by hand is refused.
+    var line = TraceEvent.First(e => e.Task.Id == task && e.Kind == TraceKind.ToolCall);
+    Assert.Denied(() => { BlankLine(line); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Denied(() => { RewriteSentence(line); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Denied(() => { line.Delete(); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    // A reason is kept with every erasure.
+    Assert.Throws<ValidationException>(() => EraseAgentWorkContent(AgentTask.Single(t => t.Id == task), " "));
+  }
+  runas (Omar) {
+    // Nothing went: every refusal above left the record as it was written.
+    Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == task && e.Payload != null && e.Payload != ""));
+    var check = VerifyTrace(AgentTask.Single(t => t.Id == task));
+    Assert.True(check.Intact);
+    Assert.Equal(0, check.Erased);
+  }
+  // Positive control: the same clerk, through the kit, erases.
+  runas (Rita) { Assert.Equal(9, EraseAgentWorkContent(AgentTask.Single(t => t.Id == task), "Its time is up.")); }
+  runas (Omar) { Assert.Equal(0, TraceEvent.Count(e => e.Task.Id == task && e.Payload != null && e.Payload != "")); }
+}
+
+[Test(Yard)]
+void work_whose_time_is_up_is_deleted_whole_and_other_work_is_untouched() {
+  Guid adas;
+  Guid bens;
+  runas (Ada) { adas = Graded("A-2"); }
+  runas (Ben) { bens = Graded("B-1"); }
+
+  runas (Rita) { Assert.Equal(1, ForgetAgentWork(AgentTask.Single(t => t.Id == adas))); }
+
+  runas (Omar) {
+    Assert.Equal(0, AgentTask.Count(t => t.Id == adas));
+    Assert.Equal(0, TraceEvent.Count(e => e.Root.Id == adas));
+    // Ben's work is all there, with its content, and checks.
+    Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == bens));
+    Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == bens && e.Payload != null && e.Payload != ""));
+    Assert.True(VerifyTrace(AgentTask.Single(t => t.Id == bens)).Intact);
+  }
+}

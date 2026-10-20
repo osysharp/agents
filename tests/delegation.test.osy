@@ -1,0 +1,1122 @@
+// Osysharp.Agents — handing work on. An agent gives typed pieces of its work to other agents — several at once — and
+// goes on with what comes back. A piece that is handed on has its own receipt under the one that handed it on, is
+// done for the same person, proposes what any piece of work above it would have to propose, and spends out of what
+// the work above it has left.
+//
+// The crew. The FOREMAN takes a delivery in by handing each crate to the inspector or the clerk; it changes things
+// alone and never condemns a crate. The USHER does the same job and says nothing of what it may do alone. The
+// DIRECTOR hands whole deliveries to the foreman, two levels deep, and gives taking a delivery in two cents; the
+// YARDMASTER lets work be handed on one level only.
+//
+// The numbers. A model's answer of 100 tokens in and 20 out costs 200 millionths of a dollar; a call reserves a
+// little over 5000 before it leaves. A piece of work may spend 50000 unless something says less.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+Crate CrateBy(string code) { return Crate.Single(c => c.Code == code); }
+
+/// What hands a text on: `{"input":"…"}`.
+string Text(string text) { return "{\"input\":" + JsonSerializer.Serialize(text) + "}"; }
+
+/// Let everything that waits look again — a wait whose person has decided goes on with its work, and the work above
+/// it follows — until nothing moves.
+void LetItGoOn() {
+  for (var i = 0; i < 5; i++) {
+    Background.Settle();
+    foreach (var wait in AgentWait.Where(w => w.Status == AgentWaitStatus.Waiting).ToList()) { Workflow.Settle(wait); }
+  }
+}
+
+/// Nothing of a tree is left behind once its top has ended: no piece still going, no wait still open, no state
+/// kept, no proposal or question still put to anybody.
+void AssertNothingLeft(Guid top) {
+  Assert.Equal(0, Trajectory.StillGoing(top).Count);
+  Assert.Equal(0, AgentWait.Count(w => w.Status == AgentWaitStatus.Waiting));
+  Assert.Equal(0, AgentTaskParking.Count());
+  Assert.Equal(0, AgentProposal.Count(p => p.Status == ProposalStatus.Waiting));
+  Assert.Equal(0, AgentHelp.Count(h => h.Status == HelpStatus.Waiting));
+}
+
+/// The tools a model was offered when it was first asked, as the stub noted them.
+string OfferedTo(string agent) { return Heard.First(h => h.What == "offered " + agent).About; }
+
+/// Note what each agent's model is offered — apart, since several are asked at once — and answer from the cast.
+LlmResponse Noted(AgentCast cast, string model, LlmRequest request) {
+  NoteApart("offered " + AgentCast.AskedAgent(request), string.Join(",", request.Tools.Select(t => t.Name)));
+  return cast.Answer(model, request);
+}
+
+// ── handing on, and gathering ───────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void work_is_handed_to_two_agents_at_once_and_comes_back_typed() {
+  var a1 = CrateBy("A-1");
+  var a2 = CrateBy("A-2");
+  var cast = AgentCast.Of()
+    .Plays<Foreman>(AgentScript.Of(
+      Says.Together(
+        Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id), "call-a1"),
+        Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a2.Id), "call-a2")),
+      Says.HandBack(new DeliveryNote { Graded = 2, Short = 1, Summary = "Two crates; A-2 is short." })))
+    .PlaysAbout<Inspector>("A-1", AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(a1)), Says.HandBack(new Grade { Score = 8, Finding = "Sound." })))
+    .PlaysAbout<Inspector>("A-2", AgentScript.Of(
+      Says.Tool(Actions.Of(FlagCrate), FlagArgs(a2, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true })));
+  ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+  var outcome = TakeIn("ada@packhouse.example");
+
+  Assert.Equal("", outcome.Problem);
+  Assert.True(outcome.Done);
+  Assert.Equal(2, outcome.Result.Graded);
+  Assert.Equal("Two crates; A-2 is short.", outcome.Result.Summary);
+  // Three receipts: the foreman's, and one for each crate under it.
+  Assert.Equal(["Foreman · Take in delivery: Done", "  Inspector · Grade crate: Done", "  Inspector · Grade crate: Done"], Trajectory.Tree(outcome.Task));
+  Assert.Equal(["Inspector", "Inspector"], Trajectory.HandedOn(outcome.Task));
+  var top = AgentTask.Single(t => t.Id == outcome.Task);
+  foreach (var piece in WorkTree.HandedOnBy(top)) {
+    Assert.Equal(top.Id, piece.Parent!.Id);
+    Assert.Equal(top.Id, piece.Root!.Id);
+    Assert.Equal(1, piece.Depth);
+    Assert.Equal("Packhouse.Foreman|Packhouse.TakeInDelivery", piece.Lineage);
+    // For the same grower, and about the same delivery.
+    Assert.Equal(Ada.Id, piece.Requester!.Id);
+    Assert.Equal("Delivery of ada@packhouse.example", piece.About);
+    Assert.Equal(AgentTaskStatus.Done, piece.Status);
+  }
+  // What each piece handed back reached the foreman's model as the answer of the call that handed it on.
+  Assert.Equal(2, Trajectory.Said(outcome.Task).Count(s => s.StartsWith("It handed grade crate to Inspector, with at most $")));
+  Assert.Equal(2, Trajectory.Said(outcome.Task).Count(s => s.StartsWith("Inspector handed back its result; that piece cost $")));
+  // The crate the second piece flagged is flagged — by the inspector, for Ada.
+  Assert.Equal(1, Crate.Count(c => c.Code == "A-2" && c.Flag == "short"));
+  Assert.True(VerifyTrace(top).Intact);
+  AssertNothingLeft(outcome.Task);
+}
+
+LlmResponse SlowlyNoted(AgentCast cast, string model, LlmRequest request) {
+  TakeAMoment(AgentCast.AskedAgent(request));
+  return cast.Answer(model, request);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void pieces_handed_on_in_one_turn_have_their_models_answering_side_by_side() {
+  var a1 = CrateBy("A-1");
+  var a2 = CrateBy("A-2");
+  var cast = AgentCast.Of()
+    .Plays<Foreman>(AgentScript.Of(
+      Says.Together(
+        Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id), "call-a1"),
+        Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a2.Id), "call-a2")),
+      Says.HandBack(new DeliveryNote { Graded = 2 })))
+    .Plays<Inspector>(AgentScript.Of(Says.HandBack(new Grade { Score = 7 })));
+  // Every model takes 400 ms to answer, and notes when it was asked and when it answered.
+  ScriptedAnswer.Stub((model, request) => SlowlyNoted(cast, model, request));
+
+  var outcome = TakeIn("ada@packhouse.example");
+
+  Assert.True(outcome.Done);
+  // Both inspectors' models were asked before either had answered: the two calls were in flight together.
+  var asked = Heard.Where(h => h.What == "asked Inspector").ToList().Select(h => long.Parse(h.About)).ToList();
+  var answered = Heard.Where(h => h.What == "answered Inspector").ToList().Select(h => long.Parse(h.About)).ToList();
+  Assert.Equal(2, asked.Count);
+  Assert.Equal(2, answered.Count);
+  Assert.True(asked.Max() < answered.Min());
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_job_of_its_own_is_done_apart_by_the_same_agent() {
+  var cast = AgentCast.Of()
+    .PlaysAbout<Foreman>("Take in a grower", AgentScript.Of(
+      Says.HandTo<Foreman>(new DescribeDelivery(), Text("ada@packhouse.example")),
+      Says.HandBack(new DeliveryNote { Summary = "Described." })))
+    .PlaysAbout<Foreman>("Say in one sentence", AgentScript.Of(
+      Says.Tool(Actions.Of(CratesOf), "{\"growerEmail\":\"ada@packhouse.example\"}"),
+      Says.Words("Two crates, A-1 and A-2.")));
+  ScriptedAnswer.Stub((model, request) => Noted(cast, model, request));
+
+  var outcome = TakeIn("ada@packhouse.example");
+
+  Assert.Equal("", outcome.Problem);
+  Assert.Equal(["Foreman · Take in delivery: Done", "  Foreman · Describe delivery: Done"], Trajectory.Tree(outcome.Task));
+  var helper = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == outcome.Task))[0];
+  // The same account, a conversation and a receipt of its own — and what it said came back as the call's answer.
+  Assert.Equal(Actor.Of<Foreman>().Id, helper.Actor.Id);
+  Assert.Equal("\"Two crates, A-1 and A-2.\"", helper.Result);
+  Assert.Equal(["CratesOf"], Trajectory.Of(helper.Id));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void work_is_handed_on_while_an_answer_is_watched() {
+  var a1 = CrateBy("A-1");
+  var cast = AgentCast.Of()
+    .Plays<Foreman>(AgentScript.Of(
+      Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)),
+      Says.Words("A-1 is sound: eight out of ten.")))
+    .Plays<Inspector>(AgentScript.Of(Says.HandBack(new Grade { Score = 8, Finding = "Sound." })));
+  ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+  var seen = WatchForeman("How is A-1?");
+
+  // Whoever watches is told the piece was handed on and came back, then reads the answer.
+  Assert.Equal(["ToolStarted:hand_to_Inspector_GradeCrate", "ToolFinished:hand_to_Inspector_GradeCrate",
+                "text:A-1 is sound: eight out of ten.", "done:A-1 is sound: eight out of ten."], seen);
+  var top = AgentTask.Single(t => t.Depth == 0);
+  Assert.Equal(["Foreman: Done", "  Inspector · Grade crate: Done"], Trajectory.Tree(top.Id));
+  Assert.Equal(AgentTaskCause.Chat, top.Cause);
+}
+
+// ── only as declared, and only so deep ──────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void work_is_handed_on_only_as_the_agent_declares() {
+  var a1 = CrateBy("A-1");
+  // The inspector declares nothing: it is offered no way to hand work on, and one it makes up is not a tool.
+  var alone = AgentCast.Of().Plays<Inspector>(AgentScript.Of(
+    Says.HandTo<Clerk>(new SettleCrate(), Says.Row(a1.Id)),
+    Says.HandBack(new Grade { Score = 6 })));
+  ScriptedAnswer.Stub((model, request) => Noted(alone, model, request));
+  var graded = Inspect(a1);
+  Assert.True(graded.Done);
+  Assert.False(OfferedTo("Inspector").Contains("hand_to_"));
+  Assert.Contains("It asked for `hand_to_Clerk_SettleCrate`, which is not one of its tools. Nothing ran.", Trajectory.Said(graded.Task));
+  Assert.Equal(1, AgentTask.Count());
+
+  // The foreman is offered exactly what its class names — and the porter only for counting, not for settling.
+  var cast = AgentCast.Of().Plays<Foreman>(AgentScript.Of(
+    Says.HandTo<Porter>(new SettleCrate(), Says.Row(a1.Id)),
+    Says.HandBack(new DeliveryNote { Summary = "Nothing was handed on." })));
+  ScriptedAnswer.Stub((model, request) => Noted(cast, model, request));
+  var taken = TakeIn("ada@packhouse.example");
+  Assert.True(taken.Done);
+  Assert.Equal("CratesOf,hand_to_Inspector_GradeCrate,hand_to_Clerk_SettleCrate,hand_to_Inspector_QuickLook,hand_to_Porter_CountCrates,hand_to_Foreman_DescribeDelivery,hand_back",
+    OfferedTo("Foreman"));
+  Assert.Contains("It asked for `hand_to_Porter_SettleCrate`, which is not one of its tools. Nothing ran.", Trajectory.Said(taken.Task));
+  Assert.Equal(2, AgentTask.Count());
+}
+
+/// ⭐ ONLY AS DECLARED — AS THE DECLARATION STANDS WHEN THE WORK IS HANDED ON, not as it stood when the tool was
+/// offered. The steward hands crates on while the yard is open. Its model is offered the way to; the yard closes
+/// while the model answers; the answer asks to hand a crate on, and nothing is.
+[Test(Yard)]
+[runas(Ada)]
+void work_is_handed_on_only_as_the_declaration_stands_when_it_is_asked_for() {
+  var a1 = CrateBy("A-1");
+  var cast = AgentCast.Of()
+    .Plays<Steward>(AgentScript.Of(
+      Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)),
+      Says.HandBack(new DeliveryNote { Summary = "Nothing was handed on." })))
+    .Plays<Inspector>(AgentScript.Of(Says.HandBack(new Grade { Score = 7 })));
+  ScriptedAnswer.Stub((model, request) => {
+    if (!YardIsClosed()) { NoteApart("yard closed", ""); }
+    return Noted(cast, model, request);
+  });
+
+  var outcome = WalkThrough("ada@packhouse.example");
+
+  Assert.True(outcome.Done);
+  // It was offered: the declaration named the inspector when the work was opened.
+  Assert.Contains("hand_to_Inspector_GradeCrate", OfferedTo("Steward"));
+  // …and by the time the model asked, it no longer did. The model was told, and no piece of work was started.
+  Assert.Contains("It tried to hand work on, and nothing was started: `hand_to_Inspector_GradeCrate` is not work Steward may hand on.",
+    Trajectory.Said(outcome.Task));
+  Assert.Equal(1, AgentTask.Count());
+  AssertNothingLeft(outcome.Task);
+}
+
+/// ⭐ "FROM NOW ON, ALONE" SAID FOR THE AGENT ABOVE COVERS WHAT IT HANDS ON — AND NOTHING ELSE. The steward proposes
+/// every change, so the inspector under it proposes a flag it would make alone in its own work. Ada tells the
+/// steward it may flag crates alone for her work: from then on a flag under the steward runs alone, for HER work,
+/// and the rule counts each time. It does not cover Ben's work; it does not lift what the specialist's own
+/// declaration proposes; and it is taken back like any other.
+[Test(Yard)]
+void a_standing_rule_for_the_agent_above_covers_what_it_hands_on_and_nothing_else() {
+  Guid rule = Guid.Empty;
+  // 1. No rule: the inspector's flag is proposed, on the steward's account.
+  runas (Ada) {
+    var a2 = CrateBy("A-2");
+    var cast = AgentCast.Of()
+      .Plays<Steward>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a2.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+      .Plays<Inspector>(AgentScript.Of(Says.Tool("It weighs 8 kg.", Actions.Of(FlagCrate), FlagArgs(a2, "short")), Says.HandBack(new Grade { Score = 4 })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    var first = WalkThrough("ada@packhouse.example");
+    Assert.True(first.Waiting);
+    var piece = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == first.Task))[0];
+    Assert.Contains("It asked for FlagCrate (changes data); Steward, which handed this work on, may not do that alone, so it was put to Ada.",
+      Trajectory.Said(piece.Id));
+    Assert.Equal(0, Crate.Count(c => c.Flag == "short"));
+    Assert.Equal(ProposalStatus.Done, ApproveAgentProposal(AgentProposal.Single()).Status);
+    LetItGoOn();
+    AssertNothingLeft(first.Task);
+
+    // 2. "From now on, alone" — for the steward, for Ada's own work.
+    rule = AllowAlone("Packhouse.Steward", Actions.Of(FlagCrate)).Id;
+    UnitOfWork.Commit();
+
+    var a1 = CrateBy("A-1");
+    var again = AgentCast.Of()
+      .Plays<Steward>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+      .Plays<Inspector>(AgentScript.Of(Says.Tool("It is bruised.", Actions.Of(FlagCrate), FlagArgs(a1, "bruised")), Says.HandBack(new Grade { Score = 5 })));
+    ScriptedAnswer.Stub((model, request) => again.Answer(model, request));
+    var second = WalkThrough("ada@packhouse.example");
+    // It ran alone, under the steward — and the record says on whose word.
+    Assert.True(second.Done);
+    Assert.Equal(1, Crate.Count(c => c.Code == "A-1" && c.Flag == "bruised"));
+    Assert.Equal(1, AgentProposal.Count());
+    var alone = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == second.Task))[0];
+    Assert.Contains("It asked for FlagCrate (changes data); its declaration lets it, and a person said the work above it may, from now on, so it runs as the agent, for whoever asked.",
+      Trajectory.Said(alone.Id));
+    Assert.Equal(1, AgentStandingRule.Single(r => r.Id == rule).Used);
+
+    // 3. The rule lifts the STEWARD's "propose", not the specialist's own: the clerk proposes a flag in its own
+    //    work, and under the steward still does.
+    var a2again = CrateBy("A-2");
+    var third = AgentCast.Of()
+      .Plays<Steward>(AgentScript.Of(Says.HandTo<Clerk>(new SettleCrate(), Says.Row(a2again.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+      .Plays<Clerk>(AgentScript.Of(Says.Tool("Still short.", Actions.Of(FlagCrate), FlagArgs(a2again, "very short")), Says.HandBack(new Grade { Score = 3 })));
+    ScriptedAnswer.Stub((model, request) => third.Answer(model, request));
+    var settled = WalkThrough("ada@packhouse.example");
+    Assert.True(settled.Waiting);
+    var clerk = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == settled.Task))[0];
+    Assert.Contains("It asked for FlagCrate (changes data); its declaration says it is proposed first, so it was put to Ada.", Trajectory.Said(clerk.Id));
+    Assert.Equal(0, Crate.Count(c => c.Flag == "very short"));
+    Assert.Equal(1, AgentStandingRule.Single(r => r.Id == rule).Used);
+    StopAgentTask(AgentTask.Single(t => t.Id == settled.Task), "Enough.");
+    UnitOfWork.Commit();
+    LetItGoOn();
+    AssertNothingLeft(settled.Task);
+  }
+
+  // 4. It is Ada's rule, for Ada's work: under the same steward, Ben's crate is still proposed — to Ben.
+  runas (Ben) {
+    var b1 = CrateBy("B-1");
+    var cast = AgentCast.Of()
+      .Plays<Steward>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(b1.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+      .Plays<Inspector>(AgentScript.Of(Says.Tool("It is bruised.", Actions.Of(FlagCrate), FlagArgs(b1, "bruised")), Says.HandBack(new Grade { Score = 5 })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    var bens = WalkThrough("ben@packhouse.example");
+    Assert.True(bens.Waiting);
+    Assert.Equal(Ben.Id, AgentProposal.Single(p => p.Status == ProposalStatus.Waiting).DecideBy!.Id);
+    Assert.Equal(0, Crate.Count(c => c.Code == "B-1" && c.Flag == "bruised"));
+    StopAgentTask(AgentTask.Single(t => t.Id == bens.Task), "Not today.");
+    UnitOfWork.Commit();
+  }
+  LetItGoOn();
+
+  // 5. Taken back, it covers nothing: the next flag under the steward is proposed again.
+  runas (Ada) {
+    RevokeStandingRule(AgentStandingRule.Single(r => r.Id == rule), "It flagged too freely.");
+    UnitOfWork.Commit();
+    var a1 = CrateBy("A-1");
+    var cast = AgentCast.Of()
+      .Plays<Steward>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+      .Plays<Inspector>(AgentScript.Of(Says.Tool("Mould.", Actions.Of(FlagCrate), FlagArgs(a1, "mould")), Says.HandBack(new Grade { Score = 1 })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    var last = WalkThrough("ada@packhouse.example");
+    Assert.True(last.Waiting);
+    Assert.Equal(0, Crate.Count(c => c.Flag == "mould"));
+    Assert.Equal(1, AgentStandingRule.Single(r => r.Id == rule).Used);
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void work_is_handed_on_no_deeper_than_the_work_above_allows() {
+  var a1 = CrateBy("A-1");
+  // The yardmaster lets work be handed on one level deep. The foreman under it would hand a crate on — a second
+  // level — and is not offered the means; what it makes up is not a tool.
+  var cast = AgentCast.Of()
+    .Plays<Yardmaster>(AgentScript.Of(
+      Says.HandTo<Foreman>(new TakeInDelivery(), Text("ada@packhouse.example")),
+      Says.HandBack(new DeliveryNote { Summary = "Taken in." })))
+    .Plays<Foreman>(AgentScript.Of(
+      Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)),
+      Says.HandBack(new DeliveryNote { Summary = "Could not have it graded." })));
+  ScriptedAnswer.Stub((model, request) => Noted(cast, model, request));
+
+  var outcome = KeepYard("ada@packhouse.example");
+
+  Assert.Equal("", outcome.Problem);
+  Assert.Equal(["Yardmaster · Run the yard: Done", "  Foreman · Take in delivery: Done"], Trajectory.Tree(outcome.Task));
+  Assert.Equal("CratesOf,hand_back", OfferedTo("Foreman"));
+  var foreman = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == outcome.Task))[0];
+  Assert.Contains("It asked for `hand_to_Inspector_GradeCrate`, which is not one of its tools. Nothing ran.", Trajectory.Said(foreman.Id));
+}
+
+// ── a child never holds more than its parent ────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void a_child_never_holds_more_than_its_parent() {
+  TestClock.Set(new DateTime(2031, 4, 7, 9, 0, 0, DateTimeKind.Utc));
+  // 1. THE GATE. The usher says nothing of what it may do alone, so it proposes every change. The inspector it hands
+  //    a crate to marks crates by itself in its own work — and here, under the usher, must propose it.
+  Guid shown;
+  runas (Ada) {
+    var a2 = CrateBy("A-2");
+    var cast = AgentCast.Of()
+      .Plays<Usher>(AgentScript.Of(
+        Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a2.Id)),
+        Says.HandBack(new DeliveryNote { Graded = 1, Short = 1, Summary = "A-2 is short." })))
+      .Plays<Inspector>(AgentScript.Of(
+        Says.Tool("It weighs 8 kg.", Actions.Of(FlagCrate), FlagArgs(a2, "short")),
+        Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+    var outcome = ShowIn("ada@packhouse.example");
+    shown = outcome.Task;
+
+    // Nothing was flagged. The inspector's work stopped on Ada, and the usher's on the inspector.
+    Assert.True(outcome.Waiting);
+    Assert.Equal(["Usher · Take in delivery: Waiting", "  Inspector · Grade crate: Waiting"], Trajectory.Tree(shown));
+    Assert.Equal(0, Crate.Count(c => c.Flag == "short"));
+    var proposal = AgentProposal.Single();
+    Assert.Equal("Packhouse.Inspector", proposal.Agent);
+    Assert.Equal(Ada.Id, proposal.DecideBy!.Id);
+    Assert.Equal("Inspector, working for Usher", proposal.AskedThrough);
+    var inspector = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == shown))[0];
+    Assert.Contains("It asked for FlagCrate (changes data); Usher, which handed this work on, may not do that alone, so it was put to Ada.",
+      Trajectory.Said(inspector.Id));
+    Assert.Equal("a decision from Ada", inspector.WaitingOn);
+    Assert.Equal("Inspector, which waits for a decision from Ada", AgentTask.Single(t => t.Id == shown).WaitingOn);
+
+    // Ada says yes: it runs as her and as the inspector, and both pieces of work go on to their end.
+    Assert.Equal(ProposalStatus.Done, ApproveAgentProposal(proposal).Status);
+    LetItGoOn();
+    Assert.Equal(["Usher · Take in delivery: Done", "  Inspector · Grade crate: Done"], Trajectory.Tree(shown));
+    var asInspector = Actor.Of<Inspector>().Id;
+    Assert.Equal(1, Crate.Count(c => c.Code == "A-2" && c.Flag == "short" && c.ChangedBy == asInspector));
+    Assert.Contains("A-2 is short.", AgentTask.Single(t => t.Id == shown).Result!);
+    AssertNothingLeft(shown);
+  }
+
+  // 2. THE PERSON. The director asks Ada a question first, so its work goes on later with nobody signed in — and
+  //    only then hands a crate to the inspector, who tries to condemn it. A grader may condemn a crate; a grower may
+  //    not. The inspector's work is for Ada, as the director's is: it cannot either.
+  Guid run;
+  runas (Ada) {
+    var a1 = CrateBy("A-1");
+    var cast = AgentCast.Of()
+      .Plays<Director>(AgentScript.Of(
+        Says.AskPerson("Shall I have A-1 looked at?", "It came in late."),
+        Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)),
+        Says.HandBack(new DeliveryNote { Graded = 1, Summary = "A-1 was looked at." })))
+      .Plays<Inspector>(AgentScript.Of(
+        Says.Tool(Actions.Of(CondemnCrate), CondemnArgs(a1)),
+        Says.HandBack(new Grade { Score = 1, Finding = "Mould." })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    run = RunYard("ada@packhouse.example").Task;
+    Assert.Equal(1, AgentTask.Count(t => t.Root.Id == run || t.Id == run));
+    AnswerAgentQuestion(AgentHelp.Single(h => h.Status == HelpStatus.Waiting), "Yes.");
+  }
+  // Nobody is signed in while the work goes on.
+  LetItGoOn();
+  // The crate is not condemned — read by the lead, who sees every crate and every piece of work.
+  runas (Dana) {
+    Assert.Equal(0, Crate.Count(c => c.Code == "A-1" && c.Condemned));
+    Assert.Equal(2, AgentTask.Count(t => t.Requester == Ada && (t.Id == run || t.Root.Id == run)));
+  }
+  runas (Ada) {
+    Assert.Equal(["Director · Run the yard: Done", "  Inspector · Grade crate: Done"], Trajectory.Tree(run));
+    var inspector = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == run))[0];
+    Assert.Equal(Ada.Id, inspector.Requester!.Id);
+    Assert.Null(inspector.StartedBy);
+    Assert.True(Trajectory.Said(inspector.Id).Any(s => s.StartsWith("CondemnCrate did not run: not allowed.")));
+    Assert.False(CrateBy("A-1").Condemned);
+    AssertNothingLeft(run);
+  }
+}
+
+[Test(Yard)]
+[runas(Dana)]
+void what_any_work_above_never_does_is_never_done_below() {
+  var a1 = CrateBy("A-1");
+  var b1 = CrateBy("B-1");
+  // The lead may condemn a crate, and so may the inspector — in its own work, and under the director.
+  var free = AgentCast.Of()
+    .Plays<Director>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(b1.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+    .Plays<Inspector>(AgentScript.Of(Says.Tool(Actions.Of(CondemnCrate), CondemnArgs(b1)), Says.HandBack(new Grade { Score = 0, Finding = "Mould." })));
+  ScriptedAnswer.Stub((model, request) => Noted(free, model, request));
+  Assert.True(RunYard("ben@packhouse.example").Done);
+  Assert.Equal(1, Crate.Count(c => c.Code == "B-1" && c.Condemned));
+  Assert.Contains("CondemnCrate", OfferedTo("Inspector"));
+
+  // The foreman never condemns a crate. The inspector it hands one to is not even offered the tool — and when its
+  // model asks for it anyway, nothing runs and nothing is proposed.
+  var cast = AgentCast.Of()
+    .Plays<Foreman>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+    .Plays<Inspector>(AgentScript.Of(Says.Tool(Actions.Of(CondemnCrate), CondemnArgs(a1)), Says.HandBack(new Grade { Score = 0, Finding = "Mould." })));
+  ScriptedAnswer.Stub((model, request) => Noted(cast, model, request));
+
+  var outcome = TakeIn("ada@packhouse.example");
+
+  Assert.True(outcome.Done);
+  Assert.Equal(0, Crate.Count(c => c.Code == "A-1" && c.Condemned));
+  Assert.Equal(0, AgentProposal.Count());
+  var inspector = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == outcome.Task))[0];
+  Assert.Equal("Weigh,FlagCrate,hand_back", Heard.Where(h => h.What == "offered Inspector").ToList().Last().About);
+  Assert.Contains("It asked for `CondemnCrate`, which is not one of its tools. Nothing ran.", Trajectory.Said(inspector.Id));
+}
+
+[Test(Yard)]
+void a_yes_does_not_make_a_piece_do_what_the_work_above_it_now_never_does() {
+  Guid shown;
+  runas (Ada) {
+    var a2 = CrateBy("A-2");
+    var cast = AgentCast.Of()
+      .Plays<Usher>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a2.Id)), Says.HandBack(new DeliveryNote { Summary = "Not flagged: the yard closed." })))
+      .Plays<Inspector>(AgentScript.Of(
+        Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(a2, "short")),
+        Says.HandBack(new Grade { Score = 4, Finding = "Short; could not be flagged." })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    shown = ShowIn("ada@packhouse.example").Task;
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+  }
+  // The yard closes while the proposal waits: from now on the usher flags nothing — and so nothing under it does.
+  runas (Dana) { CloseTheYard(); }
+  runas (Ada) {
+    // The gate of the work above is asked again as she decides: her yes runs nothing.
+    var decided = ApproveAgentProposal(AgentProposal.Single());
+    Assert.Equal(ProposalStatus.Stale, decided.Status);
+    Assert.Equal("Inspector may no longer do this at all, so it was not done.", decided.Said);
+    Assert.Equal(0, Crate.Count(c => c.Flag == "short"));
+    LetItGoOn();
+    Assert.Equal(["Usher · Take in delivery: Done", "  Inspector · Grade crate: Done"], Trajectory.Tree(shown));
+    AssertNothingLeft(shown);
+  }
+}
+
+// ── people, from any depth ──────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void an_approval_from_depth_two_reaches_the_root_requester() {
+  TestClock.Set(new DateTime(2031, 4, 7, 9, 0, 0, DateTimeKind.Utc));
+  Guid top;
+  runas (Ada) {
+    var a2 = CrateBy("A-2");
+    var cast = AgentCast.Of()
+      .Plays<Director>(AgentScript.Of(
+        Says.HandTo<Foreman>(new TakeInDelivery(), Text("ada@packhouse.example")),
+        Says.HandBack(new DeliveryNote { Graded = 1, Short = 1, Summary = "One crate, short, flagged." })))
+      .Plays<Foreman>(AgentScript.Of(
+        Says.HandTo<Clerk>(new SettleCrate(), Says.Row(a2.Id)),
+        Says.HandBack(new DeliveryNote { Graded = 1, Short = 1, Summary = "A-2 is short." })))
+      .Plays<Clerk>(AgentScript.Of(
+        Says.Tool("It weighs 8 kg, under the 10 a crate must.", Actions.Of(FlagCrate), FlagArgs(a2, "short")),
+        Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+    var outcome = RunYard("ada@packhouse.example");
+    top = outcome.Task;
+
+    // The clerk, two levels down, wants to flag the crate and may not alone. The whole chain waits — each piece on
+    // the one below it — and nothing is lost.
+    Assert.True(outcome.Waiting);
+    Assert.Equal(["Director · Run the yard: Waiting", "  Foreman · Take in delivery: Waiting", "    Clerk · Settle crate: Waiting"], Trajectory.Tree(top));
+    var nodes = WorkTree.Of(AgentTask.Single(t => t.Id == top));
+    Assert.Equal("Foreman, which waits for Clerk, which waits for a decision from Ada", nodes[0].WaitingOn);
+    Assert.Equal("Clerk, which waits for a decision from Ada", nodes[1].WaitingOn);
+    Assert.Equal("a decision from Ada", nodes[2].WaitingOn);
+    Assert.Equal(2, nodes[2].Depth);
+
+    // It is put to the person the work at the TOP is for, and says through whom it comes.
+    var proposal = AgentProposal.Single();
+    Assert.Equal(Ada.Id, proposal.DecideBy!.Id);
+    Assert.Equal("Clerk, working for Foreman, working for Director", proposal.AskedThrough);
+    Assert.Equal("It weighs 8 kg, under the 10 a crate must.", proposal.Why);
+    Assert.Equal(1, ProposalsForMe().Count);
+  }
+  // Three days. Nothing runs, and nothing is asked of a model.
+  TestClock.Advance(TimeSpan.FromDays(3));
+  LetItGoOn();
+  // Another grower does not see it.
+  runas (Ben) { Assert.Equal(0, AgentProposal.Count()); }
+  runas (Ada) {
+    Assert.Equal(3, AgentTask.ToList().Sum(t => t.ModelCalls));
+    Assert.Equal(["Director · Run the yard: Waiting", "  Foreman · Take in delivery: Waiting", "    Clerk · Settle crate: Waiting"], Trajectory.Tree(top));
+
+    // Ada approves: the flag is set as her and as the clerk — the piece that proposed it — for exactly what was shown.
+    var decided = ApproveAgentProposal(AgentProposal.Single());
+    Assert.Equal(ProposalStatus.Done, decided.Status);
+    var asClerk = Actor.Of<Clerk>().Id;
+    Assert.Equal(1, Crate.Count(c => c.Code == "A-2" && c.Flag == "short" && c.ChangedBy == asClerk));
+    Assert.Equal(Ada.Id, AgentProposal.Single().DecidedBy!.Id);
+  }
+  LetItGoOn();
+  runas (Ada) {
+    // Each piece went on from where it stood, and handed its typed result up to the next.
+    Assert.Equal(["Director · Run the yard: Done", "  Foreman · Take in delivery: Done", "    Clerk · Settle crate: Done"], Trajectory.Tree(top));
+    var receipt = AgentTask.Single(t => t.Id == top);
+    Assert.Contains("One crate, short, flagged.", receipt.Result!);
+    Assert.Equal(6, AgentTask.ToList().Sum(t => t.ModelCalls));
+    var clerk = AgentTask.Single(t => t.Depth == 2);
+    Assert.Contains("Ada approved FlagCrate, and it ran as them.", Trajectory.Said(clerk.Id));
+    Assert.Contains("It waits for Foreman, which waits for Clerk, which waits for a decision from Ada.", Trajectory.Said(top));
+    Assert.True(VerifyTrace(receipt).Intact);
+    AssertNothingLeft(top);
+  }
+}
+
+[Test(Yard)]
+void a_process_waits_for_a_whole_tree_and_what_is_proposed_goes_to_the_sponsor_of_the_top() {
+  Guid intake;
+  runas (Ada) {
+    var a2 = CrateBy("A-2");
+    var cast = AgentCast.Of()
+      .Plays<Director>(AgentScript.Of(
+        Says.HandTo<Foreman>(new TakeInDelivery(), Text("ada@packhouse.example")),
+        Says.HandBack(new DeliveryNote { Graded = 1, Summary = "Seen through; the flag was refused." })))
+      .Plays<Foreman>(AgentScript.Of(
+        Says.HandTo<Clerk>(new SettleCrate(), Says.Row(a2.Id)),
+        Says.HandBack(new DeliveryNote { Graded = 1, Summary = "A-2 was looked at." })))
+      .Plays<Clerk>(AgentScript.Of(
+        Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(a2, "short")),
+        Says.HandBack(new Grade { Score = 4, Finding = "Short; not flagged." })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    OpenIntake("ada@packhouse.example");
+    var i = Intake.Single();
+    intake = i.Id;
+    Workflow.Settle(i);
+    // The step has not answered: its work, three pieces deep, waits on a person.
+    Assert.Equal(IntakeStage.Open, Intake.Single().Stage);
+  }
+  // Nobody is signed in while a process runs, so the work is for nobody — and what the clerk proposes is put to
+  // whoever answers for the agent at the TOP: the auditor, who sponsors the director. Not to the clerk's own sponsor.
+  runas (Dana) { Assert.Equal(0, ProposalsForMe().Count); }
+  runas (Omar) {
+    var proposal = ProposalsForMe().Single();
+    Assert.Equal("Clerk, working for Foreman, working for Director", proposal.AskedThrough);
+    Assert.Equal(ProposalStatus.Rejected, RejectAgentProposal(proposal, "Leave it for the lead.").Status);
+  }
+  LetItGoOn();
+  runas (Ada) {
+    foreach (var wait in AgentWorkWait.ToList()) { Workflow.Settle(wait); }
+    var i = Intake.Single(x => x.Id == intake);
+    Workflow.Settle(i);
+    // The whole tree ended, and the process went on with the director's result.
+    Assert.Equal(IntakeStage.Closed, i.Stage);
+    Assert.Equal("Seen through; the flag was refused.", i.Note);
+    Assert.Equal(0, Crate.Count(c => c.Flag == "short"));
+  }
+  runas (Dana) {
+    Assert.Equal(3, AgentTask.Count(t => t.Status == AgentTaskStatus.Done));
+    Assert.Equal(0, AgentTask.Count(t => t.Requester != null));
+  }
+}
+
+// ── money: down the tree, and back up ───────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void a_childs_spend_counts_against_its_parent_and_the_top() {
+  var a1 = CrateBy("A-1");
+  var cast = AgentCast.Of()
+    .Plays<Director>(AgentScript.Of(
+      Says.HandTo<Foreman>(new TakeInDelivery(), Text("ada@packhouse.example")),
+      Says.HandBack(new DeliveryNote { Graded = 1 })))
+    .Plays<Foreman>(AgentScript.Of(
+      Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)),
+      Says.HandBack(new DeliveryNote { Graded = 1 })))
+    // The inspector's one answer is a long one: 1000 tokens in and 600 out cost 4000.
+    .Plays<Inspector>(AgentScript.Of(Says.HandBack(new Grade { Score = 7 }, 1000, 600)));
+  ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+  var outcome = RunYard("ada@packhouse.example");
+
+  Assert.Equal("", outcome.Problem);
+  var director = AgentTask.Single(t => t.Depth == 0);
+  var foreman = AgentTask.Single(t => t.Depth == 1);
+  var inspector = AgentTask.Single(t => t.Depth == 2);
+  // Each receipt says what that piece spent itself…
+  Assert.Equal(400, director.SpentMicros);
+  Assert.Equal(400, foreman.SpentMicros);
+  Assert.Equal(4000, inspector.SpentMicros);
+  // …the tree says what each piece cost with everything under it…
+  Assert.Equal(4800, Trajectory.TreeCost(director.Id));
+  Assert.Equal(4400, Trajectory.TreeCost(foreman.Id));
+  Assert.Equal(4000, Trajectory.TreeCost(inspector.Id));
+  var nodes = WorkTree.Of(director);
+  Assert.Equal([400L, 400L, 4000L], nodes.Select(n => n.OwnMicros).ToList());
+  Assert.Equal([4800L, 4400L, 4000L], nodes.Select(n => n.TreeMicros).ToList());
+  // …and the METER counted every call against the limit of every piece above the one that made it: that is what
+  // each limit was held to while the work ran.
+  Assert.Equal(0.0048m, SpentAgainst("task:" + director.Id.ToString()));
+  Assert.Equal(0.0044m, SpentAgainst("task:" + foreman.Id.ToString()));
+  Assert.Equal(0.0040m, SpentAgainst("task:" + inspector.Id.ToString()));
+  // What a piece may spend: its share, or its own — and never more than was left above it when it was opened.
+  Assert.Equal(50000, director.LimitMicros);
+  Assert.Equal(20000, foreman.LimitMicros);          // the director gives taking a delivery in two cents
+  Assert.Equal(19800, inspector.LimitMicros);        // what the foreman had left: 20000 less its first call
+  Assert.Contains("Foreman handed back its result; that piece cost $0.0044 in all.", Trajectory.Said(director.Id));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_child_is_given_no_more_than_its_parent_has_left() {
+  var a1 = CrateBy("A-1");
+  // The foreman's first answer is an expensive one: 10000 tokens in and 7000 out cost 45000 of its 50000.
+  var cast = AgentCast.Of()
+    .Plays<Foreman>(AgentScript.Of(
+      Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id), "", 10000, 7000),
+      Says.HandBack(new DeliveryNote { Summary = "Never reached." })))
+    .Plays<Inspector>(AgentScript.Of(Says.HandBack(new Grade { Score = 7 })));
+  ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+  var outcome = TakeIn("ada@packhouse.example");
+
+  // The inspector's piece was opened with the 5000 that were left — less than one call reserves — so it was stopped
+  // before anything was sent; and so was the foreman, when it went on.
+  var inspector = AgentTask.Single(t => t.Depth == 1);
+  Assert.Equal(5000, inspector.LimitMicros);
+  Assert.Equal(AgentTaskStatus.Stopped, inspector.Status);
+  Assert.Equal(0, inspector.ModelCalls);
+  Assert.Equal(AgentTaskStatus.Stopped, outcome.Status);
+  Assert.StartsWith("Its money ran out:", outcome.Problem);
+  Assert.Equal(45000, Trajectory.TreeCost(outcome.Task));
+  Assert.True(Trajectory.Said(outcome.Task).Any(s => s.StartsWith("Inspector was stopped: Its money ran out:")));
+
+  // With nothing left at all, nothing is handed on: no piece is opened.
+  var spent = AgentCast.Of().Plays<Foreman>(AgentScript.Of(
+    Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id), "", 10000, 8000),
+    Says.HandBack(new DeliveryNote { Summary = "Never reached." })));
+  ScriptedAnswer.Stub((model, request) => spent.Answer(model, request));
+  var second = TakeIn("ada@packhouse.example");
+  Assert.Equal(AgentTaskStatus.Stopped, second.Status);
+  Assert.Equal(0, AgentTask.Count(t => t.Parent.Id == second.Task));
+  Assert.Contains("It tried to hand work on, and nothing was started: Foreman has nothing left to hand work on with: its own limit is spent.",
+    Trajectory.Said(second.Task));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_share_named_for_a_piece_of_work_is_the_most_it_may_spend() {
+  var a1 = CrateBy("A-1");
+  // A quick look may spend 0.012 by its own skill; the foreman gives it 0.006. One call at 4000 leaves 2000.
+  var cast = AgentCast.Of()
+    .Plays<Foreman>(AgentScript.Of(
+      Says.HandTo<Inspector>(new QuickLook(), Says.Row(a1.Id)),
+      Says.HandBack(new DeliveryNote { Summary = "The look ran out of money." })))
+    .Plays<Inspector>(AgentScript.Of(
+      Says.Tool(Actions.Of(Weigh), CrateArg(a1), 1000, 600),
+      Says.HandBack(new Grade { Score = 7 })));
+  ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+  var outcome = TakeIn("ada@packhouse.example");
+
+  // The piece stopped at its own share; the foreman was told — with what the piece had found — and carried on.
+  Assert.True(outcome.Done);
+  Assert.Equal("The look ran out of money.", outcome.Result.Summary);
+  var look = AgentTask.Single(t => t.Depth == 1);
+  Assert.Equal(6000, look.LimitMicros);
+  Assert.Equal(AgentTaskStatus.Stopped, look.Status);
+  Assert.Equal(4000, look.SpentMicros);
+  var told = Trajectory.Said(outcome.Task).Single(s => s.StartsWith("Inspector was stopped:"));
+  Assert.Contains("Its money ran out", told);
+  Assert.Contains("That piece cost $0.0040 in all.", told);
+  AssertNothingLeft(outcome.Task);
+}
+
+[Test(Yard)]
+void a_spent_child_cancels_its_subtree() {
+  Guid top;
+  runas (Ada) {
+    var a1 = CrateBy("A-1");
+    var a2 = CrateBy("A-2");
+    var cast = AgentCast.Of()
+      // The director hands two pieces on at once: taking the delivery in (two cents), and counting it.
+      .Plays<Director>(AgentScript.Of(
+        Says.Together(
+          Says.HandTo<Foreman>(new TakeInDelivery(), Text("ada@packhouse.example"), "call-take"),
+          Says.HandTo<Foreman>(new CountDelivery(), Text("ada@packhouse.example"), "call-count")),
+        Says.HandBack(new DeliveryNote { Graded = 2, Summary = "Counted: two crates. Taking them in ran out of money." })))
+      .PlaysAbout<Foreman>("Count a grower", AgentScript.Of(Says.HandBack(new DeliveryNote { Graded = 2, Summary = "Two crates." })))
+      // Taking it in, the foreman hands a crate each to the inspector and the clerk.
+      .PlaysAbout<Foreman>("Take in a grower", AgentScript.Of(
+        Says.Together(
+          Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)),
+          Says.HandTo<Clerk>(new SettleCrate(), Says.Row(a2.Id))),
+        Says.HandBack(new DeliveryNote { Summary = "Never reached." })))
+      // The inspector's answers are long ones — 9000 each. The clerk's first costs as much, and proposes a flag.
+      .Plays<Inspector>(AgentScript.Of(
+        Says.Tool(Actions.Of(Weigh), CrateArg(a1), 1000, 1600),
+        Says.HandBack(new Grade { Score = 7 }, 1000, 1600)))
+      .Plays<Clerk>(AgentScript.Of(
+        Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(a2, "short"), 1000, 1600),
+        Says.HandBack(new Grade { Score = 4 })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+    top = RunYard("ada@packhouse.example").Task;
+  }
+  LetItGoOn();
+  runas (Ada) {
+    // Taking the delivery in had 20000. Its own call (200), the inspector's (9000) and the clerk's (9000) left 1800:
+    // the inspector's next call did not fit — the money that ran out was the FOREMAN's. Everything under the foreman
+    // stopped with it: the inspector, and the clerk, who was waiting for Ada. The piece beside it was not touched.
+    Assert.Equal([
+      "Director · Run the yard: Done",
+      "  Foreman · Take in delivery: Stopped",
+      "    Inspector · Grade crate: Stopped",
+      "    Clerk · Settle crate: Cancelled",
+      "  Foreman · Count delivery: Done",
+    ], Trajectory.Tree(top));
+    var taking = AgentTask.Single(t => t.Depth == 1 && t.Status == AgentTaskStatus.Stopped);
+    Assert.Contains("no room left in the limit set for task:" + taking.Id.ToString(), AgentTask.Single(t => t.Agent == "Packhouse.Inspector").Outcome);
+    Assert.Equal("It was called off: The work it was part of ran out of money.", AgentTask.Single(t => t.Agent == "Packhouse.Clerk").Outcome);
+    Assert.StartsWith("Its money ran out:", taking.Outcome);
+    Assert.Equal(18200, Trajectory.TreeCost(taking.Id));
+    // What the clerk had proposed is withdrawn, and nothing was flagged.
+    Assert.Equal(ProposalStatus.Withdrawn, AgentProposal.Single().Status);
+    Assert.Equal(0, Crate.Count(c => c.Flag == "short"));
+    // The director was told, and reported what it had: the count, and what could not be done.
+    Assert.True(Trajectory.Said(top).Any(s => s.StartsWith("Foreman was stopped: Its money ran out:")));
+    Assert.Contains("Foreman handed back its result; that piece cost $0.0002 in all.", Trajectory.Said(top));
+    var receipt = AgentTask.Single(t => t.Id == top);
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Contains("Taking them in ran out of money.", receipt.Result!);
+    Assert.True(VerifyTrace(receipt).Intact);
+    AssertNothingLeft(top);
+  }
+}
+
+// ── stopping and failing ────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void stopping_the_work_at_the_top_calls_off_everything_under_it() {
+  Guid top;
+  runas (Ada) {
+    var a2 = CrateBy("A-2");
+    var cast = AgentCast.Of()
+      .Plays<Director>(AgentScript.Of(Says.HandTo<Foreman>(new TakeInDelivery(), Text("ada@packhouse.example")), Says.HandBack(new DeliveryNote())))
+      .Plays<Foreman>(AgentScript.Of(Says.HandTo<Clerk>(new SettleCrate(), Says.Row(a2.Id)), Says.HandBack(new DeliveryNote())))
+      .Plays<Clerk>(AgentScript.Of(Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(a2, "short")), Says.HandBack(new Grade { Score = 4 })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    top = RunYard("ada@packhouse.example").Task;
+    Assert.Equal(3, Trajectory.StillGoing(top).Count);
+
+    StopAgentTask(AgentTask.Single(t => t.Id == top), "the delivery was turned away");
+  }
+  LetItGoOn();
+  runas (Ada) {
+    Assert.Equal(["Director · Run the yard: Cancelled", "  Foreman · Take in delivery: Cancelled", "    Clerk · Settle crate: Cancelled"], Trajectory.Tree(top));
+    Assert.Equal("It was called off: the delivery was turned away", AgentTask.Single(t => t.Id == top).Outcome);
+    Assert.Equal("It was called off: The work it was part of was called off: the delivery was turned away", AgentTask.Single(t => t.Depth == 2).Outcome);
+    Assert.Equal(ProposalStatus.Withdrawn, AgentProposal.Single().Status);
+    // No model was asked again by any of them.
+    Assert.Equal(3, AgentTask.ToList().Sum(t => t.ModelCalls));
+    Assert.Equal(0, Crate.Count(c => c.Flag == "short"));
+    AssertNothingLeft(top);
+  }
+}
+
+// ── a process that dies ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// The yard is run for Ada, and the process doing it dies part-way: the director has handed the delivery to the
+/// foreman, who has handed a crate each to the inspector and the clerk. The clerk has proposed a flag and waits for
+/// Ada; the inspector's model has answered once, and as it is asked again everything stops. Answers the top.
+Guid AYardWhoseProcessDied() {
+  Guid top = Guid.Empty;
+  runas (Ada) {
+    var a1 = CrateBy("A-1");
+    var a2 = CrateBy("A-2");
+    var cast = AgentCast.Of()
+      .Plays<Director>(AgentScript.Of(Says.HandTo<Foreman>(new TakeInDelivery(), Text("ada@packhouse.example")), Says.HandBack(new DeliveryNote())))
+      .Plays<Foreman>(AgentScript.Of(
+        Says.Together(
+          Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)),
+          Says.HandTo<Clerk>(new SettleCrate(), Says.Row(a2.Id))),
+        Says.HandBack(new DeliveryNote())))
+      .Plays<Inspector>(AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(a1)), Says.HandBack(new Grade { Score = 7 })))
+      .Plays<Clerk>(AgentScript.Of(Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(a2, "short")), Says.HandBack(new Grade { Score = 4 })));
+    ScriptedAnswer.Stub((model, request) => {
+      if (AgentCast.AskedAgent(request) == "Inspector" && request.Messages.Count(m => m.Role == "assistant") >= 1) {
+        throw new InvalidOperationException("The process died.");
+      }
+      return cast.Answer(model, request);
+    });
+    // Nothing of the kit's catches it: what stands for a process dying goes through, as a crash would.
+    Assert.Throws<InvalidOperationException>(() => RunYard("ada@packhouse.example"));
+  }
+  runas (Ada) {
+    top = AgentTask.Single(t => t.Parent == null).Id;
+    // What a crash leaves: three receipts that say the work is under way, and one waiting for a person.
+    Assert.Equal(["Director · Run the yard: Working", "  Foreman · Take in delivery: Working", "    Inspector · Grade crate: Working", "    Clerk · Settle crate: Waiting"],
+      Trajectory.Tree(top));
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+  }
+  return top;
+}
+
+/// ⭐ WHAT A PROCESS THAT DIED LEFT UNDER WAY IS CLOSED, WITH EVERYTHING UNDER IT. While the work is still writing
+/// its record nothing touches it. Half an hour after its last line, it is found: each piece that said it was under
+/// way has failed — "it stopped without reporting back" — the piece that waited for Ada is called off and what it
+/// proposed is withdrawn, and only the top is said to have given up.
+[Test(Yard)]
+void work_a_process_that_died_left_under_way_is_closed_with_everything_under_it() {
+  TestClock.Set(new DateTime(2031, 5, 5, 9, 0, 0, DateTimeKind.Utc));
+  var top = AYardWhoseProcessDied();
+  runas (Dana) {
+    // A minute later it may only be slow: nothing is closed.
+    TestClock.Advance(TimeSpan.FromMinutes(1));
+    Assert.False(WasAbandoned(AgentTask.Single(t => t.Id == top)));
+    Assert.Equal(0, CloseAbandonedAgentWork());
+    UnitOfWork.Commit();
+  }
+  LetItGoOn();
+  runas (Ada) { Assert.Equal(4, Trajectory.StillGoing(top).Count); }
+
+  TestClock.Advance(TimeSpan.FromMinutes(30));
+  runas (Dana) {
+    Assert.True(WasAbandoned(AgentTask.Single(t => t.Id == top)));
+    // The piece that waits for a person is not abandoned by waiting; it goes with the work it was part of.
+    Assert.False(WasAbandoned(AgentTask.Single(t => t.Agent == "Packhouse.Clerk")));
+    Assert.Equal(3, CloseAbandonedAgentWork());
+    UnitOfWork.Commit();
+  }
+  LetItGoOn();
+  runas (Ada) {
+    Assert.Equal(["Director · Run the yard: Failed", "  Foreman · Take in delivery: Failed", "    Inspector · Grade crate: Failed", "    Clerk · Settle crate: Cancelled"],
+      Trajectory.Tree(top));
+    var receipt = AgentTask.Single(t => t.Id == top);
+    Assert.Equal("It stopped without reporting back: whatever was doing it is gone.", receipt.Outcome);
+    Assert.NotNull(receipt.EndedAt);
+    Assert.Equal("It was called off: Foreman's work, which it was part of, stopped without reporting back.", AgentTask.Single(t => t.Agent == "Packhouse.Clerk").Outcome);
+    // What the clerk had proposed is withdrawn, and nothing was flagged.
+    Assert.Equal(ProposalStatus.Withdrawn, AgentProposal.Single().Status);
+    Assert.Equal(0, Crate.Count(c => c.Flag == "short"));
+    // The record says how each piece ended, and still checks; only the top gave up.
+    Assert.True(Trajectory.Said(top).Any(s => s.StartsWith("Failed. It stopped without reporting back: whatever was doing it is gone. Nothing had been done in it since 2031-05-05 09:00 UTC.")));
+    Assert.True(VerifyTrace(receipt).Intact);
+    Assert.Equal(1, Heard.Count(h => h.What == "gave up"));
+    // No model was asked again by any of them.
+    Assert.Equal(4, AgentTask.ToList().Sum(t => t.ModelCalls));
+    AssertNothingLeft(top);
+  }
+  // Found once: a second look closes nothing.
+  runas (Dana) { Assert.Equal(0, CloseAbandonedAgentWork()); }
+}
+
+/// ⭐ …AND NOBODY HAS TO DO IT: the kit's own clock looks every ten minutes, and closes what was abandoned by itself.
+[Test(Yard)]
+void work_a_process_that_died_left_is_closed_by_the_kits_own_clock() {
+  TestClock.Set(new DateTime(2031, 5, 5, 9, 0, 0, DateTimeKind.Utc));
+  var top = AYardWhoseProcessDied();
+  // Twenty minutes: the clock has looked twice, and the work may only be slow.
+  TestClock.Advance(TimeSpan.FromMinutes(20));
+  LetItGoOn();
+  runas (Ada) { Assert.Equal(4, Trajectory.StillGoing(top).Count); }
+  // Forty minutes after its last line: closed, with everything under it — nobody asked.
+  TestClock.Advance(TimeSpan.FromMinutes(20));
+  LetItGoOn();
+  runas (Ada) {
+    Assert.Equal(["Director · Run the yard: Failed", "  Foreman · Take in delivery: Failed", "    Inspector · Grade crate: Failed", "    Clerk · Settle crate: Cancelled"],
+      Trajectory.Tree(top));
+    Assert.Equal(ProposalStatus.Withdrawn, AgentProposal.Single().Status);
+    AssertNothingLeft(top);
+  }
+}
+
+/// Calling off work that nothing is doing any more takes effect at once — it has no next step to stop at — for
+/// whoever may call it off: here the grower it was for, who supervises nothing.
+[Test(Yard)]
+void calling_off_work_that_was_abandoned_closes_it_and_everything_under_it() {
+  TestClock.Set(new DateTime(2031, 5, 5, 9, 0, 0, DateTimeKind.Utc));
+  var top = AYardWhoseProcessDied();
+  TestClock.Advance(TimeSpan.FromMinutes(45));
+  runas (Ada) {
+    StopAgentTask(AgentTask.Single(t => t.Id == top), "the delivery was turned away");
+    UnitOfWork.Commit();
+  }
+  LetItGoOn();
+  runas (Ada) {
+    Assert.Equal(["Director · Run the yard: Cancelled", "  Foreman · Take in delivery: Cancelled", "    Inspector · Grade crate: Cancelled", "    Clerk · Settle crate: Cancelled"],
+      Trajectory.Tree(top));
+    Assert.Equal("It was called off: the delivery was turned away", AgentTask.Single(t => t.Id == top).Outcome);
+    Assert.Equal(ProposalStatus.Withdrawn, AgentProposal.Single().Status);
+    Assert.Equal(0, Heard.Count(h => h.What == "gave up"));
+    Assert.True(VerifyTrace(AgentTask.Single(t => t.Id == top)).Intact);
+    AssertNothingLeft(top);
+  }
+}
+
+/// What stands for a process that stalls: three quarters of an hour pass with nothing written, and whoever
+/// supervises the agents closes what was abandoned. Once.
+void StallUntilTheWorkIsClosed() {
+  if (Heard.Any(h => h.What == "stalled")) { return; }
+  NoteApart("stalled", "");
+  TestClock.Advance(TimeSpan.FromMinutes(45));
+  runas (Dana) {
+    CloseAbandonedAgentWork();
+    UnitOfWork.Commit();
+  }
+  Background.Settle();
+}
+
+/// ⭐ A PROCESS THAT COMES BACK TO WORK THAT WAS CLOSED DOES NOTHING MORE IN ITS NAME. The foreman's model takes
+/// three quarters of an hour to answer; meanwhile the work is closed as abandoned. The answer arrives and asks to
+/// hand a crate on: nothing is handed on, no model is asked again, and the receipt stands as it was closed.
+[Test(Yard)]
+void a_process_that_comes_back_to_work_that_was_closed_does_nothing_more() {
+  TestClock.Set(new DateTime(2031, 5, 5, 9, 0, 0, DateTimeKind.Utc));
+  runas (Ada) {
+    var a1 = CrateBy("A-1");
+    var cast = AgentCast.Of()
+      .Plays<Foreman>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+      .Plays<Inspector>(AgentScript.Of(Says.HandBack(new Grade { Score = 7 })));
+    ScriptedAnswer.Stub((model, request) => {
+      NoteApart("asked", AgentCast.AskedAgent(request));
+      StallUntilTheWorkIsClosed();
+      return cast.Answer(model, request);
+    });
+
+    var outcome = TakeIn("ada@packhouse.example");
+
+    Assert.Equal(AgentTaskStatus.Failed, outcome.Status);
+    Assert.Equal("It stopped without reporting back: whatever was doing it is gone.", outcome.Problem);
+    // The one answer that was under way is counted and paid for; no model was asked after it.
+    Assert.Equal(1, Heard.Count(h => h.What == "asked"));
+    // Nothing was handed on in the name of work that had ended.
+    Assert.Equal(1, AgentTask.Count());
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Failed, receipt.Status);
+    Assert.Equal(1, receipt.ModelCalls);
+    Assert.True(VerifyTrace(receipt).Intact);
+    AssertNothingLeft(receipt.Id);
+  }
+}
+
+/// Work that waits for a person is not abandoned however long the person takes, and work under way is closed only
+/// by whoever supervises the agents.
+[Test(Yard)]
+void work_that_waits_for_a_person_is_never_abandoned_and_only_a_supervisor_closes_what_was() {
+  TestClock.Set(new DateTime(2031, 5, 5, 9, 0, 0, DateTimeKind.Utc));
+  runas (Ada) {
+    var a2 = CrateBy("A-2");
+    var script = AgentScript.Of(Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(a2, "short")), Says.HandBack(new Grade { Score = 4 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Settle(a2);
+    Assert.Equal(AgentTaskStatus.Waiting, AgentTask.Single().Status);
+  }
+  TestClock.Advance(TimeSpan.FromDays(3));
+  runas (Ada) {
+    Assert.False(WasAbandoned(AgentTask.Single()));
+    // A grower gives agents work and supervises nothing: the sweep is not hers.
+    Assert.Denied(() => CloseAbandonedAgentWork());
+  }
+  runas (Dana) {
+    Assert.Equal(0, CloseAbandonedAgentWork());
+    UnitOfWork.Commit();
+  }
+  LetItGoOn();
+  runas (Ada) {
+    Assert.Equal(AgentTaskStatus.Waiting, AgentTask.Single().Status);
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_piece_that_fails_is_told_to_the_work_above_which_carries_on() {
+  var a1 = CrateBy("A-1");
+  var a2 = CrateBy("A-2");
+  var cast = AgentCast.Of()
+    .Plays<Foreman>(AgentScript.Of(
+      Says.Together(
+        Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id), "call-a1"),
+        Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a2.Id), "call-a2")),
+      Says.HandBack(new DeliveryNote { Graded = 1, Summary = "A-2 graded. A-1 could not be: it weighs 12.5 kg, and no more is known." })))
+    // On A-1 the inspector goes in circles; on A-2 it does its job.
+    .PlaysAbout<Inspector>("A-1", AgentScript.Of(
+      Says.Tool(Actions.Of(Weigh), CrateArg(a1)), Says.Tool(Actions.Of(Weigh), CrateArg(a1)), Says.Tool(Actions.Of(Weigh), CrateArg(a1))))
+    .PlaysAbout<Inspector>("A-2", AgentScript.Of(Says.HandBack(new Grade { Score = 6 })));
+  ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+  var outcome = TakeIn("ada@packhouse.example");
+
+  Assert.True(outcome.Done);
+  Assert.Equal(["Foreman · Take in delivery: Done", "  Inspector · Grade crate: Failed", "  Inspector · Grade crate: Done"], Trajectory.Tree(outcome.Task));
+  // The foreman's model was told how the piece ended, why, and what it had found — and reported what it had.
+  var told = Trajectory.Said(outcome.Task).Single(s => s.StartsWith("Inspector could not finish:"));
+  Assert.Contains("It went in circles", told);
+  var failed = AgentTask.Single(t => t.Status == AgentTaskStatus.Failed);
+  var back = TraceEvent.Single(e => e.Task.Id == outcome.Task && e.Kind == TraceKind.CameBack && e.Summary.StartsWith("Inspector could not finish:"));
+  Assert.Contains("What it had found: Weigh answered 12.5", back.Payload!);
+  Assert.Equal("A-2 graded. A-1 could not be: it weighs 12.5 kg, and no more is known.", outcome.Result.Summary);
+  // The packhouse heard that a piece failed — and not that anybody gave up: the work above it dealt with it.
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.What == "failed"));
+  Assert.Equal(0, Heard.Count(h => h.What == "gave up"));
+  AssertNothingLeft(outcome.Task);
+}
+
+LlmResponse SecondTimeRight(AgentCast first, AgentCast second, string model, LlmRequest request) {
+  return AgentTask.Count(t => t.Agent == "Packhouse.Porter") >= 2 ? second.Answer(model, request) : first.Answer(model, request);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void handed_on_work_that_fails_is_tried_again_as_its_skill_says() {
+  var foreman = AgentScript.Of(
+    Says.HandTo<Porter>(new CountCrates(), Text("ada@packhouse.example")),
+    Says.HandBack(new DeliveryNote { Graded = 2, Summary = "Two crates." }));
+  // The porter's first attempt hands back a count that is refused, again and again; its second gets it right.
+  var bad = AgentCast.Of().Plays<Foreman>(foreman).Plays<Porter>(AgentScript.Of(
+    Says.HandBack(new Grade { Score = -1 }), Says.HandBack(new Grade { Score = -1 }), Says.HandBack(new Grade { Score = -1 })));
+  var good = AgentCast.Of().Plays<Foreman>(foreman).Plays<Porter>(AgentScript.Of(Says.HandBack(new Grade { Score = 2, Finding = "Two crates." })));
+  ScriptedAnswer.Stub((model, request) => SecondTimeRight(bad, good, model, request));
+
+  var outcome = TakeIn("ada@packhouse.example");
+
+  Assert.Equal("", outcome.Problem);
+  Assert.Equal(["Foreman · Take in delivery: Done", "  Porter · Count crates: Failed", "  Porter · Count crates: Done"], Trajectory.Tree(outcome.Task));
+  var first = AgentTask.Single(t => t.Agent == "Packhouse.Porter" && t.Attempt == 1);
+  var second = AgentTask.Single(t => t.Agent == "Packhouse.Porter" && t.Attempt == 2);
+  Assert.Equal(first.Id, second.RetryOf!.Id);
+  Assert.Equal(outcome.Task, second.Parent!.Id);
+  // The foreman's model heard of one piece: the one that got it right.
+  Assert.Equal(1, Trajectory.Said(outcome.Task).Count(s => s.StartsWith("Porter ")));
+  Assert.Contains("Porter handed back its result; that piece cost $0.0002 in all.", Trajectory.Said(outcome.Task));
+}
+
+// ── the record ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void the_record_of_a_tree_is_one_chain_that_says_who_handed_what_to_whom() {
+  Guid top;
+  runas (Ada) {
+    var a1 = CrateBy("A-1");
+    var cast = AgentCast.Of()
+      .Plays<Foreman>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+      .Plays<Inspector>(AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(a1)), Says.HandBack(new Grade { Score = 8 })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    top = TakeIn("ada@packhouse.example").Task;
+
+    var receipt = AgentTask.Single(t => t.Id == top);
+    var piece = WorkTree.HandedOnBy(receipt)[0];
+    // The foreman's own lines, and the inspector's, in the order things happened.
+    Assert.Equal(["Started", "ModelCall", "HandedOn", "CameBack", "ModelCall", "Ended"], Trajectory.Kinds(top));
+    Assert.Equal(["Started", "ModelCall", "ToolCall", "ToolResult", "ModelCall", "Ended"], Trajectory.Kinds(piece.Id));
+    Assert.Equal("Inspector was given grade crate: Delivery of ada@packhouse.example, by Foreman.", Trajectory.Said(piece.Id)[0]);
+    // One chain for the tree: asked for from either piece, it is the same twelve lines, in order, and it checks.
+    var whole = TraceOf(receipt);
+    Assert.Equal(12, whole.Count);
+    Assert.Equal(12, TraceOf(piece).Count);
+    Assert.Equal(["Started", "ModelCall", "HandedOn", "Started", "ModelCall", "ToolCall", "ToolResult", "ModelCall", "Ended", "CameBack", "ModelCall", "Ended"],
+      whole.Select(l => l.Kind.Name).ToList());
+    Assert.Equal(12, VerifyTrace(piece).Lines);
+    Assert.True(VerifyTrace(piece).Intact);
+    // The cost of every call is on its own line, so a branch's cost is the sum of its lines.
+    Assert.Equal(400, whole.Where(l => l.Task == piece.Id).ToList().Sum(l => l.CostMicros));
+    Assert.Equal(800, whole.Sum(l => l.CostMicros));
+    Assert.Equal(800, Trajectory.TreeCost(top));
+  }
+  // The auditor reads the whole tree; another grower reads none of it.
+  runas (Omar) { Assert.Equal(2, WorkTree.Of(AgentTask.Single(t => t.Id == top)).Count); }
+  runas (Ben) { Assert.Equal(0, AgentTask.Count()); }
+}

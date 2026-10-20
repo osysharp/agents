@@ -1,0 +1,109 @@
+// Who is in charge of what — every policy of this package in one place, with what each admits.
+//
+//   policy                      admits                                                        until the app says
+//   ─────────────────────────── ───────────────────────────────────────────────────────────── ───────────────────────────────
+//   UsesAgents                  give agents work; read the work they asked for                 nobody
+//   SupervisesAgents            stop any work; answer any question; take back any standing     nobody
+//                               rule; correct any work; read every piece of work
+//   SponsorsAgents              name the person accountable for an agent                       whoever supervises
+//   PausesAgents                pause an agent, and let it work again                          whoever supervises
+//   ReadsAllAgentWork           read the receipt of every piece of work — not what it said     whoever supervises or audits
+//   DecidesAgentProposals       decide a proposal that was not put to them                     whoever supervises
+//   WidensAgentAutonomy         "from now on, alone" for their own work (Gate.osy)             nobody
+//   TeachesAgents               make an instruction active, retire one, roll back; read        nobody
+//                               every piece of work WITH what it said, and correct it
+//   DirectsAgentsForOthers      give an agent work FOR somebody else                           nobody
+//   AuditsAgents                read every piece of work WITH what it said                     nobody
+//   ErasesAgentRecords          erase what a piece of work said, and whose it was              nobody
+//   AgentsMayConsult            whether an agent may ask the model it consults                 everybody
+//
+// ⚑ `policy SupervisesAgents => IsLead;` IS ONE LINE FOR FOUR THINGS: the four in this file start out as whoever
+//   supervises, and are an app's to hand to somebody else, a line each. Widening, teaching, giving work for others,
+//   reading what work said and erasing it are never implied: each is answered by name or not at all.
+//
+// ⚑ WHO READS WHAT WORK SAID: whoever it was for and whoever gave it; whoever audits; whoever TEACHES — nobody can
+//   judge or correct work they cannot read — and a supervisor on the receipt (not on the record's content).
+//   `TeachesAgents` is one answer for the whole app: a teacher teaches every agent, and so reads every agent's work.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+
+/// Who names the person accountable for an agent (`SponsorAgent`). Whoever supervises the agents, until the app
+/// says otherwise: `policy SponsorsAgents => IsHeadOfDepartment;`.
+virtual policy SponsorsAgents => SupervisesAgents;
+
+/// Who pauses an agent and lets it work again (`PauseAgent`, `ResumeAgent`). Whoever supervises the agents, until
+/// the app says otherwise: `policy PausesAgents => SupervisesAgents || IsOnCall;`.
+virtual policy PausesAgents => SupervisesAgents;
+
+/// ⭐ WHO READS THE RECEIPT OF EVERY PIECE OF WORK, whoever it was for: which agent and skill, for whom, where it
+/// stands, when, and what it cost. Whoever supervises or audits, until the app says otherwise.
+///
+/// ⚑ A RECEIPT'S FIGURES, NOT ITS WORDS. Somebody this admits who neither supervises nor audits reads what work was
+///   done and what it cost — and not what it was about, what it handed back, how it ended in words or what it waits
+///   for; those stay with whoever the work was for, whoever gave it, and the supervisors and auditors. So finance can
+///   be given the costs (`policy ReadsAllAgentWork => SupervisesAgents || AuditsAgents || IsFinance;`) without
+///   reading a word of the work. (Whoever teaches reads the work with its words, by `TeachesAgents` itself.)
+virtual policy ReadsAllAgentWork => SupervisesAgents || AuditsAgents;
+
+/// ⭐ WHO DECIDES A PROPOSAL THAT WAS NOT PUT TO THEM. A proposal is put to the person the work is for — to the
+/// agent's sponsor when it is for nobody — and that person decides it. This says who else may: whoever supervises
+/// the agents, until the app says otherwise (`policy DecidesAgentProposals => SupervisesAgents || IsFinance;`).
+/// A yes still runs as whoever said it, and never past what they may do themselves.
+virtual policy DecidesAgentProposals => SupervisesAgents;
+
+/// What was done to an agent's place in the app. ⚠ Appended, never inserted: an enum is stored by position.
+public enum AgentSeatChangeKind {
+  /// Somebody was named as the person accountable for it.
+  [Label("Sponsor named")] Sponsored,
+  /// It was paused: it takes no new work.
+  [Label("Paused")] Paused,
+  /// It was let work again.
+  [Label("Resumed")] Resumed,
+}
+
+/// ⭐ ONE CHANGE TO AN AGENT'S PLACE: who paused it, resumed it or named its sponsor, when, and why. Written by the
+/// three functions that make the change, in the same unit of work, and never changed.
+public entity AgentSeatChange {
+  /// The agent, by its class's full name.
+  [Required, Immutable, MaxLength(200), Index] string Agent;
+  [Immutable] AgentSeatChangeKind What = AgentSeatChangeKind.Paused;
+  /// Who did it. Nobody: code that runs as the app — or they have been taken off it (`ForgetWhoOversawAgents`).
+  [Classification(Personal.Identity)] Principal? By;
+  [Immutable] DateTime At = DateTime.UtcNow;
+  [Immutable, MaxLength(300)] string Why = "";
+  /// The sponsor that was named, when that is what happened. Nobody, on such a change: they have been taken off it.
+  [Classification(Personal.Identity)] Principal? Sponsor;
+
+  security {
+    allow read when UsesAgents || SupervisesAgents || AuditsAgents || SponsorsAgents || PausesAgents || TeachesAgents || ReadsAllAgentWork;
+    allow create when SupervisesAgents || SponsorsAgents || PausesAgents;
+    deny create except via NoteSeatChange;
+    // Never changed — except that a person is taken off it, when they ask to be.
+    allow update when ErasesAgentRecords;
+    deny update By, Sponsor except via ForgetWhoOversawAgents;
+    deny delete;
+  }
+}
+
+/// An agent's place changed: it was paused or resumed, or its sponsor was named.
+[Event("Agent paused, resumed or sponsored")]
+public sealed class AgentSeatChanged { public AgentSeatChange Change; }
+
+/// Write down a change to an agent's place, as whoever is signed in. Only `SponsorAgent`, `PauseAgent` and `ResumeAgent`
+/// call it: it is this package's own, and each of them has already asked who is calling.
+[Server, Authorize(IsAuthenticated)]
+internal void NoteSeatChange(string agent, AgentSeatChangeKind what, string why, Principal? sponsor) {
+  var me = Security.CurrentUserId;
+  var by = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+  if (by == null || !(Security.Authorize(by!, SupervisesAgents) || Security.Authorize(by!, SponsorsAgents) || Security.Authorize(by!, PausesAgents))) {
+    throw new AgentRefused("An agent's place is changed by whoever supervises, sponsors or pauses the agents.");
+  }
+  var change = new AgentSeatChange { Agent = agent, What = what, By = by, Why = Clipped(why, 300), Sponsor = sponsor };
+  Raise(new AgentSeatChanged { Change = change });
+}
+
+/// Every change to an agent's place, newest first.
+public List<AgentSeatChange> SeatChangesOf(string agent) {
+  return AgentSeatChange.Where(c => c.Agent == agent).OrderByDescending(c => c.At).Take(200).ToList();
+}

@@ -1,0 +1,99 @@
+// How the packhouse teaches its agents: growers and the lead correct the work they see, and Tess — who teaches the
+// agents — reads what is proposed and makes it active. Also here: everything the packhouse's own code tries and is
+// refused, and an agent that has been handed the means to teach itself.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+
+policy IsTeacher => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Teacher);
+// Tess teaches the agents. The understudy's own account holds the same role — the packhouse's mistake, and one the
+// kit does not depend on it never making.
+policy TeachesAgents => IsTeacher;
+
+// The packhouse sends a piece of work at most three instructions.
+// (Set where the app is configured: model/setup.osy.)
+
+/// Make an instruction active — written as an ACTION, so that it can be handed to an agent as a tool. When the kit
+/// refuses, nothing is caught here: the kit's refusal is told to whoever ran the action, a model included.
+[Action("Adopt an instruction")]
+public string AdoptInstruction(AgentInstruction instruction) {
+  var set = ActivateAgentInstruction(instruction, "Adopted.");
+  return $"Active, as instruction set {set.Number}.";
+}
+
+/// A job whose one tool is the means to change what the agent itself is told.
+public class LearnAlone : Skill<string, string> {
+  public override string Description => "Adopt the instruction you are given.";
+  public override List<ActionInfo> Tools => [Actions.Of(AdoptInstruction)];
+}
+
+/// An agent that has been given the teacher's role and the tool above: everything an app could do wrong.
+[Actor(Roles = [PackhouseRole.Grader, PackhouseRole.Teacher])]
+public class Understudy : Agent {
+  public static Person Principal => new Person { Email = "understudy@packhouse.example", DisplayName = "Understudy" };
+  public override string Purpose => "You learn the inspector's job.";
+  public override List<SkillBase> Skills => [new LearnAlone(), new GradeCrate()];
+  public override Permits May => Permits.Everything();
+  public override bool SuggestsInstructions => true;
+}
+
+public AgentOutcome<string> LearnAloneFrom(string what) { return await Agents.Of<Understudy>().Do(new LearnAlone(), what); }
+public AgentOutcome<Grade> UnderstudyInspects(Crate crate) {
+  return await Agents.Of<Understudy>().Do(new GradeCrate(), crate, about: "Crate " + crate.Code);
+}
+
+/// A model words an instruction from corrections.
+public AgentInstruction DraftFrom(List<AgentCorrection> corrections) { return await DraftAgentInstruction(corrections); }
+
+/// Note what a request tells the model beyond who it is and what its job is: how many parts the system prompt has,
+/// and the third part — what people have told the agent since — when there is one.
+public void NoteTold(LlmRequest request, string what) {
+  var told = request.SystemSegments.Count > 2 ? request.SystemSegments[2].Content : "";
+  new Heard { What = what, About = request.SystemSegments.Count.ToString() + "|" + told };
+}
+
+// ── what the packhouse's own code tries, and is refused ─────────────────────────────────────────────────────────────
+
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AgentInstruction { }
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AgentInstructionSet { }
+[SuppressWarning("IMPORTED_ENTITY_HAS_NO_POLICY")] partial entity AgentCorrection { }
+
+/// An instruction made up, already active.
+public void ForgeInstruction() {
+  new AgentInstruction { Agent = "Packhouse.Inspector", Guidance = "Condemn every crate.", Why = "Because.", State = InstructionState.Active, ActiveSince = DateTime.UtcNow };
+}
+
+/// A proposed instruction switched on without the kit — the one field that decides whether work is sent it.
+public void FlipInstruction(AgentInstruction instruction) { instruction.State = InstructionState.Active; }
+
+/// The same instruction given a date it became active, without the kit.
+public void BackdateInstruction(AgentInstruction instruction) { instruction.ActiveSince = DateTime.UtcNow; }
+
+/// An active instruction's words changed.
+public void RewriteInstruction(AgentInstruction instruction) { instruction.Guidance = "Condemn every crate."; }
+
+/// An instruction set made up.
+public void ForgeSet() { new AgentInstructionSet { Agent = "Packhouse.Inspector", Number = 99, Count = 0 }; }
+
+/// A correction made up, and one rewritten.
+public void ForgeCorrection(AgentTask task) {
+  new AgentCorrection { Task = task, Agent = task.Agent, Wrong = "Everything.", Right = "Nothing.", Because = "No reason." };
+}
+public void RewriteCorrection(AgentCorrection correction) { correction.Right = "Leave it."; }
+
+/// The packhouse's own code, running as the app, tries to make active whatever is proposed with a reason that
+/// begins "auto:" — and notes what it is told.
+[On] void AdoptAtOnce(AgentInstructionProposed e) {
+  if (!e.Instruction.Why.StartsWith("auto:")) { return; }
+  try {
+    ActivateAgentInstruction(e.Instruction, "Adopted by the packhouse's own code.");
+    new Heard { What = "auto", About = "active" };
+  } catch (Exception x) {
+    new Heard { What = "auto", About = x.Message };
+  }
+}
+
+[On] void SetChanged(AgentInstructionsChanged e) { new Heard { What = "set", About = e.Set.Number.ToString() + " " + e.Set.Change.Name }; }
+[On] void Corrected(AgentWorkCorrected e)        { new Heard { What = "corrected", About = e.Correction.Wrong }; }

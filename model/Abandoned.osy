@@ -1,0 +1,195 @@
+// Work that nothing is doing any more — what a process that died leaves behind, and how it is closed.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+
+// A piece of work is done by the process that was given it: that process asks the model, runs the tools, and writes
+// each step on the record as it goes. When it dies — the machine stops, a deploy replaces it, something outside the
+// kit throws through it — nothing runs to say so. The receipt goes on saying `Working`, and so does every piece it
+// had handed on that was under way; a piece that was waiting for a person waits for an answer nobody will use.
+//
+// Nothing can KNOW that a process is gone. What can be seen is that work which says it is under way has stopped
+// writing: every model answer and every tool is a line on the record of the whole it belongs to, so a whole with a
+// piece under way and no new line for `AgentsSetup.AbandonedAfter` is one nothing is doing.
+
+/// The internal word for "close this one": said by the functions below, heard by the kit with the app's own
+/// authority — so the work is closed the same way whoever noticed it.
+[Event("Agent work was abandoned")]
+internal sealed class AgentWorkAbandoned {
+  public AgentTask Task;
+  /// When the last line was written on the record of the whole it belongs to, as whoever noticed read it.
+  public DateTime QuietSince;
+}
+
+/// When anything was last written on the record of the whole a piece of work belongs to — a step of any piece of
+/// it, at any depth.
+DateTime LastStepOf(AgentTask task) {
+  var root = task.Root ?? task;
+  var last = TraceEvent.Where(e => e.Root == root).OrderByDescending(e => e.Seq).FirstOrDefault();
+  return last == null ? root.StartedAt : last!.At;
+}
+
+/// ⭐ WHETHER A PIECE OF WORK WAS ABANDONED: it says it is under way, and nothing has been written on the record of
+/// the whole it belongs to for `AgentsSetup.AbandonedAfter` — whatever was doing it is gone.
+///
+/// Work that waits for a person is never abandoned by waiting: it is `Waiting`, not `Working`, however long it takes.
+public bool WasAbandoned(AgentTask task) {
+  if (task.Status != AgentTaskStatus.Working) { return false; }
+  return GoneQuiet(task);
+}
+
+/// Whether the whole a piece of work belongs to has written nothing for `AbandonedAfter`.
+bool GoneQuiet(AgentTask task) {
+  var after = App.Setting<AgentsSetup>().AbandonedAfter;
+  if (after <= TimeSpan.Zero) { return false; }
+  return DateTime.UtcNow - LastStepOf(task) >= after;
+}
+
+/// The pieces under way at or under `task` in a whole that has gone quiet — the deepest first, so that a piece is
+/// closed before the piece that handed it on.
+List<AgentTask> AbandonedAtOrUnder(AgentTask task) {
+  List<AgentTask> found = [];
+  if (!GoneQuiet(task)) { return found; }
+  var root = task.Root ?? task;
+  var working = AgentTask.Where(t => (t.Root == root || t.Id == root.Id) && t.Status == AgentTaskStatus.Working)
+    .OrderByDescending(t => t.Depth).ToList();
+  foreach (var t in working) { if (t.Id == task.Id || IsUnder(t, task)) { found.Add(t); } }
+  return found;
+}
+
+/// Whether `piece` was handed on, at any remove, by `above`.
+bool IsUnder(AgentTask piece, AgentTask above) {
+  var at = piece.Parent;
+  while (at != null) {
+    if (at!.Id == above.Id) { return true; }
+    at = at!.Parent;
+  }
+  return false;
+}
+
+/// ⭐ CLOSE THE WORK NOTHING IS DOING ANY MORE. Every piece of work that says it is under way in a whole that has
+/// written nothing for `AgentsSetup.AbandonedAfter` is closed — `Failed`, "It stopped without reporting back", or
+/// `Cancelled` when somebody had called it off — and with it everything it handed on: a piece that waited for a
+/// person is called off and its proposal withdrawn; a piece above that was waiting for it is told, and goes on.
+/// Answers how many pieces were found.
+///
+/// Run it from a schedule of the app's — a workflow on the row a `Schedule` makes; every few minutes is plenty — or
+/// by hand: whoever supervises the agents may. Calling off one piece that was abandoned (`StopAgentTask`) closes
+/// that piece and what is under it at once, for whoever may call it off.
+[Server, Authorize(SupervisesAgents)]
+public int CloseAbandonedAgentWork() { return SweepAbandonedWork(); }
+
+/// What the sweep and the kit's clock both do: find every piece of abandoned work, and say so of each.
+[Server, Authorize(IsAuthenticated)]
+internal int SweepAbandonedWork() {
+  var after = App.Setting<AgentsSetup>().AbandonedAfter;
+  if (after <= TimeSpan.Zero) { return 0; }
+  var working = AgentTask.Where(t => t.Status == AgentTaskStatus.Working).OrderByDescending(t => t.Depth).ToList();
+  // Decided for every piece before any is closed: closing one writes a line on the record of its whole.
+  List<AgentWorkAbandoned> abandoned = [];
+  foreach (var t in working) { if (GoneQuiet(t)) { abandoned.Add(new AgentWorkAbandoned { Task = t, QuietSince = LastStepOf(t) }); } }
+  foreach (var found in abandoned) { Raise(found); }
+  return abandoned.Count;
+}
+
+/// Say of pieces of work that they were abandoned. What `StopAgentTask` does with what it found before it wrote
+/// anything, so that calling off work nothing is doing takes effect.
+void CloseAbandoned(List<AgentTask> pieces, DateTime quietSince) {
+  foreach (var t in pieces) { Raise(new AgentWorkAbandoned { Task = t, QuietSince = quietSince }); }
+}
+
+[On]
+void HearWorkWasAbandoned(AgentWorkAbandoned e) { CloseAbandonedWork(e.Task.Id, e.QuietSince); }
+
+/// Close one piece of work that was abandoned: the last line of its record, its receipt, what it had put to people,
+/// whoever waited for it, and everything it had handed on.
+[Server, Authorize(IsTheApp)]
+internal void CloseAbandonedWork(Guid id, DateTime quietSince) {
+  var task = AgentTask.Single(t => t.Id == id);
+  if (task.Status != AgentTaskStatus.Working) { return; }
+  var root = task.Root ?? task;
+  var bare = BareName(task.Agent);
+  var status = task.StopAsked ? AgentTaskStatus.Cancelled : AgentTaskStatus.Failed;
+  var outcome = task.StopAsked
+    ? (task.StopWhy == "" ? "It was called off." : "It was called off: " + task.StopWhy)
+    : "It stopped without reporting back: whatever was doing it is gone.";
+  AppendAgentTrace(root.Id, task.Id, new TraceEntry {
+    Kind = TraceKind.Ended, Summary = $"{status.Label}. {outcome} Nothing had been done in it since {quietSince.ToString("yyyy-MM-dd HH:mm")} UTC.",
+  });
+  CloseAgentTask(task.Id, status, outcome, null, true);
+  foreach (var p in AgentProposal.Where(p => p.Task == task && p.Status == ProposalStatus.Waiting).ToList()) { WithdrawProposal(p.Id); }
+  foreach (var q in AgentHelp.Where(h => h.Task == task && h.Status == HelpStatus.Waiting).ToList()) {
+    CloseAgentQuestion(q.Id, HelpStatus.Unavailable, "The work it belonged to stopped without reporting back.", null);
+  }
+  // Whoever waits for this work — a workflow that gave it — is let go.
+  ReleaseWorkWait(task.Id);
+  // What it handed on: a piece that waits is told now; one that is under way was abandoned with it, and is closed
+  // by the same sweep.
+  CallOffWorkUnder(task.Id, $"{bare}'s work, which it was part of, stopped without reporting back.");
+  // The work above, if it waits for this piece, hears that it has ended.
+  if (task.Parent != null && task.Parent!.Status == AgentTaskStatus.Waiting) { TellWaits(task.Parent!.Id); }
+}
+
+// ── the kit's own clock ──────────────────────────────────────────────────────────────────────────────────────────
+
+public enum AgentWorkWatchState {
+  [Label("Looking")] Watching,
+  [Label("Stopped")] Stopped,
+}
+
+/// The one row the clock runs on — made with the first piece of work, when the app looks for abandoned work at all.
+public entity AgentWorkWatch {
+  AgentWorkWatchState State;
+  security {
+    allow read when SupervisesAgents;
+    allow create when IsAuthenticated;
+    deny create except via WatchForAbandonedWork;
+  }
+}
+
+[On] void StartTheClock(AgentTaskStarted e) {
+  if (e.Task.Parent != null) { return; }
+  WatchForAbandonedWork();
+}
+
+[Server, Authorize(IsTheApp)]
+internal void WatchForAbandonedWork() {
+  var setup = App.Setting<AgentsSetup>();
+  if (setup.AbandonedAfter <= TimeSpan.Zero || setup.AbandonedCheckEvery <= TimeSpan.Zero) { return; }
+  if (!AgentWorkWatch.Any()) { new AgentWorkWatch(); }
+}
+
+TimeSpan AbandonedCheckEvery() {
+  var every = App.Setting<AgentsSetup>().AbandonedCheckEvery;
+  return every > TimeSpan.Zero ? every : TimeSpan.FromDays(36500);
+}
+
+/// ⭐ EVERY `AbandonedCheckEvery` (ten minutes; zero: never) the kit closes work that was abandoned, as
+/// `CloseAbandonedAgentWork` does — nobody has to remember to.
+public workflow AbandonedWorkClock {
+  Tracks    = AgentWorkWatch.State;
+  Autostart = true;
+  Initial   = Watching;
+
+  event Stop();
+
+  state Watching {
+    subscribe Stop() as Stopping {
+      Finished {
+        Within = TimeSpan.FromDays(36500);
+        Remind Look(After = AbandonedCheckEvery(), ThenEvery = AbandonedCheckEvery()) { CloseWhatWasAbandoned(); }
+        Unfinished { }
+      }
+    }
+    on Stopping() { goto Stopped; }
+  }
+  terminal cancel Stopped { }
+}
+
+[Server, Authorize(IsTheApp)]
+internal void CloseWhatWasAbandoned() {
+  if (App.Setting<AgentsSetup>().AbandonedCheckEvery <= TimeSpan.Zero) { return; }
+  SweepAbandonedWork();
+}

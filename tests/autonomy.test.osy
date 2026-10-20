@@ -1,0 +1,497 @@
+// Osysharp.Agents — the gate: what an agent does alone, what it proposes to a person first, and what it never does.
+// A proposal is the exact call — the tool, its arguments, what it does and why — and a yes runs it as whoever said
+// yes, for the version of things they said yes to. The work waits meanwhile, and goes on from where it stood.
+//
+// The clerk says nothing about what it may do: it looks things up alone and proposes the rest. The porter changes
+// the packhouse's data by itself, proposes a change of line every time, and never condemns a crate.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+string LineArgs(Crate crate, string line) { return "{\"crate\":\"" + crate.Id.ToString() + "\",\"line\":\"" + line + "\"}"; }
+
+/// Let the work a person has decided or answered go on: its wait's own run is settled.
+void GoOn(Guid task) {
+  Workflow.Settle(AgentWait.Where(w => w.Task.Id == task).OrderByDescending(w => w.Since).First());
+}
+
+// ── the default ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void an_agent_that_says_nothing_looks_things_up_alone_and_proposes_the_rest() {
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(Weigh), CrateArg(crate)),
+      Says.Tool("It weighs 8 kg, and a full crate holds 10.", Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+
+    var outcome = Settle(crate);
+    task = outcome.Task;
+
+    // It weighed the crate by itself. The flag changes the packhouse's data, so it did NOT run: it was proposed.
+    Assert.True(outcome.Waiting);
+    Assert.False(outcome.Done);
+    Assert.Equal("", Crate.Single(c => c.Code == "A-2").Flag);
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Waiting, receipt.Status);
+    Assert.Equal("a decision from Ada", receipt.WaitingOn);
+    Assert.Null(receipt.EndedAt);
+    Assert.Equal(2, Heard.Count(h => h.What == "asked:Small"));
+
+    // The proposal is the exact call: the tool, its arguments, what it does, why, and what the agent had looked at.
+    var proposal = AgentProposal.Single();
+    Assert.Equal("Packhouse.FlagCrate", proposal.Action);
+    Assert.Equal("Flag the crate", proposal.Label);
+    Assert.Equal("changes data", proposal.Does);
+    Assert.True(proposal.Changes);
+    Assert.False(proposal.Sends);
+    Assert.Equal(FlagArgs(crate, "short"), proposal.ArgumentsJson);
+    Assert.Equal("It weighs 8 kg, and a full crate holds 10.", proposal.Why);
+    Assert.Equal("[{\"Tool\":\"Weigh the crate\",\"Said\":\"8\"}]", proposal.EvidenceJson);
+    Assert.Equal("Packhouse.SettleCrate", proposal.Skill);
+    Assert.Equal(ProposalStatus.Waiting, proposal.Status);
+    // It is put to the person the work is for.
+    Assert.Equal(Ada.Id, proposal.DecideBy!.Id);
+    Assert.Equal(1, ProposalsForMe().Count);
+    Assert.Equal("crate: " + crate.Id.ToString() + " · flag: short", ArgumentsInWords(proposal.ArgumentsJson));
+    // The record says what it did alone, what it put to whom and why, and that it waits.
+    var said = Trajectory.Said(task);
+    Assert.Contains("It asked for Weigh (reads only); it is one of this work's tools, so it runs as the agent, for whoever asked.", said);
+    Assert.Contains("It asked for FlagCrate (changes data); its declaration says it is proposed first, so it was put to Ada.", said);
+    Assert.Contains("It waits for a decision from Ada.", said);
+
+    // She says yes: it runs now, and she is told so.
+    var decision = ApproveAgentProposal(proposal);
+    Assert.Equal("Done, as you.", decision.Said);
+    Assert.Equal(ProposalStatus.Done, decision.Status);
+    Assert.Equal("short", Crate.Single(c => c.Code == "A-2").Flag);
+    GoOn(task);
+  }
+  runas (Ada) {
+    // The work went on from where it stood: the model was given what the tool answered, and handed its result back.
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Equal("", receipt.WaitingOn);
+    Assert.Contains("\"Finding\":\"Short.\"", receipt.Result!);
+    Assert.Equal(3, receipt.ModelCalls);
+    Assert.Equal(2, receipt.ToolCalls);
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About == "\"A-2 is flagged short.\""));
+    Assert.Contains("Ada approved FlagCrate, and it ran as them.", Trajectory.Said(task));
+    Assert.Equal(["Started", "ModelCall", "ToolCall", "ToolResult", "ModelCall", "ToolCall", "Waiting", "Decided", "ModelCall", "Ended"], Trajectory.Kinds(task));
+    Assert.True(VerifyTrace(receipt).Intact);
+    var proposal = AgentProposal.Single();
+    Assert.Equal(ProposalStatus.Done, proposal.Status);
+    Assert.Equal(Ada.Id, proposal.DecidedBy!.Id);
+    Assert.Equal(0, ProposalsForMe().Count);
+    // What the packhouse heard: it waited, it was proposed, it was decided, it finished.
+    Assert.Equal(1, Heard.Count(h => h.What == "waiting" && h.About == "a decision from Ada"));
+    Assert.Equal(1, Heard.Count(h => h.What == "proposed" && h.About == "FlagCrate"));
+    Assert.Equal(1, Heard.Count(h => h.What == "decided" && h.About == "Done"));
+    Assert.Equal(1, Heard.Count(h => h.What == "wrapped up" && h.About == "Crate A-2"));
+  }
+}
+
+// ── a yes runs it as whoever said yes ───────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void an_approved_proposal_runs_as_the_approver() {
+  // Condemning a crate is the lead's and the graders' to do — never a grower's. The clerk is a grader; it works here
+  // for Ada, a grower, and proposes to condemn her crate.
+  Guid first;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool("There is mould right through it.", Actions.Of(CondemnCrate), CondemnArgs(crate)),
+      Says.HandBack(new Grade { Score = 0, Finding = "Mould." }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    first = Settle(crate).Task;
+
+    // Ada's yes runs it as Ada — and Ada may not condemn a crate. So it is not done, and she is told.
+    var decision = ApproveAgentProposal(AgentProposal.Single());
+    Assert.Equal(ProposalStatus.Failed, decision.Status);
+    Assert.StartsWith("It could not be done:", decision.Said);
+    Assert.False(Crate.Single(c => c.Code == "A-1").Condemned);
+    GoOn(first);
+    // The agent was told it could not be done, as what its tool answered, and went on.
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.StartsWith("error: ")));
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+  }
+  // The same proposal again — and this time the lead, who may condemn a crate, says yes.
+  Guid second;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    second = Settle(crate).Task;
+  }
+  runas (Dana) {
+    var proposal = AgentProposal.Single(p => p.Status == ProposalStatus.Waiting);
+    Assert.Equal(Ada.Id, proposal.DecideBy!.Id);
+    var decision = ApproveAgentProposal(proposal);
+    Assert.Equal(ProposalStatus.Done, decision.Status);
+    var crate = Crate.Single(c => c.Code == "A-1");
+    Assert.True(crate.Condemned);
+    Assert.Equal("mould", crate.CondemnedWhy);
+    // It was the clerk's own account that changed the crate — on Dana's say, not on Ada's.
+    Assert.Equal(Actor.Of<Clerk>().Id, crate.ChangedBy);
+    Assert.Equal(Dana.Id, AgentProposal.Single(p => p.Id == proposal.Id).DecidedBy!.Id);
+    GoOn(second);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single(t => t.Id == second).Status);
+    Assert.Contains("Dana approved CondemnCrate, and it ran as them.", Trajectory.Said(second));
+  }
+}
+
+[Test(Yard)]
+void a_rejected_proposal_gives_the_agent_the_reason() {
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool("It looks bruised.", Actions.Of(FlagCrate), FlagArgs(crate, "bruised")),
+      Says.HandBack(new Grade { Score = 8, Finding = "Sound after all." }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    var task = Settle(crate).Task;
+
+    // A no needs its reason: the agent goes on from it.
+    Assert.Throws<ValidationException>(() => RejectAgentProposal(AgentProposal.Single(), " "));
+    var decision = RejectAgentProposal(AgentProposal.Single(), "That is the variety's colour, not a bruise.");
+    Assert.Equal(ProposalStatus.Rejected, decision.Status);
+    GoOn(task);
+
+    // Nothing was flagged, and the model was told no and why — as what its tool answered.
+    Assert.Equal("", Crate.Single(c => c.Code == "A-1").Flag);
+    var told = Heard.Single(h => h.What == "result").About;
+    Assert.StartsWith("error: ", told);
+    Assert.Contains("Their reason: That is the variety", told);
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Contains("Sound after all.", receipt.Result!);
+    // A tool that did not run is not counted as run.
+    Assert.Equal(0, receipt.ToolCalls);
+    Assert.Contains("Ada said no to FlagCrate: That is the variety's colour, not a bruise.", Trajectory.Said(task));
+    Assert.Equal("That is the variety's colour, not a bruise.", AgentProposal.Single().Reason);
+  }
+}
+
+[Test(Yard)]
+void a_yes_does_not_cover_what_changed_after_it_was_proposed() {
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool("At 8 kg it is short.", Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+      Says.HandBack(new Grade { Score = 7, Finding = "Full weight on the second scale." }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    var task = Settle(crate).Task;
+    var proposal = AgentProposal.Single();
+    Assert.Equal("8", proposal.SubjectVersion);
+
+    // The crate is weighed again before she decides: what the agent proposed is about a crate that is no more.
+    crate.Kilos = 10.5m;
+    UnitOfWork.Commit();
+    Assert.NotEqual(proposal.Fingerprint, ProposalFingerprintNow(proposal));
+
+    var decision = ApproveAgentProposal(proposal);
+    // Her yes was to the crate as it was. Nothing ran; she is told; the agent looks again.
+    Assert.Equal(ProposalStatus.Stale, decision.Status);
+    Assert.Contains("has changed since Clerk proposed it", decision.Said);
+    Assert.Equal("", Crate.Single(c => c.Code == "A-2").Flag);
+    GoOn(task);
+    var told = Heard.Single(h => h.What == "result").About;
+    Assert.StartsWith("error: ", told);
+    Assert.Contains("has changed since it was proposed", told);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+    Assert.Equal(ProposalStatus.Stale, AgentProposal.Single().Status);
+  }
+}
+
+// ── what it never does ──────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void out_of_envelope_is_never_approvable() {
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool("It is mouldy.", Actions.Of(CondemnCrate), CondemnArgs(crate)),
+      Says.HandBack(new Grade { Score = 1, Finding = "Mould; I may not condemn it." }));
+    ScriptedAnswer.Stub((model, request) => { NoteOffer(request, "offered"); NoteAsked(model, request); return script.Answer(model, request); });
+
+    var outcome = Carry(crate);
+
+    // The porter never condemns a crate. The tool was not offered to the model; asked for anyway, it did not run —
+    // and NOTHING WAS PROPOSED, so there is nothing for anybody to approve.
+    Assert.True(outcome.Done);
+    Assert.False(Crate.Single(c => c.Code == "A-1").Condemned);
+    Assert.Equal(0, AgentProposal.Count());
+    Assert.Equal("Weigh,FlagCrate,MoveToLine,hand_back", Heard.First(h => h.What == "offered").About);
+    Assert.Contains("It asked for `CondemnCrate`, which is not one of its tools. Nothing ran.", Trajectory.Said(outcome.Task));
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.StartsWith("error: ") && h.About.Contains("is not one of your tools.")));
+
+    // No standing rule can be given for it either — nor for what the porter proposes every time.
+    var never = Assert.Throws<AgentRefused>(() => AllowAlone("Packhouse.Porter", Actions.Of(CondemnCrate)));
+    Assert.Equal("Porter never runs CondemnCrate: its declaration says so, and no rule changes that.", never.Message);
+    var always = Assert.Throws<AgentRefused>(() => AllowAlone("Packhouse.Porter", Actions.Of(MoveToLine)));
+    Assert.Equal("Porter proposes MoveToLine every time: its declaration says so, and no rule changes that.", always.Message);
+    // …nor for a tool none of its skills holds.
+    Assert.Throws<AgentRefused>(() => AllowAlone("Packhouse.Porter", Actions.Of(ReadLedger)));
+    Assert.Equal(0, AgentStandingRule.Count());
+  }
+  // And the lead herself cannot: what an agent never does is not hers to allow.
+  runas (Dana) {
+    Assert.Throws<AgentRefused>(() => AllowAlone("Packhouse.Porter", Actions.Of(CondemnCrate), forEverybody: true));
+    // A rule made up by the app is refused where it is stored.
+    Assert.Denied(() => { ForgeRule(Dana); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_skill_can_be_stricter_than_its_agent_and_never_looser() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Tool("It is bruised.", Actions.Of(FlagCrate), FlagArgs(crate, "bruised")),
+    Says.Tool("Bruised fruit is for juice.", Actions.Of(MoveToLine), LineArgs(crate, "Juice")),
+    Says.HandBack(new Grade { Score = 5, Finding = "Bruised: juice." }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  // On its ordinary job the porter flags by itself…
+  var plain = Carry(crate);
+  Assert.Equal("bruised", Crate.Single(c => c.Code == "A-1").Flag);
+  // …and a change of line is proposed, every time.
+  Assert.True(plain.Waiting);
+  Assert.Equal("Packhouse.MoveToLine", AgentProposal.Single().Action);
+  Assert.Contains("its declaration says it is proposed every time, so it was put to Ada.", string.Join(" ", Trajectory.Said(plain.Task)));
+  StopAgentTask(AgentTask.Single(t => t.Id == plain.Task), "Not today.");
+  UnitOfWork.Commit();
+  GoOn(plain.Task);
+
+  // By the book, even the flag is proposed: the skill says so, whatever the porter may do elsewhere.
+  var other = Crate.Single(c => c.Code == "A-2");
+  var byTheBook = AgentScript.Of(Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(other, "short")));
+  ScriptedAnswer.Stub((model, request) => byTheBook.Answer(model, request));
+  var careful = CarryByTheBook(other);
+  Assert.True(careful.Waiting);
+  Assert.Equal("", Crate.Single(c => c.Code == "A-2").Flag);
+  Assert.Equal("Packhouse.FlagCrate", AgentProposal.Single(p => p.Status == ProposalStatus.Waiting).Action);
+}
+
+// ── "approve all like this" ─────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void a_standing_rule_lets_it_run_alone_until_it_is_taken_back() {
+  Guid rule;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool("It is bruised.", Actions.Of(FlagCrate), FlagArgs(crate, "bruised")),
+      Says.HandBack(new Grade { Score = 5, Finding = "Bruised." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var first = Settle(crate);
+    Assert.True(first.Waiting);
+
+    // "Yes — and from now on, do this alone."
+    var decision = ApproveAgentProposal(AgentProposal.Single(), alwaysLikeThis: true);
+    Assert.Equal(ProposalStatus.Done, decision.Status);
+    GoOn(first.Task);
+    var standing = AgentStandingRule.Single();
+    rule = standing.Id;
+    Assert.Equal("Packhouse.Clerk", standing.Agent);
+    Assert.Equal("Packhouse.FlagCrate", standing.Action);
+    Assert.Equal("Packhouse.SettleCrate", standing.Skill);
+    Assert.Equal(Ada.Id, standing.For!.Id);
+    Assert.Equal(Ada.Id, standing.GrantedBy!.Id);
+    Assert.Equal(AgentProposal.Single().Id, standing.FromProposal);
+
+    // The next time, for her, it flags without asking — and the record says on whose word.
+    var other = Crate.Single(c => c.Code == "A-2");
+    var again = AgentScript.Of(
+      Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(other, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true }));
+    ScriptedAnswer.Stub((model, request) => again.Answer(model, request));
+    var second = Settle(other);
+    Assert.True(second.Done);
+    Assert.Equal("short", Crate.Single(c => c.Code == "A-2").Flag);
+    Assert.Equal(1, AgentProposal.Count());
+    Assert.Contains("It asked for FlagCrate (changes data); a person said it may, from now on, so it runs as the agent, for whoever asked.", Trajectory.Said(second.Task));
+    // …and the rule counts each time it let a tool run — by the kit, never by hand.
+    var used = AgentStandingRule.Single();
+    Assert.Equal(1, used.Used);
+    Assert.NotNull(used.LastUsedAt);
+    Assert.Denied(() => { CountRuleByHand(AgentStandingRule.Single()); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+  }
+  // Her rule is hers: work the clerk does for Ben is still proposed.
+  runas (Ben) {
+    var crate = Crate.Single(c => c.Code == "B-1");
+    var script = AgentScript.Of(Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(crate, "short")));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Assert.True(Settle(crate).Waiting);
+    Assert.Equal("", Crate.Single(c => c.Code == "B-1").Flag);
+    // And it is not his to take back.
+    Assert.Equal(0, AgentStandingRule.Count());
+  }
+  // The auditor is not somebody the packhouse lets widen what an agent does.
+  runas (Omar) {
+    Assert.Denied(() => AllowAlone("Packhouse.Clerk", Actions.Of(FlagCrate)));
+  }
+  // She takes it back: from its next step the clerk proposes again.
+  runas (Ada) {
+    RevokeStandingRule(AgentStandingRule.Single(r => r.Id == rule), "It flagged too much.");
+    UnitOfWork.Commit();
+    var standing = AgentStandingRule.Single();
+    Assert.NotNull(standing.RevokedAt);
+    Assert.Equal(Ada.Id, standing.RevokedBy!.Id);
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(Says.Tool("Still bruised.", Actions.Of(FlagCrate), FlagArgs(crate, "bruised twice")));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Assert.True(Settle(crate).Waiting);
+    Assert.Equal("bruised", Crate.Single(c => c.Code == "A-1").Flag);
+  }
+}
+
+// ── who decides ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void a_proposal_is_decided_only_through_the_kit_by_who_it_is_put_to() {
+  Guid id;
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool("It is bruised.", Actions.Of(FlagCrate), FlagArgs(crate, "bruised")),
+      Says.HandBack(new Grade { Score = 5 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = Settle(crate).Task;
+    id = AgentProposal.Single().Id;
+    // Marked approved by hand, it is refused where it is stored; so is one made up, and so is the app's own relay.
+    Assert.Denied(() => { ForgeApproval(AgentProposal.Single()); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Denied(() => { ForgeProposal(AgentTask.Single()); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    Assert.Denied(() => RelayByHand(AgentProposal.Single(), Dana));
+    Assert.Denied(() => { AgentProposal.Single().Delete(); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+  }
+  // Another grower neither sees it nor decides it.
+  runas (Ben) {
+    Assert.Equal(0, AgentProposal.Count());
+    Assert.Equal(0, ProposalsForMe().Count);
+  }
+  // The auditor reads every proposal — and decides none: it is not put to him.
+  runas (Omar) {
+    var refused = Assert.Throws<AgentRefused>(() => ApproveAgentProposal(AgentProposal.Single()));
+    Assert.Equal("This proposal is not put to you.", refused.Message);
+    Assert.Throws<AgentRefused>(() => RejectAgentProposal(AgentProposal.Single(), "No."));
+  }
+  // Nothing ran meanwhile.
+  runas (Ada) {
+    Assert.Equal("", Crate.Single(c => c.Code == "A-1").Flag);
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+    ApproveAgentProposal(AgentProposal.Single());
+    // Decided once: a second decision is refused, and changes nothing.
+    var twice = Assert.Throws<AgentRefused>(() => RejectAgentProposal(AgentProposal.Single(), "On second thoughts."));
+    Assert.Equal("This proposal has already been decided: approved and done.", twice.Message);
+    Assert.Equal("bruised", Crate.Single(c => c.Code == "A-1").Flag);
+  }
+}
+
+[Test(Yard)]
+void nobody_borrows_a_colleagues_rights_through_an_agent() {
+  // An agent's tools run for whoever the work is for. Ben is a grower; so is Ada. Ben may not touch Ada's crates —
+  // and he may not have the clerk do it "for Ada" either.
+  runas (Ben) {
+    var script = AgentScript.Of(Says.HandBack(new Grade { Score = 5 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var own = Crate.Single(c => c.Code == "B-1");
+    var refused = Assert.Throws<AgentRefused>(() => SettleFor(Ada, own));
+    Assert.StartsWith("You may give Clerk work for yourself, not for somebody else", refused.Message);
+    // Nothing was opened: no receipt, no call to a model.
+    Assert.Equal(0, AgentTask.Count());
+    // Naming himself is always his to do.
+    var mine = SettleFor(Ben, own);
+    Assert.True(mine.Done);
+    Assert.Equal(Ben.Id, AgentTask.Single().Requester!.Id);
+  }
+  // The lead is who the packhouse lets give work for somebody else: the clerk then works within what Ada may do.
+  runas (Dana) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(Says.HandBack(new Grade { Score = 6 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var outcome = SettleFor(Ada, crate);
+    Assert.True(outcome.Done);
+    var receipt = AgentTask.Single(t => t.Id == outcome.Task);
+    Assert.Equal(Ada.Id, receipt.Requester!.Id);
+    Assert.Equal(Dana.Id, receipt.StartedBy!.Id);
+  }
+}
+
+// ── waiting ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void work_that_waits_can_be_called_off() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(Says.Tool("It is bruised.", Actions.Of(FlagCrate), FlagArgs(crate, "bruised")));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  var task = Settle(crate).Task;
+
+  StopAgentTask(AgentTask.Single(), "The crate went back to the grower.");
+  UnitOfWork.Commit();
+  GoOn(task);
+
+  // It ended where it stood: nothing more was asked of a model, the proposal is withdrawn, and a late yes is refused.
+  var receipt = AgentTask.Single();
+  Assert.Equal(AgentTaskStatus.Cancelled, receipt.Status);
+  Assert.Equal("It was called off: The crate went back to the grower.", receipt.Outcome);
+  Assert.Equal(1, receipt.ModelCalls);
+  Assert.Equal(ProposalStatus.Withdrawn, AgentProposal.Single().Status);
+  Assert.Throws<AgentRefused>(() => ApproveAgentProposal(AgentProposal.Single()));
+  Assert.Equal("", Crate.Single(c => c.Code == "A-1").Flag);
+  Assert.True(VerifyTrace(receipt).Intact);
+}
+
+[Test(Yard)]
+void a_workflow_waits_with_the_work_and_goes_on_when_the_person_has_decided() {
+  TestClock.Set(new DateTime(2031, 3, 3, 9, 0, 0, DateTimeKind.Utc));
+  Guid claim;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short: the claim stands.", Short = true }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    OpenClaim(crate);
+    var c = Claim.Single();
+    claim = c.Id;
+    Workflow.Settle(c);
+    // The process is where it was: its step has not answered, because the clerk's work is waiting on a person.
+    Assert.Equal(ClaimStage.Open, Claim.Single().Stage);
+    Assert.Equal("", Claim.Single().Finding);
+  }
+  // Thirty days go by. Nothing runs, and nothing is asked of a model.
+  TestClock.Advance(TimeSpan.FromDays(30));
+  Background.Settle();
+  // Nobody is signed in while a process runs, so the work is for nobody — and its proposal goes to the clerk's sponsor.
+  runas (Dana) {
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Waiting, receipt.Status);
+    Assert.Equal(1, receipt.ModelCalls);
+    var proposal = AgentProposal.Single();
+    Assert.Equal(Dana.Id, proposal.DecideBy!.Id);
+    Assert.Equal(ProposalStatus.Done, ApproveAgentProposal(proposal).Status);
+    GoOn(receipt.Id);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+    Workflow.Settle(AgentWorkWait.Single());
+  }
+  runas (Ada) {
+    var c = Claim.Single(x => x.Id == claim);
+    Workflow.Settle(c);
+    // The step answered with the finished work, and the process went on.
+    Assert.Equal(ClaimStage.Settled, c.Stage);
+    Assert.Equal("Short: the claim stands.", c.Finding);
+    Assert.Equal("short", Crate.Single(x => x.Code == "A-2").Flag);
+  }
+}

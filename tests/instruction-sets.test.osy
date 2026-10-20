@@ -1,0 +1,497 @@
+// Osysharp.Agents — instruction sets: which instructions reach which work, in what order and within what bound; how
+// one is retired and an agent put back to an earlier set; what work already under way does when the set changes; why
+// a yes to a proposal does not carry from one set to another; and whether an instruction helped, counted.
+//
+// The fixture, the helpers and the packhouse's teacher (Tess) are in teaching.test.osy.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+string WeightRule()  { return "Say the weight in every finding."; }
+string OrganicRule() { return "This grower's fruit is organic: say so in the finding."; }
+string JuiceRule()   { return "This delivery is for juice: bruises do not lower the grade."; }
+
+/// The numbered lines of what a model was sent — the heading taken off.
+string LinesIn(string what) {
+  var told = ToldIn(what);
+  var at = told.IndexOf("\n");
+  return at < 0 ? told : told.Substring(at + 1);
+}
+
+// ── which work is sent what ─────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void instructions_reach_the_work_they_are_for_in_a_stated_order() {
+  runas (Tess) {
+    // Made active in this order: for one grower, for one skill, for everything the inspector does.
+    Teach(OrganicRule(), forPerson: Ada.Id);
+    Teach(ShortRule(), TheGrading);
+    Teach(WeightRule());
+  }
+  // Ada's grading is sent all three — the general first, then the skill's, and the one for her last.
+  runas (Ada) { GradeNoting("A-1", "ada grading"); }
+  Assert.Equal("1. " + WeightRule() + "\n2. " + ShortRule() + "\n3. " + OrganicRule(), LinesIn("ada grading"));
+  // Ben's grading is not sent what is for Ada.
+  runas (Ben) { GradeNoting("B-1", "ben grading"); }
+  Assert.Equal("1. " + WeightRule() + "\n2. " + ShortRule(), LinesIn("ben grading"));
+  // Asked something — no skill — the inspector is sent what holds for everything it does, and what is for whoever asks.
+  runas (Ada) {
+    ScriptedAnswer.Stub((model, request) => { NoteTold(request, "ada asking"); return Says.Words("Two crates."); });
+    AskInspector("What did I bring?");
+  }
+  Assert.Equal("1. " + WeightRule() + "\n2. " + OrganicRule(), LinesIn("ada asking"));
+  // Another agent is sent none of it.
+  runas (Ada) {
+    ScriptedAnswer.Stub((model, request) => { NoteTold(request, "the sorter"); return Says.HandBack(new Grade { Score = 7 }); });
+    InspectCarefully(Crate.Single(c => c.Code == "A-1"));
+  }
+  Assert.Equal("2|", ToldIn("the sorter"));
+}
+
+[Test(School)]
+void an_instruction_for_what_work_is_charged_to_reaches_only_that_work() {
+  runas (Tess) { Teach(JuiceRule(), onScope: "delivery:D7"); }
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    ScriptedAnswer.Stub((model, request) => { NoteTold(request, "on D7"); return Says.HandBack(new Grade { Score = 7 }); });
+    InspectOn(crate, "D7", null);
+    ScriptedAnswer.Stub((model, request) => { NoteTold(request, "on D8"); return Says.HandBack(new Grade { Score = 7 }); });
+    InspectOn(crate, "D8", null);
+  }
+  Assert.Equal("1. " + JuiceRule(), LinesIn("on D7"));
+  Assert.Equal("2|", ToldIn("on D8"));
+}
+
+[Test(School)]
+void a_piece_of_work_is_sent_no_more_than_the_bound() {
+  // The packhouse sends a piece of work at most three instructions.
+  Guid general;
+  runas (Tess) {
+    general = Teach(WeightRule()).Id;
+    Teach(ShortRule(), TheGrading);
+    Teach(JuiceRule(), onScope: "delivery:D7");
+    Teach(OrganicRule(), forPerson: Ada.Id);
+    Teach("Round every weight to the nearest half kilo.");
+  }
+  // Ada's grading on delivery D7 is what all five apply to. It is sent the three most specific, and its record says
+  // the others did not fit.
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    ScriptedAnswer.Stub((model, request) => { NoteTold(request, "everything"); return Says.HandBack(new Grade { Score = 7 }); });
+    var task = InspectOn(crate, "D7", null).Task;
+    Assert.Equal("1. " + ShortRule() + "\n2. " + JuiceRule() + "\n3. " + OrganicRule(), LinesIn("everything"));
+    Assert.Equal("Inspector was given grade crate: Crate A-1. It runs under instruction set 5, and was sent 3 instructions; 2 more applied and did not fit.",
+                 Trajectory.Said(task)[0]);
+    var receipt = AgentTask.Single(t => t.Id == task);
+    Assert.Equal(3, receipt.InstructionsSent.Split("\n").Length);
+    Assert.False(receipt.InstructionsSent.Contains(general.ToString()));
+  }
+  runas (Tess) {
+    // One that would take the work it is for past the bound is refused where somebody tries to make it active —
+    // with what to do about it. A fourth for everything the inspector does is one too many.
+    Teach("Grade apples before pears.");
+    var fourth = ProposeAgentInstruction(new InstructionDraft { Agent = TheInspector, Guidance = "Grade pears before plums.", Why = "The lead asked." });
+    var refused = Assert.Throws<AgentRefused>(() => ActivateAgentInstruction(fourth));
+    Assert.Equal("Inspector would be sent 4 instructions for this work, and a piece of work is sent at most 3. Retire one it no longer needs first.", refused.Message);
+    Assert.Equal(InstructionState.Proposed, fourth.State);
+
+    // And an instruction is short: one thing, in at most 600 characters.
+    var longOne = "";
+    for (var i = 0; i < 61; i++) { longOne = longOne + "ten chars "; }
+    var tooLong = Assert.Throws<ValidationException>(() => ProposeAgentInstruction(new InstructionDraft { Agent = TheInspector, Guidance = longOne, Why = "x" }));
+    Assert.Contains("at most 600 characters, and this is 609", tooLong.Message);
+  }
+}
+
+// ── retiring, and going back ────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void retiring_an_instruction_ends_it_for_new_work_and_is_a_record() {
+  runas (Tess) {
+    var rule = Teach(ShortRule(), TheGrading);
+    // Not without a reason; and only what is active is retired.
+    Assert.Throws<ValidationException>(() => RetireAgentInstruction(rule, " "));
+    var set = RetireAgentInstruction(rule, "The buyers take short crates at full price this season.");
+    UnitOfWork.Commit();
+    Assert.Equal(2, set.Number);
+    Assert.Equal(InstructionChange.Retired, set.Change);
+    Assert.Equal(rule.Id, set.Instruction!.Id);
+    Assert.Equal(Tess.Id, set.By!.Id);
+    Assert.Equal("The buyers take short crates at full price this season.", set.Why);
+    Assert.Equal(0, set.Count);
+    Assert.Equal("", set.Hash);
+    var retired = AgentInstruction.Single();
+    Assert.Equal(InstructionState.Retired, retired.State);
+    Assert.Equal(Tess.Id, retired.RetiredBy!.Id);
+    Assert.NotNull(retired.RetiredAt);
+    Assert.Throws<AgentRefused>(() => RetireAgentInstruction(retired, "Again."));
+  }
+  runas (Ada) {
+    var task = GradeNoting("A-1", "after");
+    Assert.Equal("2|", ToldIn("after"));
+    var receipt = AgentTask.Single(t => t.Id == task);
+    Assert.Equal(2, receipt.InstructionSet);
+    Assert.Equal("", receipt.InstructionsSent);
+    Assert.Equal("Inspector was given grade crate: Crate A-1. It runs under instruction set 2, none of which is for this work.", Trajectory.Said(task)[0]);
+  }
+  // The lead supervises; retiring is the teacher's.
+  runas (Tess) {
+    var again = Teach(WeightRule());
+    runas (Dana) { Assert.Denied(() => RetireAgentInstruction(again, "No.")); }
+  }
+}
+
+[Test(School)]
+void a_rollback_restores_an_earlier_set_and_is_itself_a_record() {
+  Guid shortRule;
+  Guid weightRule;
+  runas (Tess) {
+    shortRule = Teach(ShortRule(), TheGrading).Id;                                                  // set 1: the short rule
+    weightRule = Teach(WeightRule()).Id;                                                            // set 2: both
+    RetireAgentInstruction(AgentInstruction.Single(i => i.Id == shortRule), "Trying without it.");  // set 3: the weight rule
+    UnitOfWork.Commit();
+    Assert.Equal(3, InstructionSetOf(TheInspector));
+  }
+  runas (Ada) { GradeNoting("A-1", "on set 3"); }
+  Assert.Equal("1. " + WeightRule(), LinesIn("on set 3"));
+
+  runas (Tess) {
+    Assert.Throws<ValidationException>(() => RollBackAgentInstructions(TheInspector, 1, " "));
+    Assert.Throws<ValidationException>(() => RollBackAgentInstructions(TheInspector, 9, "No such set."));
+
+    // Back to set 1: what was active then is active again, and what came since is retired.
+    var back = RollBackAgentInstructions(TheInspector, 1, "Grades went wrong after the second rule.");
+    UnitOfWork.Commit();
+    Assert.Equal(4, back.Number);
+    Assert.Equal(InstructionChange.RolledBack, back.Change);
+    Assert.Equal(1, back.RestoredFrom);
+    Assert.Equal(Tess.Id, back.By!.Id);
+    Assert.Equal("Grades went wrong after the second rule.", back.Why);
+    // It is the same set as set 1, and can be seen to be: the same instructions, the same hash.
+    var first = InstructionSetNumbered(TheInspector, 1)!;
+    Assert.Equal(first.Members, back.Members);
+    Assert.Equal(first.Hash, back.Hash);
+    Assert.NotEqual("", back.Hash);
+    Assert.Equal(InstructionState.Active, AgentInstruction.Single(i => i.Id == shortRule).State);
+    var undone = AgentInstruction.Single(i => i.Id == weightRule);
+    Assert.Equal(InstructionState.Retired, undone.State);
+    Assert.Equal("Put back to instruction set 1: Grades went wrong after the second rule.", undone.RetiredWhy);
+    // Already there: nothing to do, and no set is made for nothing.
+    Assert.Throws<AgentRefused>(() => RollBackAgentInstructions(TheInspector, 1, "Again."));
+    Assert.Equal(4, InstructionSetOf(TheInspector));
+  }
+  // New work runs under the restored set.
+  runas (Ada) {
+    var task = GradeNoting("A-1", "on set 4");
+    Assert.Equal(4, AgentTask.Single(t => t.Id == task).InstructionSet);
+  }
+  Assert.Equal("1. " + ShortRule(), LinesIn("on set 4"));
+
+  runas (Tess) {
+    // To set 2 — both — and its hash again.
+    var both = RollBackAgentInstructions(TheInspector, 2, "The second rule was not the cause.");
+    UnitOfWork.Commit();
+    Assert.Equal(InstructionSetNumbered(TheInspector, 2)!.Hash, both.Hash);
+    Assert.Equal(2, both.Count);
+    // One skill alone: the grading's own instructions go back to how they were before anybody taught it; the rest stay.
+    var skill = RollBackAgentInstructions(TheInspector, 0, "Grading goes back to the book.", skill: TheGrading);
+    UnitOfWork.Commit();
+    Assert.Equal(6, skill.Number);
+    Assert.Equal(TheGrading, skill.Skill);
+    Assert.Equal(weightRule.ToString(), skill.Members);
+    // And everything: as it was before anybody taught it anything.
+    var nothing = RollBackAgentInstructions(TheInspector, 0, "Start again.");
+    UnitOfWork.Commit();
+    Assert.Equal(0, nothing.Count);
+    Assert.Equal("", nothing.Hash);
+    Assert.Equal(7, InstructionSetsOf(TheInspector).Count);
+  }
+  runas (Ada) { GradeNoting("A-1", "on set 7"); }
+  Assert.Equal("2|", ToldIn("on set 7"));
+  // The lead does not roll back; the teacher does.
+  runas (Dana) { Assert.Denied(() => RollBackAgentInstructions(TheInspector, 2, "No.")); }
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.What == "set" && h.About == "4 RolledBack"));
+}
+
+// ── work already under way ──────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void work_in_flight_finishes_under_the_set_it_started_with() {
+  Guid first;
+  runas (Ada) {
+    // The clerk stops to ask Ada something: its work waits.
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(Says.AskPerson("Is A-2 meant for juice?", "It is short."), Says.HandBack(new Grade { Score = 4, Finding = "Short." }));
+    ScriptedAnswer.Stub((model, request) => {
+      NoteTold(request, "first, turn " + request.Messages.Count(m => m.Role == "assistant").ToString());
+      return script.Answer(model, request);
+    });
+    first = Settle(crate).Task;
+    Assert.Equal(AgentTaskStatus.Waiting, AgentTask.Single(t => t.Id == first).Status);
+  }
+  // While it waits, the clerk is taught something.
+  runas (Tess) { Teach(WeightRule(), agent: "Packhouse.Clerk"); }
+  runas (Ada) {
+    AnswerAgentQuestion(AgentHelp.Single(), "Yes, juice.");
+    GoOn(first);
+    // The waiting work went on — and to its end — told what it was told when it started: nothing more.
+    var receipt = AgentTask.Single(t => t.Id == first);
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Equal(0, receipt.InstructionSet);
+    Assert.Equal("2|", ToldIn("first, turn 0"));
+    Assert.Equal("2|", ToldIn("first, turn 1"));
+    Assert.Equal("It ran before anybody had taught Clerk anything. Since then 1 has been made active that it had not been sent.", InstructionsOf(receipt).Words);
+
+    // Work that starts now is sent it.
+    ScriptedAnswer.Stub((model, request) => { NoteTold(request, "second"); return Says.HandBack(new Grade { Score = 8 }); });
+    var second = Settle(Crate.Single(c => c.Code == "A-1")).Task;
+    Assert.Equal(1, AgentTask.Single(t => t.Id == second).InstructionSet);
+  }
+  Assert.Equal("1. " + WeightRule(), LinesIn("second"));
+}
+
+[Test(School)]
+void a_yes_does_not_carry_from_one_instruction_set_to_another() {
+  Guid task;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(Weigh), CrateArg(crate)),
+      Says.Tool("It weighs 8 kg.", Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+      Says.Tool("It still weighs 8 kg, and I am to say the weight.", Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "8 kg: short.", Short = true }));
+    ScriptedAnswer.Stub((model, request) => {
+      NoteTold(request, "turn " + request.Messages.Count(m => m.Role == "assistant").ToString());
+      return script.Answer(model, request);
+    });
+    // The clerk proposes to flag the crate, under the set it is on: nobody has taught it anything.
+    task = Settle(crate).Task;
+    var proposal = AgentProposal.Single();
+    Assert.Equal(0, proposal.InstructionSet);
+    Assert.Equal("", proposal.InstructionSetHash);
+  }
+  // Before Ada decides, the clerk is told something new.
+  runas (Tess) { Teach(WeightRule(), agent: "Packhouse.Clerk"); }
+  runas (Ada) {
+    var proposal = AgentProposal.Single();
+    Assert.NotEqual(proposal.Fingerprint, ProposalFingerprintNow(proposal));
+    // Her yes is to what the clerk proposed when it was told less. It does not run.
+    var decision = ApproveAgentProposal(proposal);
+    Assert.Equal(ProposalStatus.Stale, decision.Status);
+    Assert.Equal("What Clerk is told has changed since it proposed this, so it was not done. Clerk is looking again, with what it is told now.", decision.Said);
+    Assert.Equal("", Crate.Single(c => c.Code == "A-2").Flag);
+    GoOn(task);
+
+    // The work took up what the clerk is told now — the one time work under way does — and proposed again under it.
+    Assert.Equal("2|", ToldIn("turn 1"));
+    Assert.Equal("1. " + WeightRule(), LinesIn("turn 2"));
+    Assert.Contains("FlagCrate was not run: What Clerk is told has changed since it proposed this. Its instructions changed while it waited: "
+      + "it started under instruction set 0 and goes on under set 1, sent 1 instruction.", Trajectory.Said(task));
+    var again = AgentProposal.Single(p => p.Status == ProposalStatus.Waiting);
+    Assert.Equal(1, again.InstructionSet);
+    Assert.Equal(InstructionSetHashNow("Packhouse.Clerk"), again.InstructionSetHash);
+    Assert.Equal(again.Fingerprint, ProposalFingerprintNow(again));
+
+    // This yes is to what it proposes now: it runs, as her.
+    Assert.Equal(ProposalStatus.Done, ApproveAgentProposal(again).Status);
+    Assert.Equal("short", Crate.Single(c => c.Code == "A-2").Flag);
+    GoOn(task);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single(t => t.Id == task).Status);
+    Assert.True(VerifyTrace(AgentTask.Single(t => t.Id == task)).Intact);
+  }
+}
+
+// ── whether it helped ───────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void whether_an_instruction_helped_is_counted() {
+  Guid rule;
+  runas (Ada) {
+    var correction = Correct(GradeNoting("A-2", "before"));
+    rule = Propose(correction.Id, ShortRule()).Id;
+    UnitOfWork.Commit();
+  }
+  runas (Tess) { ActivateAgentInstruction(AgentInstruction.Single(i => i.Id == rule)); UnitOfWork.Commit(); }
+  runas (Ada) {
+    // Three pieces of work are sent it. One is corrected again — for the very thing the instruction says.
+    GradeNoting("A-1", "one");
+    GradeNoting("A-1", "two");
+    var third = GradeNoting("A-2", "three");
+    CorrectAgentWork(AgentTask.Single(t => t.Id == third), new Correction {
+      Wrong = "It gave a short crate a 7 again.", Right = "A 4 at most.", Because = "It had been told.", Despite = rule,
+    });
+    UnitOfWork.Commit();
+  }
+  // The lead, who reads every run: drawn from one correction; three pieces of work since; one of them corrected,
+  // and that correction names this instruction as the one not followed.
+  runas (Dana) {
+    var effect = EffectOf(AgentInstruction.Single(i => i.Id == rule));
+    Assert.Equal(1, effect.DrawnFrom);
+    Assert.Equal(3, effect.WorkSince);
+    Assert.Equal(1, effect.CorrectedSince);
+    Assert.Equal(1, effect.NotFollowed);
+    Assert.NotNull(effect.Since);
+  }
+  // Tess teaches and does not supervise: whoever teaches reads the agents' work, so she counts what the lead counts.
+  runas (Tess) {
+    var effect = EffectOf(AgentInstruction.Single(i => i.Id == rule));
+    Assert.Equal(1, effect.CorrectedSince);
+    Assert.Equal(1, effect.NotFollowed);
+    Assert.Equal(3, effect.WorkSince);
+  }
+}
+
+// ── a model words one ───────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void a_model_words_an_instruction_from_corrections_and_it_is_only_proposed() {
+  runas (Ada) {
+    Correct(GradeNoting("A-2", "one"));
+    Correct(GradeNoting("A-2", "two"));
+    UnitOfWork.Commit();
+  }
+  runas (Dana) {
+    ScriptedAnswer.Stub((model, request) => {
+      new Heard { What = "drafting", About = Scripted.Asked(request) };
+      return Scripted.Text("{\"Guidance\":\"Grade a crate under 10 kg 4 or lower.\",\"Why\":\"A short crate cannot be sold as a full one.\"}");
+    });
+    var drafted = DraftFrom(CorrectionsOfAgent(TheInspector));
+    UnitOfWork.Commit();
+
+    // The model was given the corrections, and nothing else of the work.
+    var asked = Heard.Single(h => h.What == "drafting").About;
+    Assert.Contains("Correction 1\nWhat was wrong: It gave a short crate a 7.", asked);
+    Assert.Contains("Correction 2", asked);
+    // What it worded is proposed, with the model named and what it was drawn from — and nothing more.
+    Assert.Equal(InstructionState.Proposed, drafted.State);
+    Assert.Equal("Grade a crate under 10 kg 4 or lower.", drafted.Guidance);
+    Assert.Equal("a model", drafted.DraftedBy);
+    Assert.Equal(2, drafted.DrawnFrom);
+    Assert.Equal(TheGrading, drafted.Skill);
+    Assert.Equal(Dana.Id, drafted.ProposedBy!.Id);
+    Assert.Equal(2, SourcesOf(drafted).Count);
+    // The call is on the meter, charged to the inspector.
+    Assert.Equal(1, ModelCall.Count(c => c.Purpose == "draft-instruction"));
+  }
+  runas (Ada) { GradeNoting("A-1", "after the draft"); }
+  Assert.Equal("2|", ToldIn("after the draft"));
+}
+
+// ── who reads what ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void what_an_agent_is_told_is_read_by_those_it_is_for_and_what_is_proposed_by_fewer() {
+  Guid proposed;
+  runas (Ada) {
+    proposed = Propose(Correct(GradeNoting("A-2", "one")).Id, "Never grade above 8.").Id;
+    UnitOfWork.Commit();
+  }
+  runas (Tess) {
+    Teach(WeightRule());
+    Teach(OrganicRule(), forPerson: Ada.Id);
+    Assert.Equal(3, InstructionsOfAgent(TheInspector).Count);
+  }
+  // Ada reads what the inspector is told for her work, and what she proposed herself.
+  runas (Ada) { Assert.Equal(3, InstructionsOfAgent(TheInspector).Count); }
+  // Ben reads what it is told for anybody's work — not what is for Ada, and not what is only proposed.
+  runas (Ben) {
+    Assert.Equal(WeightRule(), InstructionsOfAgent(TheInspector).Single().Guidance);
+    // That the set changed, and when, he can see; who changed it and why is for those in charge.
+    var sets = InstructionSetsOf(TheInspector);
+    Assert.Equal(2, sets.Count);
+    Assert.Null(sets[0].By);
+  }
+  runas (Dana) { Assert.Equal(Tess.Id, InstructionSetsOf(TheInspector)[0].By!.Id); }
+}
+
+// ── erasing ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void what_was_taught_can_be_erased_and_the_record_of_each_change_stays() {
+  Guid task;
+  Guid rule;
+  runas (Ada) {
+    task = GradeNoting("A-2", "before");
+    rule = Propose(Correct(task).Id, ShortRule()).Id;
+    UnitOfWork.Commit();
+  }
+  runas (Tess) {
+    ActivateAgentInstruction(AgentInstruction.Single(i => i.Id == rule), "Agreed.");
+    UnitOfWork.Commit();
+    // Teaching is not erasing.
+    Assert.Denied(() => EraseAgentInstruction(AgentInstruction.Single(i => i.Id == rule), "No."));
+    Assert.Denied(() => EraseAgentCorrection(AgentCorrection.Single(), "No."));
+  }
+  runas (Rita) {
+    // The correction's words go; that the work was corrected, by whom and how much it mattered stay.
+    EraseAgentCorrection(AgentCorrection.Single(), "Asked for by the grower.");
+    UnitOfWork.Commit();
+    var correction = AgentCorrection.Single();
+    Assert.Equal("Erased.", correction.Wrong);
+    Assert.Equal("Erased.", correction.Because);
+    Assert.NotNull(correction.ErasedAt);
+    Assert.Equal(CorrectionSeverity.Mistake, correction.Severity);
+
+    // An active instruction that is erased is taken out of use first: the agent's next set, made by nobody.
+    EraseAgentInstruction(AgentInstruction.Single(i => i.Id == rule), "Asked for by the grower.");
+    UnitOfWork.Commit();
+    var erased = AgentInstruction.Single(i => i.Id == rule);
+    Assert.Equal(InstructionState.Retired, erased.State);
+    Assert.Equal("Erased.", erased.Guidance);
+    Assert.Null(erased.ProposedBy);
+    var sets = InstructionSetsOf(TheInspector);
+    Assert.Equal(2, sets.Count);
+    Assert.Equal(InstructionChange.Erased, sets[0].Change);
+    Assert.Null(sets[0].By);
+    Assert.Equal(0, sets[0].Count);
+    // The set it was in still says what it was: its number, its member and its hash.
+    Assert.Equal(rule.ToString(), sets[1].Members);
+    Assert.NotEqual("", sets[1].Hash);
+
+    // Whoever taught is taken off what they taught; what was decided stays.
+    // (Two records: the instruction she read and made active, and the set that made.)
+    Assert.Equal(2, ForgetWhoTaughtAgents(Tess));
+    UnitOfWork.Commit();
+    Assert.Null(InstructionSetsOf(TheInspector)[1].By);
+    Assert.Equal("Agreed.", InstructionSetsOf(TheInspector)[1].Why);
+
+    // The work's own record can be deleted when its time is up: the correction outlives it, without the work.
+    Assert.Equal(1, ForgetAgentWork(AgentTask.Single(t => t.Id == task)));
+    UnitOfWork.Commit();
+    Assert.Null(AgentCorrection.Single().Task);
+    Assert.Equal("Erased.", AgentCorrection.Single().Right);
+  }
+  // Nothing of it reaches a model, and an erased instruction cannot be brought back by a rollback.
+  runas (Ada) { GradeNoting("A-1", "after"); }
+  Assert.Equal("2|", ToldIn("after"));
+  runas (Tess) {
+    var refused = Assert.Throws<AgentRefused>(() => RollBackAgentInstructions(TheInspector, 1, "Bring it back."));
+    Assert.Contains("has since been erased", refused.Message);
+  }
+}
+
+/// Taking an active instruction out of use WITHOUT a teacher is for whoever erases the agents' records — what a
+/// privacy request's own run does — and for nobody else: not whoever teaches, not whoever supervises. Positive
+/// control: for the records clerk it is taken out of use, as the agent's next instruction set, made by nobody.
+[Test(School)]
+void an_instruction_is_withheld_only_by_whoever_erases_the_agents_records() {
+  Guid rule = Guid.Empty;
+  runas (Tess) { rule = Teach(ShortRule()).Id; UnitOfWork.Commit(); }
+  runas (Tess) { Assert.Denied(() => WithholdAgentInstruction(AgentInstruction.Single(i => i.Id == rule), "I changed my mind.")); }
+  runas (Dana) { Assert.Denied(() => WithholdAgentInstruction(AgentInstruction.Single(i => i.Id == rule), "It is the lead who says.")); }
+  runas (Tess) { Assert.Equal(InstructionState.Active, AgentInstruction.Single(i => i.Id == rule).State); }
+  runas (Rita) {
+    WithholdAgentInstruction(AgentInstruction.Single(i => i.Id == rule), "Kept out of use at the request of the person it is for.");
+    UnitOfWork.Commit();
+  }
+  runas (Tess) {
+    var withheld = AgentInstruction.Single(i => i.Id == rule);
+    Assert.Equal(InstructionState.Retired, withheld.State);
+    Assert.StartsWith("Withheld: Kept out of use", withheld.RetiredWhy);
+    Assert.Equal(2, InstructionSetOf(TheInspector));
+  }
+}

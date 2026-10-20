@@ -1,0 +1,176 @@
+// Osysharp.Agents — an agent's work as a step of a process: the receipt says which run of which workflow gave it the
+// work, and in which state; every model call of the work is charged to that workflow and that run, also when the
+// work goes on days later in a run of its own; a budget for each run of the process holds the work; and a process
+// that is stopped while it waits calls the work off.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+[Test(Yard)]
+void work_given_in_a_process_says_which_run_it_is_a_step_of() {
+  Guid crateId = Guid.Empty;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    crateId = crate.Id;
+    var script = AgentScript.Of(Says.Tool(Actions.Of(FlagCrate), FlagArgs(crate, "sound")), Says.HandBack(new Grade { Score = 8 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Workflow.Run(crate);
+    Workflow.Settle(crate);
+    Assert.Equal(CrateStage.Accepted, Crate.Single(c => c.Code == "A-1").Stage);
+    // The same skill given from a plain function is a step of nothing.
+    Assert.True(Inspect(Crate.Single(c => c.Code == "A-2")).Done);
+  }
+  runas (Dana) {
+    var step = AgentTask.Single(t => t.About == "Intake of A-1");
+    Assert.NotNull(step.Run);
+    Assert.Equal("Intake", step.RunWorkflow);
+    Assert.Equal("Arrived", step.RunState);
+    Assert.Equal(crateId, step.RunItem);
+    Assert.Null(step.RunStarter);
+    Assert.Equal(1, step.RunStep);
+    var plain = AgentTask.Single(t => t.About != "Intake of A-1");
+    Assert.Null(plain.Run);
+    Assert.Equal("", plain.RunWorkflow);
+    Assert.Null(plain.RunItem);
+
+    // Its model calls are charged to the workflow and to that run; the plain work's are not.
+    var scope = RunScope("Intake", step.Run!);
+    var inRun = ModelCall.Where(c => c.Scopes.Contains("task:" + step.Id.ToString())).ToList();
+    Assert.Equal(2, inRun.Count);
+    foreach (var call in inRun) {
+      Assert.Contains("workflow:Intake", call.Scopes.Split("\n"));
+      Assert.Contains(scope, call.Scopes.Split("\n"));
+    }
+    foreach (var call in ModelCall.Where(c => c.Scopes.Contains("task:" + plain.Id.ToString())).ToList()) {
+      Assert.False(call.Scopes.Contains("workflow:"));
+    }
+    // What the run cost is what its step's receipt says.
+    Assert.Equal(step.SpentMicros / 1000000m, SpentOn(scope));
+  }
+}
+
+[Test(Yard)]
+void work_that_goes_on_after_a_person_decided_is_still_charged_to_its_process() {
+  Guid claim = Guid.Empty;
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short: the claim stands.", Short = true }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    OpenClaim(crate);
+    claim = Claim.Single().Id;
+    Workflow.Settle(Claim.Single());
+    Assert.Equal(ClaimStage.Open, Claim.Single().Stage);
+  }
+  runas (Dana) {
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Waiting, receipt.Status);
+    Assert.Equal("ClaimFlow", receipt.RunWorkflow);
+    Assert.Equal("Open", receipt.RunState);
+    Assert.Equal(claim, receipt.RunItem);
+    Assert.Equal(ProposalStatus.Done, ApproveAgentProposal(AgentProposal.Single()).Status);
+    // It goes on in the run of its own wait — and is charged where it was started.
+    GoOn(receipt.Id);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+    Workflow.Settle(AgentWorkWait.Single());
+  }
+  runas (Ada) {
+    Workflow.Settle(Claim.Single());
+    Assert.Equal(ClaimStage.Settled, Claim.Single().Stage);
+  }
+  runas (Dana) {
+    var receipt = AgentTask.Single();
+    var run = Claim.Single().Run;
+    Assert.Equal(run, receipt.Run);
+    var calls = ModelCall.OrderBy(c => c.At).ToList();
+    Assert.Equal(2, calls.Count);
+    foreach (var call in calls) {
+      var scopes = call.Scopes.Split("\n");
+      Assert.Contains("workflow:ClaimFlow", scopes);
+      Assert.Contains(RunScope("ClaimFlow", run!), scopes);
+      // …and to no other run: not the wait's, not the one the caller parked on.
+      Assert.Equal(1, scopes.Count(s => s.StartsWith("run.")));
+      Assert.Equal(1, scopes.Count(s => s.StartsWith("workflow:")));
+    }
+    Assert.Equal(receipt.SpentMicros / 1000000m, SpentOn(RunScope("ClaimFlow", run!)));
+  }
+}
+
+[Test(Yard)]
+void a_budget_for_each_run_of_a_process_stops_the_work_and_the_process_handles_it() {
+  // Each intake may spend 0.8 cents. The inspector's first answer costs 0.4 (1000 in, 600 out); a second call would
+  // hold another 0.5 before it left, and there is no room for it.
+  runas (Dana) { SetBudget(RunKind("Intake"), "", LlmBudgetWindow.Total, 0.008m); UnitOfWork.Commit(); }
+  runas (Ada) {
+    var a1 = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(Weigh), CrateArg(a1), 1000, 600),
+      Says.HandBack(new Grade { Score = 9 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Workflow.Run(a1);
+    Workflow.Settle(a1);
+    // The step answered "stopped", and the process went where it goes when the grade never came.
+    Assert.Equal(CrateStage.Rejected, Crate.Single(c => c.Code == "A-1").Stage);
+  }
+  runas (Dana) {
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Stopped, receipt.Status);
+    Assert.StartsWith("Its money ran out: There is no room left in the run.Intake budget for " + receipt.Run!.ToString(), receipt.Outcome);
+    Assert.Equal(1, receipt.ModelCalls);
+    Assert.Equal(4000, receipt.SpentMicros);
+    Assert.True(VerifyTrace(receipt).Intact);
+  }
+  // Another crate's intake is another run, with room of its own.
+  runas (Ada) {
+    var b1 = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(Says.HandBack(new Grade { Score = 7 }, 1000, 600));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Workflow.Run(b1);
+    Workflow.Settle(b1);
+    Assert.Equal(CrateStage.Accepted, Crate.Single(c => c.Code == "A-2").Stage);
+  }
+}
+
+[Test(Yard)]
+void stopping_the_process_calls_off_the_work_it_was_waiting_for() {
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-2");
+    var script = AgentScript.Of(
+      Says.Tool("It is short.", Actions.Of(FlagCrate), FlagArgs(crate, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short." }));
+    ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return script.Answer(model, request); });
+    OpenClaim(crate);
+    Workflow.Settle(Claim.Single());
+  }
+  runas (Dana) {
+    Assert.Equal(AgentTaskStatus.Waiting, AgentTask.Single().Status);
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+  }
+  // The grower takes the claim back while the clerk's proposal waits for the lead.
+  runas (Ada) {
+    WithdrawClaim(Claim.Single());
+    Workflow.Settle(Claim.Single());
+    Assert.Equal(ClaimStage.Withdrawn, Claim.Single().Stage);
+  }
+  Background.Settle();
+  runas (Dana) {
+    Workflow.Settle(AgentWorkWait.Single());
+    Assert.Equal(AgentWorkWaitStatus.CalledOff, AgentWorkWait.Single().Status);
+    // The app is told that nobody waits for the work any more — and the kit calls it off.
+    Assert.Equal(1, Heard.Count(h => h.What == "no longer awaited"));
+    GoOn(AgentTask.Single().Id);
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Cancelled, receipt.Status);
+    Assert.Equal("It was called off: The process that was waiting for it was stopped.", receipt.Outcome);
+    // Nothing more was asked of a model, the proposal can no longer be approved, and nothing it proposed was done.
+    Assert.Equal(1, Heard.Count(h => h.What == "asked"));
+    Assert.Equal(ProposalStatus.Withdrawn, AgentProposal.Single().Status);
+    Assert.Throws<AgentRefused>(() => ApproveAgentProposal(AgentProposal.Single()));
+    Assert.Equal("", Crate.Single(c => c.Code == "A-2").Flag);
+    Assert.True(VerifyTrace(receipt).Intact);
+  }
+}

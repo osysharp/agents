@@ -1,0 +1,332 @@
+// Waiting on a person — how a piece of work stops where it stands, costs nothing while it waits, and goes on from
+// the same point when the person has decided or answered, a minute or a month later.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+
+/// Where one wait stands.
+public enum AgentWaitStatus { Waiting, Over }
+
+/// ⭐ ONE WAIT: a piece of work stopped on a person — a proposal to decide, a question to answer. Its own small run
+/// goes on with the work when the wait is over; nothing runs and no model is asked while it lasts.
+public entity AgentWait {
+  [Required, Immutable, Index] AgentTask Task;
+  /// What it waits on: a proposal, a question — or the work it handed on (`OnWork`).
+  [Immutable] AgentProposal? Proposal;
+  [Immutable] AgentHelp? Question;
+  [Immutable] bool OnWork = false;
+  [Immutable] DateTime Since = DateTime.UtcNow;
+  AgentWaitStatus Status;                               // no default — AgentWaitFlow owns it
+
+  security {
+    allow read when UsesAgents where Task.Requester == user || Task.StartedBy == user;
+    allow read when SupervisesAgents || AuditsAgents || DecidesAgentProposals;
+    // Whoever the wait is on reads it: deciding the proposal, or answering the question, is what tells the wait —
+    // and a wait its decider cannot see is never told, so the work would stay stopped on an answer it has.
+    allow read when IsAuthenticated where Proposal.DecideBy == user || Question.AskedPerson == user;
+    allow create when UsesAgents;
+    deny create except via ParkAgentTask;
+    deny update;
+    allow delete when ErasesAgentRecords;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+/// A wait's own run. It holds no state of the work — that is on the receipt — and decides nothing from being raised:
+/// its arm looks at what is stored, and goes on only when the wait really is over.
+public workflow AgentWaitFlow {
+  Tracks    = AgentWait.Status;
+  Autostart = true;
+  Initial   = Waiting;
+
+  event Wake();
+
+  state Waiting {
+    // Decided before the wait was there to hear of it: it looks once as it starts.
+    enter {
+      if (WaitIsOver(this.Item)) {
+        ContinueAgentWork(this.Item);
+        goto Over;
+      }
+    }
+    on Wake {
+      when (WaitIsOver(this.Item)) {
+        ContinueAgentWork(this.Item);
+        goto Over;
+      }
+      default { }
+    }
+  }
+  terminal success Over { }
+}
+
+/// Whether what a wait was on has been decided or answered — or the work has been called off meanwhile.
+bool WaitIsOver(AgentWait wait) {
+  if (wait.Task.StopAsked) { return true; }
+  // Work it handed on: over when every piece has ended.
+  if (wait.OnWork) { return !AgentTask.Any(t => t.Parent == wait.Task && (t.Status == AgentTaskStatus.Working || t.Status == AgentTaskStatus.Waiting)); }
+  if (wait.Proposal != null) { return wait.Proposal!.Status != ProposalStatus.Waiting; }
+  if (wait.Question != null) { return wait.Question!.Status != HelpStatus.Waiting; }
+  return true;
+}
+
+/// Tell the wait a piece of work is stopped on that something happened. Safe to say at any time, by anybody: the
+/// wait looks for itself.
+void WakeAgentWork(Guid task) {
+  UnitOfWork.Commit();
+  foreach (var wait in AgentWait.Where(w => w.Task.Id == task && w.Status == AgentWaitStatus.Waiting).Take(5).ToList()) {
+    AgentWaitFlow.RaiseWake(wait);
+  }
+}
+
+/// What a piece of work is stopped on, and everything it needs to go on: kept on the receipt, written and read only
+/// by this package.
+public entity AgentTaskParking {
+  [Required, Immutable, Index] AgentTask Task;
+  /// The work as it stood, as JSON of `AgentRun`: the conversation so far, the tools still to answer.
+  [Classification(Personal.Content)] string State = "";
+  DateTime At = DateTime.UtcNow;
+
+  security {
+    allow read, create, update, delete when UsesAgents where Task.Requester == user || Task.StartedBy == user;
+    allow read, create, update, delete when SupervisesAgents;
+    allow delete when ErasesAgentRecords;
+    deny create except via ParkAgentTask;
+    deny update except via ParkAgentTask;
+    deny delete except via UnparkAgentTask, ForgetAgentWork;
+  }
+}
+
+/// Stop the work where it stands: its state is kept, the receipt says it is waiting and on what, and a wait is made.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal void ParkAgentTask(Guid task, string stateJson, string waitingOn, Guid? proposal, Guid? question, bool onWork = false) {
+  var t = AgentTask.Single(x => x.Id == task);
+  var parking = AgentTaskParking.FirstOrDefault(p => p.Task == t);
+  if (parking == null) { new AgentTaskParking { Task = t, State = stateJson }; }
+  else { parking!.State = stateJson; parking!.At = DateTime.UtcNow; }
+  MarkAgentTaskWaiting(task, waitingOn);
+  new AgentWait {
+    Task = t, Proposal = proposal == null ? null : AgentProposal.FirstOrDefault(p => p.Id == proposal),
+    Question = question == null ? null : AgentHelp.FirstOrDefault(h => h.Id == question), OnWork = onWork,
+  };
+  Raise(new AgentTaskWaiting { Task = t, On = waitingOn });
+}
+
+/// Take the kept state of a piece of work, for going on with it.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal string UnparkAgentTask(Guid task) {
+  var t = AgentTask.Single(x => x.Id == task);
+  var parking = AgentTaskParking.FirstOrDefault(p => p.Task == t);
+  if (parking == null) { return ""; }
+  var state = parking!.State;
+  parking!.Delete();
+  MarkAgentTaskWorking(task);
+  return state;
+}
+
+/// ⭐ GO ON WITH A PIECE OF WORK its wait is over for: its state is taken back, what the person decided or answered
+/// is given to the model as the answer of the tool it was waiting on, and the loop runs on — to its end, or to the
+/// next thing it must wait for.
+void ContinueAgentWork(AgentWait wait) {
+  var taskId = wait.Task.Id;
+  var stateJson = UnparkAgentTask(taskId);
+  if (stateJson == "") { return; }
+  var run = JsonSerializer.Deserialize<AgentRun>(stateJson);
+  run.Status = AgentTaskStatus.Working;
+  var definition = Definition(run.Agent);
+  var skill = SkillOfRun(definition, run);
+
+  // Called off while it waited: nothing more is asked of anybody.
+  var called = StopAskedOf(taskId);
+  if (called != null) {
+    if (wait.Proposal != null && wait.Proposal!.Status == ProposalStatus.Waiting) { WithdrawProposal(wait.Proposal!.Id); }
+    // A question nobody has answered is closed with the work: nobody is left to hear the answer.
+    if (wait.Question != null && wait.Question!.Status == HelpStatus.Waiting) {
+      CloseAgentQuestion(wait.Question!.Id, HelpStatus.Unavailable, "The work it belonged to was called off.", null);
+    }
+    End(run, AgentTaskStatus.Cancelled, called!);
+    return;
+  }
+  // The work it handed on has come back: each piece answers the tool call that handed it on.
+  if (wait.OnWork) { GatherWaited(run); }
+
+  var waited = (long)(DurableClock.UtcNow - wait.Since).TotalSeconds;
+  if (wait.Proposal != null) { ProposalDecided(run, wait.Proposal!); }
+  if (wait.Question != null) {
+    Ai.CountHumanWait((int)Math.Min(waited, 2000000000));
+    PersonAnswered(run, wait.Question!, waited);
+  }
+  DriveWork(run, skill);
+}
+
+/// The skill a kept piece of work was on: the one its agent holds by that name, or the free-text job behind `Ask`.
+SkillBase SkillOfRun(Agent definition, AgentRun run) {
+  foreach (var s in definition.Skills) { if (SkillNameOf(s) == run.Skill) { return s; } }
+  return new Conversation();
+}
+
+/// A proposal nobody decided before its work ended.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal void WithdrawProposal(Guid id) {
+  SettleAgentProposal(id, ProposalStatus.Withdrawn, null, "", null, "The work it belonged to was called off.");
+}
+
+/// The proposal a piece of work waited on has been decided: the line of the record, and what the model is told its
+/// tool answered — what it answered when it ran; the reason when the person said no; that things changed when they had.
+void ProposalDecided(AgentRun run, AgentProposal proposal) {
+  var who = proposal.DecidedBy == null ? "Nobody" : NameOfPrincipal(proposal.DecidedBy!);
+  var tool = BareName(proposal.Action);
+  var back = new LlmContentBlock { Kind = LlmBlockKind.ToolResult, ToolUseId = proposal.ToolUseId };
+  var said = "";
+  if (proposal.Status == ProposalStatus.Done) {
+    said = $"{who} approved {tool}, and it ran as them.";
+    back.ResultJson = proposal.ResultJson ?? JsonSerializer.Serialize("Done.");
+    run.Failures = 0;
+  } else if (proposal.Status == ProposalStatus.Rejected) {
+    said = $"{who} said no to {tool}: {Clipped(proposal.Reason, 300)}";
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize("A person decided this is not to be done. Their reason: " + proposal.Reason
+      + " Do not propose the same thing again; take the reason into account.");
+  } else if (proposal.Status == ProposalStatus.Stale) {
+    said = $"{tool} was not run: {Clipped(proposal.Problem, 300)}" + TakeUpInstructions(run);
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize(proposal.Problem + " Look at how things stand now before you propose anything.");
+  } else {
+    said = $"{who} approved {tool}, and it could not be done: {Clipped(proposal.Problem, 300)}";
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize(proposal.Problem);
+  }
+  Trace(run, new TraceEntry { Kind = TraceKind.Decided, Tool = proposal.Action, Summary = said, PayloadJson = back.ResultJson });
+  if (proposal.Status == ProposalStatus.Done) { SettleAgentTask(run.Task, new AgentTaskUse { ToolCalls = 1 }); }
+  AnswerPending(run, back);
+}
+
+/// The answer of the tool the work was waiting on joins the answers of the turn it belongs to.
+void AnswerPending(AgentRun run, LlmContentBlock back) {
+  if (run.Pending.Count > 0) { run.Pending.RemoveAt(0); }
+  run.Answered.Add(back);
+}
+
+// ── for a caller that can wait ──────────────────────────────────────────────────────────────────────────────────────
+
+/// Where a caller's wait on a piece of work stands.
+public enum AgentWorkWaitStatus { Pending, Released, CalledOff }
+
+/// What a workflow that gave an agent work is parked on while the work waits for a person: one row per piece of
+/// work, whose run the caller starts and the work ends when it has.
+[Unique(Task)]
+public entity AgentWorkWait {
+  [Required, Immutable] AgentTask Task;
+  AgentWorkWaitStatus Status = AgentWorkWaitStatus.Pending;
+  bool Held = false;
+
+  security {
+    allow read when UsesAgents || SupervisesAgents || AuditsAgents;
+    allow create when UsesAgents;
+    deny create except via WorkWaitOf;
+    deny update;
+    allow delete when ErasesAgentRecords;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+public workflow AgentWorkWaitFlow {
+  Tracks    = AgentWorkWait.Status;
+  Autostart = false;
+  Initial   = Pending;
+
+  event Release();
+
+  state Pending {
+    enter {
+      this.Item.Held = true;
+      if (!StillGoing(this.Item.Task)) { goto Released; }
+    }
+    on Release {
+      when (!StillGoing(this.Item.Task)) { goto Released; }
+      default { }
+    }
+    // ⭐ WHOEVER WAITED IS GONE: the process that gave the work was stopped, or moved on without it. Nobody will read
+    // what the work hands back, so the work is called off — its proposal withdrawn, nothing more asked of a model.
+    // Said as an event, so that it is acted on once this run has ended — the work's own end lets go of whoever
+    // waits for it, and that is this run.
+    exit {
+      if (StillGoing(this.Item.Task)) { Raise(new AgentWorkNoLongerAwaited { Task = this.Item.Task }); }
+    }
+  }
+  terminal success Released { }
+  terminal cancel  CalledOff { Message = "nobody is waiting for this work"; }
+}
+
+/// Work nobody waits for any more is called off.
+[On]
+void HearWorkIsNoLongerAwaited(AgentWorkNoLongerAwaited e) {
+  CallOffWorkNobodyAwaits(e.Task, "The process that was waiting for it was stopped.");
+}
+
+/// Call a piece of work off for the app itself — the run that was waiting for it is gone — with everything it
+/// handed on.
+[Server, Authorize(IsTheApp)]
+internal void CallOffWorkNobodyAwaits(AgentTask task, string why) {
+  if (task.Status != AgentTaskStatus.Working && task.Status != AgentTaskStatus.Waiting) { return; }
+  task.StopAsked = true;
+  task.StopWhy = Clipped(why, 300);
+  UnitOfWork.Commit();
+  CallOffWorkUnder(task.Id, "The work it was part of was called off: " + why);
+  if (task.Status == AgentTaskStatus.Waiting) { WakeAgentWork(task.Id); }
+}
+
+bool StillGoing(AgentTask task) { return task.Status == AgentTaskStatus.Working || task.Status == AgentTaskStatus.Waiting; }
+
+/// The row a caller waits on for a piece of work.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal Guid WorkWaitOf(Guid task) {
+  var t = AgentTask.Single(x => x.Id == task);
+  var there = AgentWorkWait.FirstOrDefault(w => w.Task == t);
+  if (there != null) { return there!.Id; }
+  return new AgentWorkWait { Task = t }.Id;
+}
+
+/// Let go whoever waits on a piece of work that has ended.
+void ReleaseWorkWait(Guid task) {
+  foreach (var wait in AgentWorkWait.Where(w => w.Task.Id == task && w.Held && w.Status == AgentWorkWaitStatus.Pending).Take(1).ToList()) {
+    AgentWorkWaitFlow.RaiseRelease(wait);
+  }
+}
+
+/// ⭐ WAIT FOR A PIECE OF WORK THAT IS WAITING ON A PERSON — in a workflow's body, or in anything it calls. The run
+/// parks until the work has ended, however long the person takes, and answers how it ended.
+///
+/// `Do` does this for you inside a workflow: `await agent.Do(skill, input)` there answers the finished work. From a
+/// page or a plain function `Do` answers at once with `Status == Waiting`, and the end is heard as an event
+/// (`AgentTaskFinished`, `AgentTaskFailed`, `AgentTaskStopped`).
+public async Task<AgentTaskStatus> WorkEnds(Guid task) {
+  if (!Workflow.InRun) {
+    throw new AgentRefused("Only a workflow can wait for work that is waiting on a person. From a page or a plain function, hear "
+      + "`AgentTaskFinished` (or `AgentTaskFailed`, `AgentTaskStopped`) with `[On]`, or read the receipt when you look again.");
+  }
+  var id = WorkWaitOf(task);
+  var wait = AgentWorkWait.Single(w => w.Id == id);
+  await Workflow.Run("agent-work", wait);
+  return ReceiptStatus(task);
+}
+
+/// A receipt's status as it is stored now.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal AgentTaskStatus ReceiptStatus(Guid task) { return AgentTask.Single(t => t.Id == task).Status; }
+
+/// What a finished receipt holds, read where it is stored.
+public class ReceiptEnd {
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  public string Outcome = "";
+  public string ResultJson = "";
+  public long SpentMicros = 0;
+}
+
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal ReceiptEnd ReceiptEndOf(Guid task) {
+  var t = AgentTask.Single(x => x.Id == task);
+  return new ReceiptEnd { Status = t.Status, Outcome = t.Outcome, ResultJson = t.Result ?? "", SpentMicros = t.SpentMicros };
+}

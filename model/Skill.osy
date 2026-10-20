@@ -1,0 +1,270 @@
+// Skills — the standing jobs an agent can be given: what goes in, what comes back, how to do it, and with what.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// What every skill says about itself — declare a `Skill<TIn, TOut>`, never this.
+public class SkillBase {
+  /// The job, in a sentence. What a person choosing a skill reads, and what the model is told it is doing.
+  public virtual string Description => "";
+  /// How to do it — the standing instructions, in plain words.
+  public virtual string Instructions => "";
+  /// What it may use: the app's own `[Action]` functions, each named where it is declared — `[Actions.Of(ReadReceipt),
+  /// Actions.Of(FlagLine)]`. An agent can never run anything that is not listed here.
+  public virtual List<ActionInfo> Tools => [];
+  /// What it needs of the model that does it.
+  public virtual ModelNeeds Needs => new ModelNeeds();
+  /// When it stops whether or not it is finished.
+  public virtual StopWhen Stop => new StopWhen();
+  /// The most one piece of this work may spend on models, in US dollars. Null: the agent's, else the app's.
+  public virtual decimal? Budget => null;
+  /// Its version — what a receipt records, so a result can be traced to the instructions that produced it.
+  public virtual string Version => "1";
+  /// What this skill's work may do alone — stricter than the agent's own `May`, never looser. Null: the agent's.
+  public virtual Permits? May => null;
+  /// The version of what a tool would act on, for a proposal: `action` is the tool's full name and `argumentsJson`
+  /// what it would be run with. A person's yes covers this version only — when it reads differently as they decide,
+  /// nothing runs and the agent looks again. "": the skill says nothing, and a yes covers the call as proposed.
+  ///
+  ///     public override string VersionOf(string action, string argumentsJson) => OrderVersionIn(argumentsJson);
+  public virtual string VersionOf(string action, string argumentsJson) { return ""; }
+  /// What an argument's value is called where a person reads a proposal: an id becomes the record's name.
+  /// `argument` is the parameter's name, `value` its value as text. The value itself, until you say it better.
+  ///
+  ///     public override string Names(string action, string argument, string value) =>
+  ///       argument == "order" ? "Order " + Order.Single(o => o.Id == Guid.Parse(value)).Number : value;
+  public virtual string Names(string action, string argument, string value) { return value; }
+  /// How often work that fails is tried again.
+  public virtual RetryRule Retry => new RetryRule();
+  /// ⭐ WHO DECIDES WHAT THIS SKILL PROPOSES, for one tool (`action` is its full name) — when that is not the person
+  /// the work is for. Null: the person the work is for; the agent's sponsor when it is for nobody.
+  ///
+  ///     public override ProposalRoute? DecidedBy(string action) =>
+  ///       action == Actions.Of(RefundOrder).Name ? ProposalRoute.ToQueue("Finance") : null;
+  ///
+  /// A proposal sent somewhere else is NOT decided by the person the work is for: asking an agent for a refund is
+  /// not approving one. It changes who is asked and nothing else — a tool the agent never runs is still never
+  /// proposed, the yes still runs the tool as whoever says it, and whoever the app's `DecidesAgentProposals` admits
+  /// may still decide.
+  public virtual ProposalRoute? DecidedBy(string action) { return null; }
+
+  /// The type it is given and the type it hands back, by full name, and each one's JSON Schema.
+  public virtual string Takes() { return ""; }
+  public virtual string HandsBack() { return ""; }
+  public virtual string TakesSchema() { return ""; }
+  public virtual string HandsBackSchema() { return ""; }
+  /// Whether it hands back a typed value (a class) rather than text.
+  public virtual bool Typed() { return false; }
+  /// What is wrong with a result, given as JSON of the type it hands back — null when nothing is.
+  public virtual string? Problem(string resultJson) { return null; }
+  /// What another agent's model writes to hand this work on, as a JSON Schema, and the brief made from what it wrote
+  /// — see `Skill<TIn, TOut>.Handed`.
+  public virtual string HandedSchema() { return TakesSchema(); }
+  public virtual string BriefHanded(string inputJson) { return inputJson; }
+}
+
+/// Where a proposal is put when a skill sends it somewhere other than the person the work is for.
+public class ProposalRoute {
+  /// A work queue, by its name: the proposal waits there, and whoever works that queue decides it — "refunds go to
+  /// Finance". A queue is how a role with several holders is asked. It needs a kit that puts proposals in people's
+  /// inboxes (`Osysharp.Agents.HumanRequests`); without one it waits for whoever `DecidesAgentProposals` admits.
+  public string Queue = "";
+  /// One person, by their account: the holder of a role the app looks up — its head of finance.
+  public Guid? Person;
+
+  public static ProposalRoute ToQueue(string queue) { return new ProposalRoute { Queue = queue }; }
+  public static ProposalRoute ToPerson(Principal person) { return new ProposalRoute { Person = person.Id }; }
+}
+
+/// How often a piece of work is tried.
+public class RetryRule {
+  /// The most attempts, the first included. Each is a piece of work of its own, with its own receipt and budget,
+  /// started from the beginning. Work that was stopped or called off, or that waited on a person, is not tried again.
+  public int Attempts = 1;
+}
+
+/// ⭐ A JOB WITH A TYPED INPUT AND A TYPED RESULT.
+///
+///     /// Judges one crate of a delivery.
+///     public class GradeCrate : Skill<Crate, Grade> {
+///       public override string Description => "Grade one crate of fruit.";
+///       public override string Instructions => "Weigh it first. Anything under 10 kg is a short crate: flag it.";
+///       public override List<ActionInfo> Tools => [Actions.Of(Weigh), Actions.Of(FlagCrate)];
+///       public override string Brief(Crate c) => $"Crate {c.Code}, from {c.Grower}.";
+///       public override string? Check(Grade g) => g.Score < 0 || g.Score > 10 ? "A score is 0 to 10." : null;
+///     }
+///
+/// `TOut` is a class — the model is held to its schema and its answer is read as one — or `string`, for a job whose
+/// result is prose.
+public class Skill<TIn, TOut> : SkillBase {
+  // What this skill was declared over: each instance carries it.
+  public string InType = typeof(TIn).FullName;
+  public string OutType = typeof(TOut).FullName;
+
+  /// What the model is shown about the input. The input as JSON, until you say it better.
+  public virtual string Brief(TIn input) { return JsonSerializer.Serialize(input); }
+
+  /// What is wrong with a result the model handed back — a sentence it is sent back with — or null when it is good.
+  /// The place for what a schema cannot say: "every refusal names a reason".
+  public virtual string? Check(TOut result) { return null; }
+
+  /// A result, from its JSON.
+  public TOut Read(string json) { return JsonSerializer.Deserialize<TOut>(json); }
+
+  /// ⭐ THE INPUT, WHEN ANOTHER AGENT HANDS THIS WORK ON: `inputJson` is what that agent's model wrote. A class of
+  /// plain values, or text, is read as it stands. A skill that takes one of the app's ROWS says how the row is
+  /// found — the model names it by its id — and says so in `HandedSchema`:
+  ///
+  ///     public override string HandedSchema() => HandOn.ById("The crate to grade.");
+  ///     public override Crate Handed(string inputJson) {
+  ///       var id = HandOn.IdIn(inputJson);
+  ///       return Crate.Single(c => c.Id == id);
+  ///     }
+  ///
+  /// It runs as the agent that would do the work, and never past the person the work is for: a row they may not
+  /// read is not found, and the work is not handed on.
+  public virtual TIn Handed(string inputJson) {
+    try {
+      return JsonSerializer.Deserialize<TIn>(inputJson);
+    } catch (Exception e) {
+      // A row is not read from JSON: the skill has to say how it is found.
+      if (!e.Message.Contains("is an entity")) { throw; }
+      throw new ValidationException($"{BareName(this.GetType().FullName)} takes a row ({BareName(InType)}), and does not say how the row is found when "
+        + "another agent hands the work on. Override `Handed` and `HandedSchema` on the skill — see `HandOn.ById`.");
+    }
+  }
+
+  public override string BriefHanded(string inputJson) { return Brief(Handed(inputJson)); }
+
+  public override string Takes() { return InType; }
+  public override string HandsBack() { return OutType; }
+  public override string TakesSchema() { return Json.SchemaOf<TIn>(); }
+  public override string HandsBackSchema() { return Json.SchemaOf<TOut>(); }
+  public override bool Typed() { return OutType != "System.String"; }
+
+  public override string? Problem(string resultJson) {
+    TOut result;
+    try {
+      result = Read(resultJson);
+    } catch (Exception e) {
+      return "That is not a result of the shape asked for: " + e.Message;
+    }
+    return Check(result);
+  }
+}
+
+// ── the catalogue ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One tool of a skill, as a person choosing reads it.
+public class SkillToolInfo {
+  /// The action it is, by name, and its label and description.
+  public string Action = "";
+  public string Label = "";
+  public string Description = "";
+  /// What running it does, proved by the compiler: it only reads; it changes the app's data; it sends something to
+  /// somebody; it spends.
+  public bool ReadsOnly = false;
+  public bool Changes = false;
+  public bool Sends = false;
+  public bool Spends = false;
+  /// The JSON Schema of its arguments.
+  public string ParametersSchema = "";
+  /// What the agent's declaration says of it for this skill: it runs it alone, proposes it to a person first (or
+  /// every time), or never does.
+  public Leave Leave = Leave.Alone;
+  /// The work queue its proposals are put to, when the skill sends them to one (`DecidedBy`). "": to the person the
+  /// work is for, or to one person the skill names.
+  public string DecidedByQueue = "";
+  /// The skill sends its proposals to one person it names, rather than to the person the work is for.
+  public bool DecidedByOnePerson = false;
+}
+
+/// One skill an agent of this app holds.
+public class SkillInfo {
+  /// The agent that holds it and the skill itself, each by its class's full name.
+  public string Agent = "";
+  public string Skill = "";
+  /// The skill's own name, in words — "Grade crate".
+  public string Label = "";
+  public string Description = "";
+  public string Version = "";
+  /// What it takes and what it hands back: the type's full name and its JSON Schema.
+  public string Takes = "";
+  public string TakesSchema = "";
+  public string HandsBack = "";
+  public string HandsBackSchema = "";
+  /// What it may use.
+  public List<SkillToolInfo> Tools = [];
+}
+
+/// ⭐ EVERY SKILL THE APP'S AGENTS HOLD — what a picker, a canvas and a "run this" button list.
+///
+///     foreach (var s in Skills.Catalog()) { … s.Label, s.Description, s.TakesSchema, s.Tools … }
+public class Skills {
+  /// Every skill of every agent in `app.Agents`, in the order they are declared.
+  public static List<SkillInfo> Catalog() {
+    List<SkillInfo> all = [];
+    foreach (var agent in App.Setting<AgentsSetup>().Agents) {
+      var agentName = AgentNameOf(agent);
+      foreach (var skill in agent.Skills) { all.Add(Describe(agent, agentName, skill)); }
+    }
+    return all;
+  }
+
+  /// The skills one agent holds.
+  public static List<SkillInfo> Of(string agent) {
+    List<SkillInfo> held = [];
+    foreach (var s in Catalog()) { if (s.Agent == agent) { held.Add(s); } }
+    return held;
+  }
+
+  /// One skill, by the full names of the agent and the skill. Null when the agent holds no such skill.
+  public static SkillInfo? Find(string agent, string skill) {
+    foreach (var s in Catalog()) { if (s.Agent == agent && s.Skill == skill) { return s; } }
+    return null;
+  }
+
+  static SkillInfo Describe(Agent agent, string agentName, SkillBase skill) {
+    var name = SkillNameOf(skill);
+    var info = new SkillInfo {
+      Agent = agentName, Skill = name, Label = Words(BareName(name)), Description = skill.Description,
+      Version = skill.Version, Takes = skill.Takes(), TakesSchema = skill.TakesSchema(), HandsBack = skill.HandsBack(),
+      HandsBackSchema = skill.HandsBackSchema(),
+    };
+    foreach (var tool in skill.Tools) {
+      // Where what it proposes is put — said only of a tool that is proposed. A skill that names a person looks them
+      // up; when that fails here, the page still says the skill names somebody.
+      var leave = DeclaredLeave(agent, name, tool) ?? Leave.Never;
+      ProposalRoute? route = null;
+      var named = false;
+      if (leave == Leave.Propose || leave == Leave.ProposeEveryTime) {
+        try { route = skill.DecidedBy(tool.Name); } catch (Exception e) { named = true; }
+      }
+      info.Tools.Add(new SkillToolInfo {
+        Action = tool.Name, Label = tool.Label, Description = tool.Description, ReadsOnly = tool.Query,
+        Changes = tool.Effects.Creates.Count > 0 || tool.Effects.Modifies.Count > 0 || tool.Effects.Deletes.Count > 0,
+        Sends = tool.Effects.Sends, Spends = tool.Effects.Spends, ParametersSchema = tool.ParametersSchema,
+        Leave = leave,
+        DecidedByQueue = route == null ? "" : route!.Queue, DecidedByOnePerson = named || (route != null && route!.Queue == "" && route!.Person != null),
+      });
+    }
+    return info;
+  }
+}
+
+/// The class an agent IS, by its full name.
+string AgentNameOf(Agent agent) { return agent.GetType().FullName; }
+
+/// The class a skill IS, by its full name.
+string SkillNameOf(SkillBase skill) { return skill.GetType().FullName; }
+
+/// A class's name as words: "GradeCrate" → "Grade crate".
+string Words(string name) {
+  var words = "";
+  foreach (var c in name) {
+    if (char.IsUpper(c) && words != "") { words = words + " " + char.ToLower(c); }
+    else { words = words + c; }
+  }
+  return words;
+}

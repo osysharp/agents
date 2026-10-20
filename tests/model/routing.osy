@@ -1,0 +1,35 @@
+// Where the packhouse sends what an agent proposes, when that is not the grower the work is for: a flag is quality
+// control's to approve, and a change of line is the head grader's.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+
+/// The head grader, by the account the packhouse keeps for the role.
+public Person HeadGrader() { return Person.Single(p => p.Email == "gus@packhouse.example"); }
+
+/// Settles one crate for quality control: what it would flag waits in the Quality queue, and where it would send the
+/// crate is the head grader's to say.
+public class SettleForQuality : Skill<Crate, Grade> {
+  public override string Description => "Settle one crate for quality control.";
+  public override List<ActionInfo> Tools => [Actions.Of(Weigh), Actions.Of(FlagCrate), Actions.Of(CondemnCrate), Actions.Of(MoveToLine)];
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+  public override ProposalRoute? DecidedBy(string action) {
+    if (action == Actions.Of(MoveToLine).Name) { return ProposalRoute.ToPerson(HeadGrader()); }
+    return ProposalRoute.ToQueue("Quality");
+  }
+}
+
+/// Keeps watch over quality. It proposes every change, and never condemns a crate — wherever its proposals go.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Warden : Agent {
+  public static Person Principal => new Person { Email = "warden@packhouse.example", DisplayName = "Warden" };
+  public override string Purpose => "You keep watch over the quality of what the packhouse packs.";
+  public override List<SkillBase> Skills => [new SettleForQuality()];
+  public override Permits May => new Permits { Never = [Actions.Of(CondemnCrate)] };
+}
+
+public AgentOutcome<Grade> SettleForQC(Crate crate) {
+  return await Agents.Of<Warden>().Do(new SettleForQuality(), crate, about: "Crate " + crate.Code);
+}

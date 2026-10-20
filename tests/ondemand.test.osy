@@ -1,0 +1,54 @@
+// Osysharp.Agents — a skill run on demand: what a form asks for, from what the skill takes, and the work it starts —
+// for whoever ran it, as any work they give the agent.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Packhouse;
+
+/// ⭐ RUN ON DEMAND: Ada asks the inspector to grade crate A-1 from its page. The form asks for the crate, by what the
+/// skill says of it; what she gives is the skill's input as JSON, and the work is hers — done as the inspector.
+[Test(Yard)]
+[runas(Ada)]
+void a_skill_run_on_demand_asks_for_what_it_takes_and_is_work_for_who_ran_it() {
+  var grade = Skills.Of("Packhouse.Inspector").Single(s => s.Skill == "Packhouse.GradeCrate");
+  var fields = InputFieldsOf(new GradeCrate());
+  Assert.Equal(["id"], fields.Select(f => f.Name).ToList());
+  Assert.Equal("The crate to grade.", fields[0].Label);
+  Assert.True(fields[0].Required);
+  // A skill that takes text asks for the text.
+  var describe = InputFieldsOf(new DescribeDelivery());
+  Assert.Equal("", describe.Single().Name);
+  Assert.Equal("text", describe.Single().Kind);
+
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(Weigh), "{\"crate\":\"" + crate.Id.ToString() + "\"}"),
+    Says.HandBack(new Grade { Score = 8, Finding = "Full weight." }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var input = InputJsonOf(fields, new Dictionary<string, string> { ["id"] = crate.Id.ToString() });
+  var task = RunSkill("Packhouse.Inspector", grade.Skill, input);
+
+  var receipt = AgentTask.Single(t => t.Id == task);
+  Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+  Assert.Equal(Ada.Id, receipt.Requester!.Id);
+  Assert.Equal(Actor.Of<Inspector>().Id, receipt.Actor.Id);
+  Assert.Equal("Grade crate", receipt.About);
+  Assert.Contains("Full weight.", receipt.Result!);
+  // The model was given the brief the skill writes from the crate, as for work given in code.
+  Assert.Contains("Crate A-1. Its id is " + crate.Id.ToString(), Trajectory.Said(task)[0] + string.Join("\n", TraceOf(receipt).Select(l => l.Payload ?? "")));
+}
+
+/// What is not right is said before any work is opened: a member left out, a skill the agent does not hold, a row the
+/// person may not read.
+[Test(Yard)]
+[runas(Ada)]
+void what_cannot_be_run_is_refused_before_any_work_is_opened() {
+  var fields = InputFieldsOf(new GradeCrate());
+  Assert.Throws<ValidationException>(() => InputJsonOf(fields, new Dictionary<string, string>()));
+  Assert.Throws<SkillNotHeld>(() => RunSkill("Packhouse.Inspector", "Packhouse.SettleCrate", "{}"));
+  Assert.Throws<AgentNotListed>(() => RunSkill("Packhouse.Nobody", "Packhouse.GradeCrate", "{}"));
+  Assert.Throws<ValidationException>(() => RunSkill("Packhouse.Inspector", "Packhouse.GradeCrate", "{\"id\":\"" + Guid.NewGuid().ToString() + "\"}"));
+  Assert.Equal(0, AgentTask.Count());
+}

@@ -1,0 +1,805 @@
+// Handing work on — an agent gives a typed piece of its work to another agent, several at once when it can, waits
+// for them however long they take, and goes on with what came back.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// What the name of every tool that hands work on starts with: `hand_to_Checker_CheckPapers`.
+const string HandOnPrefix = "hand_to_";
+
+/// ⭐ ONE PIECE OF WORK AN AGENT MAY HAND ON: a skill of another of the app's agents — or one of its own, done apart
+/// from the work it is in the middle of.
+///
+///     Specialist.Of<Checker>(new CheckPapers())                       // another agent, with its own account and rights
+///     Specialist.Of<Analyst>(new AssessRisk(), budget: 0.05m)         // …held to five cents a piece
+///     Specialist.Helper(new Summarise())                              // the same agent, on a job of its own
+public class Specialist {
+  /// The agent that does it, by its class's full name — "" for a helper: the agent that hands it on — and its account.
+  public string Agent = "";
+  public Principal? Account;
+  /// The job. It must be one the agent holds.
+  public SkillBase Skill;
+  /// The most one piece of this work may spend on models, in US dollars. Null: what the skill and its agent say.
+  /// Whatever it says, a piece of handed-on work never gets more than the work that hands it on has left.
+  public decimal? Budget;
+
+  /// A skill of the agent `T`.
+  public static Specialist Of<T>(SkillBase skill, decimal? budget = null) {
+    return new Specialist { Agent = typeof(T).FullName, Account = Actor.Of<T>(), Skill = skill, Budget = budget };
+  }
+
+  /// A skill of the agent's own, done as a piece of work apart: its own conversation, its own tools, its own budget.
+  public static Specialist Helper(SkillBase skill, decimal? budget = null) {
+    return new Specialist { Skill = skill, Budget = budget };
+  }
+}
+
+/// ⭐ WHAT AN AGENT MAY HAND ON, AND HOW FAR.
+///
+///     public override Delegation Delegates => new Delegation {
+///       To = [Specialist.Of<Checker>(new CheckPapers()), Specialist.Of<Analyst>(new AssessRisk())],
+///       MaxDepth = 2,
+///     };
+///
+/// ⚑ AN AGENT THAT SAYS NOTHING HANDS NOTHING ON. Each piece of work it may hand on is named here, and its model is
+///   offered exactly those — as tools whose input is what the skill takes, and whose answer is what it hands back.
+///   Pieces asked for in the same turn go out together, and their models answer side by side.
+///
+/// ⚑ WORK THAT IS HANDED ON NEVER HOLDS MORE THAN THE WORK THAT HANDED IT ON. It is done by the specialist's own
+///   account, for the same person — nobody else can be named; what any piece of work above it must propose to a person
+///   or never does, it must propose or never does too; and it spends out of what the work above it has left.
+public class Delegation {
+  /// The work it may hand on.
+  public List<Specialist> To = [];
+  /// How many levels of handed-on work may hang under one piece of this agent's work: 1 — the specialists it hands
+  /// to hand nothing on themselves.
+  public int MaxDepth = 3;
+  /// How many pieces one piece of this agent's work may hand on in all.
+  public int MaxPieces = 8;
+}
+
+/// How another agent's model names what it hands on — the pieces a skill that takes a ROW builds its `HandedSchema`
+/// and its `Handed` from.
+public class HandOn {
+  /// The schema of "one row, by its id" — `what` says which, as the model reads it.
+  public static string ById(string what) {
+    return "{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"format\":\"uuid\",\"description\":"
+         + JsonSerializer.Serialize(what) + "}},\"required\":[\"id\"],\"additionalProperties\":false}";
+  }
+
+  /// The id such an input names.
+  public static Guid IdIn(string inputJson) {
+    var values = JsonSerializer.Deserialize<Dictionary<string, Json>>(inputJson);
+    if (!values.ContainsKey("id")) { throw new ValidationException("Name the row by its id: `{\"id\": \"…\"}`."); }
+    return Guid.Parse(values["id"].ToString().Replace("\"", ""));
+  }
+}
+
+/// A piece of work that was handed on and has not come back: kept with the work that waits for it.
+public class HandedOn {
+  /// The model's id for the call that handed it on, so its answer is paired with it.
+  public string ToolUseId = "";
+  public Guid Task;
+  public string Agent = "";
+  public string Skill = "";
+}
+
+/// What a piece of handed-on work is told of the work above it. Made by this package from the work that hands on —
+/// never by a caller.
+class WorkAbove {
+  public Guid Task;
+  public Guid Root;
+  public int Depth = 0;
+  /// Who the work above is for: who this is for.
+  public Guid? Person;
+  /// What the work above is charged to, as its receipt says.
+  public string ChargedTo = "";
+  /// What the work above has left, and the specialist's own share when its declaration names one.
+  public long RoomMicros = 0;
+  public long? BudgetMicros;
+  /// Everything the work above is charged to and held to: this is charged there and held to it as well.
+  public List<string> Scopes = [];
+  public List<LlmLimit> Limits = [];
+  /// The agents above, from the nearest up, by their own names.
+  public List<string> Above = [];
+
+  /// The most this piece may spend: its share, or what its own declaration says — and never more than is left above.
+  public long LimitFor(long own) {
+    var most = BudgetMicros ?? own;
+    return most < RoomMicros ? most : RoomMicros;
+  }
+}
+
+/// One piece of handed-on work while it is being driven.
+class ChildWork {
+  public string ToolUseId = "";
+  public AgentRun Run;
+  public SkillBase Skill;
+  public AgentRef Who;
+  public string Brief = "";
+  public string About = "";
+  public WorkAbove Above;
+}
+
+/// One piece of work above another: the agent and the skill, each by its full name.
+class WorkLevel {
+  public string Agent = "";
+  public string Skill = "";
+}
+
+/// One piece of work an agent may hand on, as a person choosing reads it.
+public class DelegationInfo {
+  /// The agent that hands it on, the agent that does it and the skill, each by its class's full name.
+  public string From = "";
+  public string To = "";
+  public string Skill = "";
+  /// The skill's own name, in words — "Check papers" — and what it is for.
+  public string Label = "";
+  public string Description = "";
+  /// It is one of the agent's own skills, done apart.
+  public bool Helper = false;
+  /// The most a piece may spend, in US dollars, when the declaration names a share.
+  public decimal? Budget;
+  /// What the agent's model writes to hand it on, as a JSON Schema, and what comes back.
+  public string TakesSchema = "";
+  public string HandsBackSchema = "";
+}
+
+/// ⭐ WHAT THE APP'S AGENTS MAY HAND ON — what a picker, a canvas and an inspector list beside `Skills.Catalog()`.
+public class Delegations {
+  /// What one agent may hand on, in the order its class names it. None: it hands nothing on.
+  public static List<DelegationInfo> Of(string agent) {
+    List<DelegationInfo> all = [];
+    var definition = ListedAgent(agent);
+    if (definition == null) { return all; }
+    foreach (var to in definition!.Delegates.To) {
+      var skill = SkillNameOf(to.Skill);
+      all.Add(new DelegationInfo {
+        From = agent, To = to.Agent == "" ? agent : to.Agent, Skill = skill, Label = Words(BareName(skill)),
+        Description = to.Skill.Description, Helper = to.Agent == "", Budget = to.Budget,
+        TakesSchema = to.Skill.HandedSchema(), HandsBackSchema = to.Skill.HandsBackSchema(),
+      });
+    }
+    return all;
+  }
+
+  /// How many levels of handed-on work may hang under a piece of the agent's work. 0: it hands nothing on.
+  public static int DepthOf(string agent) {
+    var definition = ListedAgent(agent);
+    if (definition == null || definition!.Delegates.To.Count == 0) { return 0; }
+    return definition!.Delegates.MaxDepth;
+  }
+}
+
+// ── where a piece of handed-on work stands in its tree ──────────────────────────────────────────────────────────────
+
+/// Put a run under the work that handed it on: one record, the same person, and every limit above it.
+void PlaceUnder(AgentRun run, WorkAbove above) {
+  run.Parent = above.Task;
+  run.Root = above.Root;
+  run.Depth = above.Depth + 1;
+  run.Above = above.Above;
+  // Charged wherever the work above is charged — its own receipt, its agent's day, the case it is part of — and held
+  // to every limit that holds there. What a skill of somebody else's spent is not this skill's.
+  foreach (var scope in above.Scopes) {
+    if (!scope.StartsWith("skill:") && !run.Scopes.Contains(scope)) { run.Scopes.Add(scope); }
+  }
+  foreach (var limit in above.Limits) {
+    var held = false;
+    foreach (var own in run.Limits) { if (own.Scope == limit.Scope && own.Window == limit.Window) { held = true; } }
+    if (!held) { run.Limits.Add(limit); }
+  }
+}
+
+/// The work above a piece of work, from the nearest up — read from its own receipt, where it was written as the
+/// work was opened and cannot be changed. A level with no agent: the receipt could not be read.
+[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+internal List<WorkLevel> LevelsAbove(Guid task) {
+  List<WorkLevel> levels = [];
+  var receipt = AgentTask.FirstOrDefault(t => t.Id == task);
+  if (receipt == null) { levels.Add(new WorkLevel()); return levels; }
+  foreach (var line in receipt!.Lineage.Split("\n")) {
+    if (line.Trim() == "") { continue; }
+    var bar = line.IndexOf("|");
+    levels.Add(new WorkLevel { Agent = bar < 0 ? line : line.Substring(0, bar), Skill = bar < 0 ? "" : line.Substring(bar + 1) });
+  }
+  // A receipt that says it is handed-on work and names nobody above it is not believed.
+  if (receipt!.Depth != levels.Count) { levels.Add(new WorkLevel()); }
+  return levels;
+}
+
+/// The agent at the top of the work a piece of work is part of.
+string TopAgentOf(Guid task) {
+  var top = "";
+  foreach (var level in LevelsAbove(task)) { top = level.Agent; }
+  return top;
+}
+
+/// Through whom a piece of handed-on work asks a person something: "Checker, working for Coordinator". "": it is
+/// the top, and asks for itself.
+string ThroughWhom(AgentRun run) {
+  if (run.Above.Count == 0) { return ""; }
+  return AgentName(run.Agent) + ", working for " + string.Join(", working for ", run.Above);
+}
+
+/// One of the app's agents by name, or null when the app no longer lists it.
+Agent? ListedAgent(string name) {
+  foreach (var agent in App.Setting<AgentsSetup>().Agents) { if (AgentNameOf(agent) == name) { return agent; } }
+  return null;
+}
+
+/// What one piece of work above says of a tool, by what the tool DOES — its agent's `May`, and its skill's when that
+/// is stricter. The tool need not be one of its own.
+Leave LeaveAt(WorkLevel level, ActionInfo tool) {
+  var definition = level.Agent == "" ? null : ListedAgent(level.Agent);
+  // An agent the app no longer lists, or a level that could not be read: nothing is let through on its account.
+  if (definition == null) { return Leave.Never; }
+  var leave = definition!.May.For(tool);
+  foreach (var s in definition!.Skills) {
+    if (SkillNameOf(s) != level.Skill) { continue; }
+    var skills = s.May;
+    if (skills != null) { leave = Stricter(leave, skills!.For(tool)); }
+  }
+  return leave;
+}
+
+/// ⭐ THE GATE OF THE WORK ABOVE. For a piece of work that was handed on: the strictest thing any piece of work above
+/// it says of this tool — or null when all of them would run it alone.
+///
+/// SECURITY-INVARIANT(agents-a-child-never-holds-more-than-its-parent): a tool is run alone only when the agent doing
+/// the work AND every piece of work above it may run a tool that does this alone; what any of them proposes first is
+/// proposed, and what any of them never does is not done — whatever the specialist's own declaration says. Failure
+/// mode: an agent that must ask before it changes anything gets the change made, unasked, by handing the work to an
+/// agent that need not. Guarded by tests/delegation.test.osy `a_child_never_holds_more_than_its_parent`,
+/// `what_any_work_above_never_does_is_never_done_below`.
+///
+/// ⚑ "FROM NOW ON, ALONE" SAID FOR AN AGENT ABOVE COVERS WHAT IT HANDS ON, as it covers what it does itself: a
+///   standing rule a person gave that agent for this tool — for the work it does for the person this work is for, or
+///   for everybody — takes that agent's "propose" out of the gate here. It lifts nothing else: not "never", not
+///   "propose every time", not another person's work, and not the specialist's OWN declaration, which still needs a
+///   rule of its own. Such a rule can only be given for a tool the agent above holds itself (`AllowAlone`). Each
+///   rule that lifted a level is answered in `lifted`, and counted when the tool runs.
+GateVerdict? GateAbove(AgentRun run, ActionInfo tool, List<Guid> lifted) {
+  GateVerdict? strictest = null;
+  foreach (var level in LevelsAbove(run.Task)) {
+    var leave = LeaveAt(level, tool);
+    if (leave == Leave.Propose && level.Agent != "") {
+      var rule = StandingRuleFor(level.Agent, level.Skill, tool.Name, run.Person);
+      if (rule != null) { leave = Leave.Alone; lifted.Add(rule!.Value); }
+    }
+    if (leave == Leave.Alone) { continue; }
+    if (strictest != null && Rank(leave) <= Rank(strictest!.Leave)) { continue; }
+    var who = level.Agent == "" ? "the work above it" : BareName(level.Agent) + ", which handed this work on,";
+    strictest = new GateVerdict {
+      Leave = leave,
+      Why = leave == Leave.Never ? $"{who} never does that"
+          : leave == Leave.ProposeEveryTime ? $"{who} proposes that every time"
+          : $"{who} may not do that alone",
+    };
+  }
+  return strictest;
+}
+
+/// What the declarations say of a tool for this piece of work, the work above it included — what decides whether it
+/// is offered at all.
+Leave LeaveInTree(AgentRun run, Agent definition, ActionInfo tool) {
+  var own = DeclaredLeave(definition, run.Skill, tool) ?? Leave.Never;
+  if (run.Parent == null || own == Leave.Never) { return own; }
+  List<Guid> lifted = [];
+  var above = GateAbove(run, tool, lifted);
+  return above == null ? own : Stricter(own, above!.Leave);
+}
+
+/// The agent above a piece of work that never does a tool — by its own name — or "" when none says so. Asked again
+/// when a proposal is decided.
+string NeverAbove(Guid task, ActionInfo tool) {
+  foreach (var level in LevelsAbove(task)) {
+    if (LeaveAt(level, tool) == Leave.Never) { return level.Agent == "" ? "The work above it" : BareName(level.Agent); }
+  }
+  return "";
+}
+
+/// Why a piece of work may not hand anything on from where it stands in its tree — or "" when it may.
+string DepthProblem(AgentRun run, Agent definition) {
+  var own = definition.Delegates.MaxDepth;
+  if (own < 1) { return $"{BareName(run.Agent)} hands nothing on."; }
+  if (run.Parent == null) { return ""; }
+  // The new piece would be this many levels under each piece of work above: 2 under the nearest, and so on.
+  var under = 2;
+  foreach (var level in LevelsAbove(run.Task)) {
+    var above = level.Agent == "" ? null : ListedAgent(level.Agent);
+    var most = above == null ? 0 : above!.Delegates.MaxDepth;
+    if (under > most) {
+      var who = above == null ? "The work above it" : BareName(level.Agent);
+      return $"{who} lets work be handed on {most} level{(most == 1 ? "" : "s")} deep, and this would be one more.";
+    }
+    under = under + 1;
+  }
+  return "";
+}
+
+// ── the tools that hand work on ─────────────────────────────────────────────────────────────────────────────────────
+
+/// The name a model hands a piece of work on by.
+string HandOnName(string agent, string skill) {
+  return Clipped(HandOnPrefix + BareName(agent) + "_" + BareName(skill), 64);
+}
+
+/// Whether what a skill takes is written as a JSON object. Text, a number or a list is wrapped in one, as `input`:
+/// a tool's input is an object.
+bool TakesAnObject(SkillBase skill) { return skill.HandedSchema().StartsWith("{\"type\":\"object\""); }
+
+/// The work an agent may hand on, as tools — none when it is as deep as work may go.
+List<AgentTool> HandOnTools(AgentRun run, Agent definition) {
+  List<AgentTool> tools = [];
+  var hands = definition.Delegates;
+  if (hands.To.Count == 0 || DepthProblem(run, definition) != "") { return tools; }
+  foreach (var to in hands.To) {
+    var agent = to.Agent == "" ? run.Agent : to.Agent;
+    var skill = SkillNameOf(to.Skill);
+    var schema = to.Skill.HandedSchema();
+    if (!TakesAnObject(to.Skill)) {
+      schema = "{\"type\":\"object\",\"properties\":{\"input\":" + schema + "},\"required\":[\"input\"],\"additionalProperties\":false}";
+    }
+    var what = to.Skill.Description == "" ? Words(BareName(skill)) + "." : to.Skill.Description;
+    var whom = to.Agent == "" ? "Do this as a piece of work apart" : $"Hand this to {BareName(agent)}";
+    tools.Add(new AgentTool {
+      Name = HandOnName(agent, skill), HandsTo = agent + "|" + skill, SchemaJson = schema, Does = "hands work on",
+      Description = $"{whom}: {what} It is done apart from your own work and you get back its result — or how it ended and why, "
+        + "when it could not finish. Hand on several pieces in the same turn and they are done side by side.",
+    });
+  }
+  return tools;
+}
+
+/// Whether what the model asked for hands work on.
+bool IsHandOn(AgentRun run, LlmContentBlock asked) {
+  foreach (var t in run.Tools) { if (t.Name == (asked.ToolName ?? "") && t.HandsTo != "") { return true; } }
+  return false;
+}
+
+/// The specialist a hand-on names, read from the agent's declaration as it stands NOW — or null.
+Specialist? SpecialistFor(Agent definition, string agent, string handsTo) {
+  foreach (var to in definition.Delegates.To) {
+    var named = (to.Agent == "" ? agent : to.Agent) + "|" + SkillNameOf(to.Skill);
+    if (named == handsTo) { return to; }
+  }
+  return null;
+}
+
+/// What a piece of work has left of its own limit — everything under it counted, since every call under it names it.
+long RoomOf(AgentRun run) {
+  return run.LimitMicros - Micros(SpentAgainst("task:" + run.Task.ToString()));
+}
+
+/// The brief of a piece of handed-on work, made AS the agent that would do it and never past the person the work is
+/// for — so a row the model names is found only when both may read it.
+string BriefAs(AgentRun run, Principal account, SkillBase skill, string inputJson) {
+  var task = AgentTask.Single(t => t.Id == run.Task);
+  if (run.Person == null) {
+    runas (Actor.From(account), scope: task) { return skill.BriefHanded(inputJson); }
+  }
+  var person = Principal.FirstOrDefault(p => p.Id == run.Person);
+  runas (Actor.From(account), onBehalfOf: person, scope: task) { return skill.BriefHanded(inputJson); }
+}
+
+/// What a piece of work is about, as its receipt says.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal ReceiptAbove ReceiptAboveOf(Guid task) {
+  var t = AgentTask.Single(x => x.Id == task);
+  return new ReceiptAbove { About = t.About, ChargedTo = t.ChargedTo, WaitingOn = t.WaitingOn };
+}
+
+class ReceiptAbove {
+  public string About = "";
+  public string ChargedTo = "";
+  public string WaitingOn = "";
+}
+
+/// A hand-on that did not happen: the model is told why, and nothing was started.
+void NotHandedOn(AgentRun run, LlmContentBlock asked, string problem) {
+  Trace(run, new TraceEntry { Kind = TraceKind.HandedOn, Tool = asked.ToolName ?? "", PayloadJson = asked.InputJson ?? "{}",
+    Summary = "It tried to hand work on, and nothing was started: " + Clipped(problem, 400) });
+  Missed(run, problem);
+  TakePending(run, asked.ToolUseId ?? "");
+  run.Answered.Add(new LlmContentBlock { Kind = LlmBlockKind.ToolResult, ToolUseId = asked.ToolUseId, IsError = true,
+    ResultJson = JsonSerializer.Serialize(problem) });
+}
+
+/// Take a tool call out of those still to answer.
+void TakePending(AgentRun run, string toolUseId) {
+  var at = 0;
+  foreach (var b in run.Pending) {
+    if ((b.ToolUseId ?? "") == toolUseId) { run.Pending.RemoveAt(at); return; }
+    at = at + 1;
+  }
+}
+
+/// ⭐ OPEN ONE PIECE OF HANDED-ON WORK: checked against the declaration, the tree and the money, briefed as the
+/// specialist, and given its own receipt under this one. Null: it was not started, and the model has been told why.
+ChildWork? StartChild(AgentRun run, Agent definition, LlmContentBlock asked) {
+  var name = asked.ToolName ?? "";
+  var input = asked.InputJson ?? "{}";
+  var handsTo = "";
+  foreach (var t in run.Tools) { if (t.Name == name && t.HandsTo != "") { handsTo = t.HandsTo; } }
+  var bare = BareName(run.Agent);
+
+  // SECURITY-INVARIANT(agents-work-is-handed-on-only-as-declared): the specialist is looked up in the agent's own
+  // declaration as it stands now — never taken from what the model wrote or from what the work remembered — so an
+  // agent hands work only to the agents, and only for the skills, its class names. Guarded by
+  // tests/delegation.test.osy `work_is_handed_on_only_as_the_agent_declares`.
+  var to = SpecialistFor(definition, run.Agent, handsTo);
+  if (to == null) { NotHandedOn(run, asked, $"`{name}` is not work {bare} may hand on."); return null; }
+  var agent = to!.Agent == "" ? run.Agent : to!.Agent;
+  var skill = SkillNameOf(to!.Skill);
+
+  var deep = DepthProblem(run, definition);
+  if (deep != "") { NotHandedOn(run, asked, deep); return null; }
+  if (run.HandedOnCount >= definition.Delegates.MaxPieces) {
+    NotHandedOn(run, asked, $"This work has handed on the {definition.Delegates.MaxPieces} pieces it may. Go on with what came back.");
+    return null;
+  }
+  // Going in circles: the same piece, handed on with the same input, again and again.
+  var key = name + " " + input;
+  var same = 1;
+  foreach (var made in run.Calls) { if (made == key) { same = same + 1; } }
+  run.Calls.Add(key);
+  if (same >= run.SameCall) {
+    TakePending(run, asked.ToolUseId ?? "");
+    End(run, AgentTaskStatus.Failed, $"It went in circles: it handed the same work to {BareName(agent)} {same} times.");
+    return null;
+  }
+  // SECURITY-INVARIANT(agents-a-child-is-given-no-more-than-is-left): what this work has left is read from the
+  // meter — its own calls and every call made under it — and a piece is opened with no more than that. Failure mode:
+  // a tree outspends the top's limit a piece at a time. Guarded by tests/delegation.test.osy
+  // `a_child_is_given_no_more_than_its_parent_has_left`.
+  var room = RoomOf(run);
+  if (room <= 0) { NotHandedOn(run, asked, $"{bare} has nothing left to hand work on with: its own limit is spent."); return null; }
+
+  var account = to!.Agent == "" ? Principal.Single(p => p.Id == run.Actor) : to!.Account;
+  if (account == null) { NotHandedOn(run, asked, $"{BareName(agent)} has no account to do it as."); return null; }
+  var given = input;
+  if (!TakesAnObject(to!.Skill)) {
+    try { given = JsonSerializer.Deserialize<Dictionary<string, Json>>(input)["input"].ToString(); }
+    catch (Exception e) { NotHandedOn(run, asked, "Write what you hand on as `input`."); return null; }
+  }
+  var brief = "";
+  try {
+    brief = BriefAs(run, account!, to!.Skill, given);
+  } catch (Exception e) {
+    NotHandedOn(run, asked, $"{BareName(agent)} cannot be handed that: {e.Message}");
+    return null;
+  }
+
+  var mine = ReceiptAboveOf(run.Task);
+  // What people call each agent above — the words a person is told "working for".
+  List<string> above = [AgentName(run.Agent)];
+  foreach (var higher in run.Above) { above.Add(higher); }
+  var over = new WorkAbove {
+    Task = run.Task, Root = run.Root, Depth = run.Depth, Person = run.Person, ChargedTo = mine.ChargedTo, RoomMicros = room,
+    BudgetMicros = to!.Budget == null ? null : Micros(to!.Budget!), Scopes = run.Scopes, Limits = run.Limits, Above = above,
+  };
+  var who = new AgentRef { Name = agent, Actor = account! };
+  var about = mine.About != "" ? mine.About : Words(BareName(skill));
+  var theirs = ListedAgent(agent);
+  if (theirs == null) { NotHandedOn(run, asked, $"{BareName(agent)} is not one of this app's agents."); return null; }
+  // What the piece may spend, as it will be opened: said in the record before the piece's own first line.
+  var most = over.LimitFor(Micros(to!.Skill.Budget ?? theirs!.Limits.PerTask ?? App.Setting<AgentsSetup>().TaskBudget));
+  Trace(run, new TraceEntry { Kind = TraceKind.HandedOn, Tool = handsTo, PayloadJson = input,
+    Summary = $"It handed {Words(BareName(skill)).ToLower()} to {BareName(agent)}, with at most ${Dollars(most)} to spend." });
+  AgentRun child;
+  try {
+    child = StartWork(who, to!.Skill, brief, about, null, 1, over);
+  } catch (AgentRefused e) {
+    NotHandedOn(run, asked, e.Message);
+    return null;
+  } catch (ValidationException e) {
+    NotHandedOn(run, asked, e.Message);
+    return null;
+  }
+  run.HandedOnCount = run.HandedOnCount + 1;
+  SettleAgentTask(run.Task, new AgentTaskUse { ToolCalls = 1 });
+  return new ChildWork { ToolUseId = asked.ToolUseId ?? "", Run = child, Skill = to!.Skill, Who = who, Brief = brief, About = about, Above = over };
+}
+
+/// Whether one of the tool calls still to answer already has its piece of work under way.
+bool HasLeg(AgentRun run, string toolUseId) {
+  foreach (var leg in run.Legs) { if (leg.ToolUseId == toolUseId) { return true; } }
+  return false;
+}
+
+/// ⭐ HAND ON EVERYTHING THE TURN HANDS ON, TOGETHER. Each piece asked for at the head of the turn's tools is opened;
+/// all of them are driven side by side — their models asked at once, turn by turn; those that end are answered to
+/// the model. False: one or more is waiting — on a person, or on work of its own — and this work waits for it.
+bool HandWorkOn(AgentRun run) {
+  var definition = Definition(run.Agent);
+  List<LlmContentBlock> batch = [];
+  foreach (var b in run.Pending) {
+    if (!IsHandOn(run, b)) { break; }
+    if (!HasLeg(run, b.ToolUseId ?? "")) { batch.Add(b); }
+  }
+  List<ChildWork> going = [];
+  foreach (var asked in batch) {
+    if (run.Status != AgentTaskStatus.Working) { break; }
+    var child = StartChild(run, definition, asked);
+    if (child != null) { going.Add(child!); }
+  }
+  DriveTogether(going);
+  foreach (var child in going) {
+    var agent = child.Who.Name;
+    var skill = SkillNameOf(child.Skill);
+    // A piece that stopped on a person may have been called off since: its receipt says where it stands now.
+    var status = child.Run.Status == AgentTaskStatus.Waiting ? ReceiptStatus(child.Run.Task) : child.Run.Status;
+    if (status == AgentTaskStatus.Working || status == AgentTaskStatus.Waiting) {
+      run.Legs.Add(new HandedOn { ToolUseId = child.ToolUseId, Task = child.Run.Task, Agent = agent, Skill = skill });
+      continue;
+    }
+    PieceCameBack(run, child.ToolUseId, child.Run.Task, agent, skill);
+  }
+  if (run.Status != AgentTaskStatus.Working) { return false; }
+  if (run.Legs.Count == 0) { return true; }
+  ParkOnWork(run);
+  return false;
+}
+
+/// ⭐ DRIVE SEVERAL PIECES OF WORK SIDE BY SIDE. Each round, every piece that is still working puts its next request
+/// to a model, and all of those calls are in flight at once (`Task.WhenAll`); then each piece takes its answer and
+/// runs its tools, one piece after another. A piece that fails is tried again as its skill says. It returns when
+/// none is working any more: each has ended, or waits.
+void DriveTogether(List<ChildWork> works) {
+  while (true) {
+    List<ChildWork> asking = [];
+    List<Task<TurnAnswer>> asks = [];
+    foreach (var work in works) {
+      if (work.Run.Status != AgentTaskStatus.Working) { continue; }
+      var ask = NextAsk(work.Run, work.Skill);
+      if (ask == null) { continue; }
+      var inFlight = AskTheModel(ask!);
+      asking.Add(work);
+      asks.Add(inFlight);
+    }
+    if (asking.Count == 0) { return; }
+    var answers = await Task.WhenAll(asks);
+    var at = 0;
+    foreach (var work in asking) {
+      Took(work.Run, work.Skill, answers[at]);
+      TryAgain(work);
+      at = at + 1;
+    }
+  }
+}
+
+/// A piece that failed and has attempts left starts again, from the beginning, on a receipt of its own.
+void TryAgain(ChildWork work) {
+  if (work.Run.Status != AgentTaskStatus.Failed || work.Run.Attempt >= work.Run.MaxAttempts) { return; }
+  try {
+    work.Run = StartWork(work.Who, work.Skill, work.Brief, work.About, work.Run.Task, work.Run.Attempt + 1, work.Above);
+  } catch (AgentRefused e) {
+    // The work above ended meanwhile, or the agent was paused: the failed attempt stands.
+  }
+}
+
+/// ⭐ A PIECE OF HANDED-ON WORK CAME BACK: the model is answered with its result — or, when it did not finish, with how
+/// it ended, why, and what it had found — and the record says so, with what the piece cost in all.
+void PieceCameBack(AgentRun run, string toolUseId, Guid child, string agent, string skill) {
+  var end = ReceiptEndOf(child);
+  var name = BareName(agent);
+  var cost = TreeMicrosOf(child);
+  var back = new LlmContentBlock { Kind = LlmBlockKind.ToolResult, ToolUseId = toolUseId };
+  var said = "";
+  if (end.Status == AgentTaskStatus.Done) {
+    back.ResultJson = end.ResultJson == "" ? JsonSerializer.Serialize("Done.") : end.ResultJson;
+    said = $"{name} handed back its result; that piece cost ${Dollars(cost)} in all.";
+    run.Failures = 0;
+  } else {
+    var how = end.Status == AgentTaskStatus.Stopped ? "was stopped" : end.Status == AgentTaskStatus.Cancelled ? "was called off" : "could not finish";
+    var found = FoundBy(child);
+    back.IsError = true;
+    back.ResultJson = JsonSerializer.Serialize($"{name} {how}: {end.Outcome}" + (found == "" ? "" : " What it had found: " + found)
+      + " Go on without it, hand the work to somebody else, or hand back what you have and say what is missing.");
+    said = $"{name} {how}: {Clipped(end.Outcome, 300)} That piece cost ${Dollars(cost)} in all.";
+  }
+  Trace(run, new TraceEntry { Kind = TraceKind.CameBack, Tool = agent + "|" + skill, Summary = said, PayloadJson = back.ResultJson });
+  TakePending(run, toolUseId);
+  run.Answered.Add(back);
+}
+
+/// What a piece of work had found: what its tools answered, the last few — for the work above it when it did not
+/// finish.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal string FoundBy(Guid task) {
+  List<string> found = [];
+  foreach (var line in TraceEvent.Where(e => e.Task.Id == task && e.Kind == TraceKind.ToolResult).OrderByDescending(e => e.Seq).Take(4).ToList()) {
+    var said = line.Payload ?? "";
+    if (said == "") { continue; }
+    found.Insert(0, BareName(line.Tool) + " answered " + Clipped(said, 300));
+  }
+  return string.Join("; ", found);
+}
+
+/// The work stops where it stands, on the work it handed on: its state is kept, and it goes on when every piece has
+/// come back.
+void ParkOnWork(AgentRun run) {
+  List<string> on = [];
+  foreach (var leg in run.Legs) {
+    var waits = ReceiptAboveOf(leg.Task).WaitingOn;
+    on.Add(waits == "" ? AgentName(leg.Agent) : $"{AgentName(leg.Agent)}, which waits for {waits}");
+  }
+  var whom = Clipped(string.Join("; ", on), 300);
+  run.WaitingToolUse = "";
+  Trace(run, new TraceEntry { Kind = TraceKind.Waiting, Summary = $"It waits for {whom}." });
+  ParkAgentTask(run.Task, JsonSerializer.Serialize(run), whom, null, null, true);
+  run.Status = AgentTaskStatus.Waiting;
+}
+
+/// Every piece the work waited for has ended: each answers the call that handed it on.
+void GatherWaited(AgentRun run) {
+  var legs = run.Legs;
+  run.Legs = [];
+  foreach (var leg in legs) {
+    var status = ReceiptStatus(leg.Task);
+    if (status == AgentTaskStatus.Working || status == AgentTaskStatus.Waiting) { run.Legs.Add(leg); continue; }
+    PieceCameBack(run, leg.ToolUseId, leg.Task, leg.Agent, leg.Skill);
+  }
+}
+
+// ── ending, stopping, running out ───────────────────────────────────────────────────────────────────────────────────
+
+/// A piece of work has ended, however it ended: what it handed on and is still going is called off, and the work
+/// that handed THIS on is told, so it can go on.
+void WorkHasEnded(AgentRun run, AgentTaskStatus status, string outcome) {
+  if (run.HandedOnCount > 0) {
+    var how = status == AgentTaskStatus.Done ? "finished" : status == AgentTaskStatus.Cancelled ? "was called off" : status == AgentTaskStatus.Stopped ? "was stopped" : "failed";
+    CallOffWorkUnder(run.Task, $"{BareName(run.Agent)}'s work, which it was part of, {how}.");
+  }
+  // The work above is told only while it still waits: one that is ending — it is what called this off — is not
+  // woken into its own ending.
+  if (run.Parent != null && ReceiptStatus(run.Parent!.Value) == AgentTaskStatus.Waiting) { TellWaits(run.Parent!.Value); }
+}
+
+/// A model call was refused for money, and the limit that had no room is a piece of work's above this one: every
+/// piece under THAT is spent with it, and is called off now rather than left waiting for a person in vain.
+void SpentAbove(AgentRun run, TurnAnswer answer) {
+  if (run.Parent == null || answer.SpentScope != "task" || answer.SpentSubject == "" || answer.SpentSubject == run.Task.ToString()) { return; }
+  Guid spent;
+  try { spent = Guid.Parse(answer.SpentSubject); } catch (Exception e) { return; }
+  CallOffWorkUnder(spent, "The work it was part of ran out of money.");
+}
+
+/// Call off every piece of work under `task` that is still going: each stops at its next step, and one that waits —
+/// on a person, or on work of its own — is told now.
+void CallOffWorkUnder(Guid task, string why) {
+  foreach (var waiting in CallOffAgentWork(task, why)) { TellWaits(waiting); }
+}
+
+/// Mark every piece of work under `under` that has not ended as called off. Answers the ones that are waiting.
+[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+internal List<Guid> CallOffAgentWork(Guid under, string why) {
+  List<Guid> waiting = [];
+  var top = AgentTask.FirstOrDefault(t => t.Id == under);
+  if (top == null) { return waiting; }
+  var root = top!.Root ?? top!;
+  var going = AgentTask.Where(t => t.Root == root && (t.Status == AgentTaskStatus.Working || t.Status == AgentTaskStatus.Waiting)).ToList();
+  List<Guid> reached = [under];
+  var grew = true;
+  while (grew) {
+    grew = false;
+    foreach (var t in going) {
+      if (t.Parent == null || reached.Contains(t.Id) || !reached.Contains(t.Parent!.Id)) { continue; }
+      reached.Add(t.Id);
+      grew = true;
+      if (!t.StopAsked) {
+        t.StopAsked = true;
+        t.StopWhy = Clipped(why, 300);
+      }
+      if (t.Status == AgentTaskStatus.Waiting) { waiting.Add(t.Id); }
+    }
+  }
+  return waiting;
+}
+
+/// Tell the waits of a piece of work that something happened. Each looks for itself, and goes on only when what it
+/// waits for is over.
+void TellWaits(Guid task) {
+  foreach (var wait in AgentWait.Where(w => w.Task.Id == task && w.Status == AgentWaitStatus.Waiting).Take(5).ToList()) {
+    AgentWaitFlow.RaiseWake(wait);
+  }
+}
+
+// ── the tree, read back ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What a piece of work and everything under it spent on models, in millionths of a US dollar.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal long TreeMicrosOf(Guid task) {
+  var top = AgentTask.FirstOrDefault(t => t.Id == task);
+  if (top == null) { return 0; }
+  var root = top!.Root ?? top!;
+  var all = AgentTask.Where(t => t.Root == root).ToList();
+  long spent = top!.SpentMicros;
+  List<Guid> reached = [task];
+  var grew = true;
+  while (grew) {
+    grew = false;
+    foreach (var t in all) {
+      if (t.Parent == null || reached.Contains(t.Id) || !reached.Contains(t.Parent!.Id)) { continue; }
+      reached.Add(t.Id);
+      spent = spent + t.SpentMicros;
+      grew = true;
+    }
+  }
+  return spent;
+}
+
+/// One piece of work in a tree, as a person reads it.
+public class WorkNode {
+  public Guid Task;
+  /// The piece that handed it on. Null: it is the top.
+  public Guid? Parent;
+  public int Depth = 0;
+  /// The agent and the skill, each by its own name — "Checker", "Check papers".
+  public string Agent = "";
+  public string Skill = "";
+  public string About = "";
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  /// What it waits on while it waits — a person, or the work it handed on.
+  public string WaitingOn = "";
+  /// How it ended, in a sentence.
+  public string Outcome = "";
+  /// What it spent itself, and what it and everything under it spent, in millionths of a US dollar.
+  public long OwnMicros = 0;
+  public long TreeMicros = 0;
+  /// The most it may spend, everything under it included.
+  public long LimitMicros = 0;
+  public int ModelCalls = 0;
+  public int Attempt = 1;
+  public DateTime StartedAt;
+  public DateTime? EndedAt;
+}
+
+/// ⭐ THE TREE OF A PIECE OF WORK — who handed what to whom, where each piece stands, what each cost and what the
+/// whole cost.
+///
+///     foreach (var node in WorkTree.Of(task)) { … node.Depth, node.Agent, node.Status, node.WaitingOn, node.TreeMicros … }
+///
+/// Read as whoever asks: a person sees the tree of the work they asked for, whoever supervises or audits sees any.
+public class WorkTree {
+  /// Every piece of the work `task` is part of, the top first and each piece followed by what it handed on, in the
+  /// order it was handed on.
+  public static List<WorkNode> Of(AgentTask task) {
+    var root = task.Root ?? task;
+    List<AgentTask> all = [root];
+    foreach (var under in AgentTask.Where(t => t.Root == root).OrderBy(t => t.StartedAt).ToList()) { all.Add(under); }
+    List<WorkNode> nodes = [];
+    Place(root, all, nodes);
+    return nodes;
+  }
+
+  /// What a piece of work and everything it handed on spent on models, in millionths of a US dollar.
+  public static long CostOf(AgentTask task) {
+    long spent = 0;
+    foreach (var node in Of(task)) { if (node.Task == task.Id) { spent = node.TreeMicros; } }
+    return spent;
+  }
+
+  /// The pieces `task` handed on itself, in the order it handed them on.
+  public static List<AgentTask> HandedOnBy(AgentTask task) {
+    return AgentTask.Where(t => t.Parent == task).OrderBy(t => t.StartedAt).ToList();
+  }
+
+  static long Place(AgentTask piece, List<AgentTask> all, List<WorkNode> nodes) {
+    var node = new WorkNode {
+      Task = piece.Id, Parent = piece.Parent == null ? null : piece.Parent!.Id, Depth = piece.Depth,
+      Agent = BareName(piece.Agent), Skill = piece.Skill == "" ? "" : Words(BareName(piece.Skill)), About = piece.About,
+      Status = piece.Status, WaitingOn = piece.WaitingOn, Outcome = piece.Outcome, OwnMicros = piece.SpentMicros,
+      LimitMicros = piece.LimitMicros, ModelCalls = piece.ModelCalls, Attempt = piece.Attempt, StartedAt = piece.StartedAt, EndedAt = piece.EndedAt,
+    };
+    nodes.Add(node);
+    long spent = piece.SpentMicros;
+    foreach (var under in all) {
+      if (under.Parent != null && under.Parent!.Id == piece.Id) { spent = spent + Place(under, all, nodes); }
+    }
+    node.TreeMicros = spent;
+    return spent;
+  }
+}

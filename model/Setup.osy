@@ -1,0 +1,100 @@
+// What the app says: which agents it has, what a piece of work may spend by default, and who may do what.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+
+/// Who gives agents work and reads the runs they asked for. Nobody, until the app says: `policy UsesAgents => IsStaff;`.
+virtual policy UsesAgents => false;
+
+/// Who is in charge of the agents: names each one's sponsor, pauses and stops them, and reads every run's record.
+/// Nobody, until the app says: `policy SupervisesAgents => IsLead;`. Naming a sponsor, pausing, reading every
+/// receipt and deciding other people's proposals come with it, and can each be given to somebody else — see Roles.osy.
+virtual policy SupervisesAgents => false;
+
+/// Who reads every run WITH its content — the prompts, what each tool was given and what it answered. Nobody, until
+/// the app says: `policy AuditsAgents => IsAuditor;`.
+virtual policy AuditsAgents => false;
+
+/// Whether an agent that names a model to consult may ask it. Yes, until the app says otherwise:
+/// `policy AgentsMayConsult => false;` switches the help of a stronger model off for everybody.
+virtual policy AgentsMayConsult => true;
+
+/// Who may give an agent work FOR SOMEBODY ELSE (`Agents.Of<X>().For(person)`) while signed in themselves. Nobody,
+/// until the app says: `policy DirectsAgentsForOthers => IsLead;`. Naming yourself needs nobody's leave, and neither
+/// does work the app starts itself — a workflow, a handler — where nobody is signed in.
+virtual policy DirectsAgentsForOthers => false;
+
+/// How this app uses agents — `app.Agents = new AgentsSetup { Agents = [new Auditor()] };`.
+[AppSetting("Agents")]
+public class AgentsSetup {
+  /// Every agent the app has. `Agents.Of<Auditor>()` answers one of these; `Skills.Catalog()` lists what they can do.
+  public List<Agent> Agents = [];
+  /// What one piece of work may spend on models, in US dollars, when neither its agent nor its skill says.
+  public decimal TaskBudget = 0.50m;
+  /// How many turns a piece of work may take when its skill does not say.
+  public int MaxTurns = 12;
+  /// The app's own checks on every piece of work — see `AgentGuard`. Asked in this order.
+  public List<AgentGuard> Guards = [];
+  /// How long work that says it is under way may write nothing on its record before it counts as abandoned — the
+  /// process that was doing it is gone (`WasAbandoned`, `CloseAbandonedAgentWork`). Longer than the slowest tool an
+  /// agent runs. Zero: never.
+  public TimeSpan AbandonedAfter = TimeSpan.FromMinutes(30);
+  /// How often the kit's own clock looks for work that was abandoned, and closes it — the clock starts with the
+  /// first piece of work. Zero: never; the app closes it itself (`CloseAbandonedAgentWork`), or nothing does.
+  public TimeSpan AbandonedCheckEvery = TimeSpan.FromMinutes(10);
+}
+
+/// What an agent may spend, and how much it may do at once.
+public class AgentLimits {
+  /// The most one piece of work may spend on models, in US dollars. Null: the skill's, else the app's `TaskBudget`.
+  public decimal? PerTask;
+  /// The most the agent may spend in a day (UTC), in US dollars. Null: no limit of its own.
+  public decimal? Daily;
+}
+
+/// What a skill needs of the model that does it — what the app's router decides from.
+public class ModelNeeds {
+  /// What kind of work it is.
+  public LlmTaskKind Kind = LlmTaskKind.Reason;
+  /// Whether a person is waiting for the answer.
+  public LlmLatencySensitivity Latency = LlmLatencySensitivity.Background;
+  /// The lowest quality rank that may do it, on the scale the app's router ranks its models by.
+  public int MinQuality = 0;
+  /// One of the app's models, by name, when the skill must be done by that one. It can only narrow what the router admits.
+  public string? Model;
+  /// The most tokens one answer may run to. 0: the model's own.
+  public int MaxTokens = 0;
+}
+
+/// When a piece of work stops whether or not it is finished.
+public class StopWhen {
+  /// The most turns — one model answer, with the tools it asked for — before the work is stopped. 0: the app's `MaxTurns`.
+  public int MaxTurns = 0;
+  /// How many times the same tool may be asked for with the same arguments before the work is stopped as going in
+  /// circles.
+  public int SameCall = 3;
+  /// How much of the conversation is kept in full: once it passes this many tokens (estimated), the results of older
+  /// tool calls are replaced by one line each. 0: nothing is cleared.
+  public int ClearResultsPast = 60000;
+}
+
+// ── refusals ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Work an agent was not given, before anything ran — tell it apart from work that ran and failed (an
+/// `AgentOutcome` whose `Status` is `Failed`).
+/// A `ValidationException`, so whoever asked is told why in the kit's own words: a person on a page, a caller of an
+/// endpoint, and a model whose tool ran into it (an exception that says nothing about its kind is told to nobody).
+public class AgentRefused : ValidationException { }
+
+/// The class is not one of the app's agents: it is missing from `app.Agents`.
+public class AgentNotListed : AgentRefused { }
+
+/// The agent has no sponsor — nobody accountable for it — so it does not run.
+public class AgentNotSponsored : AgentRefused { }
+
+/// The agent is paused by whoever supervises it.
+public class AgentPaused : AgentRefused { }
+
+/// The skill is not one the agent holds.
+public class SkillNotHeld : AgentRefused { }

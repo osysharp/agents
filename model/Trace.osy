@@ -1,0 +1,262 @@
+// The record — every step of a piece of work, in order, each chained to the one before it.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+
+/// What one line of the record is. ⚠ Appended, never inserted: an enum is stored by position.
+public enum TraceKind {
+  /// The work was given: what the agent was shown.
+  [Label("Started")] Started,
+  /// A model answered: which one, by which rule of the router, at what cost.
+  [Label("Model call")] ModelCall,
+  /// A tool was asked for, and whether it may run.
+  [Label("Tool call")] ToolCall,
+  /// What the tool answered.
+  [Label("Tool result")] ToolResult,
+  /// The agent asked for help: of whom, why, and what came back.
+  [Label("Asked for help")] AskedForHelp,
+  /// The result did not fit what the skill promises, and was sent back.
+  [Label("Sent back")] SentBack,
+  /// The work ended.
+  [Label("Ended")] Ended,
+  /// It proposed something it may not do alone, or asked a person, and waits.
+  [Label("Waiting on a person")] Waiting,
+  /// A person decided a proposal.
+  [Label("Decided by a person")] Decided,
+  /// One of the app's guards stopped a step.
+  [Label("Stopped by a guard")] Guarded,
+  /// It handed a piece of its work on to another agent: to whom, and what.
+  [Label("Handed work on")] HandedOn,
+  /// Work it handed on came back: how it ended, and what it cost.
+  [Label("Work came back")] CameBack,
+}
+
+/// ⭐ ONE LINE OF THE RECORD. `Summary` says the step in plain words and is kept with the record; `Payload` is the
+/// content — the prompt, the arguments, the answer — and is read only by whoever asked for the work and by whoever
+/// audits the agents.
+///
+/// ⚑ CHAINED. `Hash` is the SHA-256 of the line before it and of this line's own facts, per top piece of work, so a
+///   line changed, removed or slipped in afterwards — by anyone, with any access — is found by `VerifyTrace`. What a
+///   line SAID is chained through its hashes (`PayloadHash`, `SummaryHash`), never as itself — so the content, and
+///   the sentence, can be erased for the person they are about without breaking the chain: the record of what
+///   happened, in what order, by which model and tool and at what cost, still checks.
+///
+/// Written only by this package's own functions, and never changed — except that what it said can be erased
+/// (`EraseAgentWorkContent`, `AnonymiseAgentWork`).
+public entity TraceEvent {
+  [Required, Immutable, Index] AgentTask Task;
+  /// The top piece of work whose chain this line is on.
+  [Required, Immutable, Index] AgentTask Root;
+  /// Its place in the chain, from 1.
+  [Immutable] int Seq = 0;
+  [Immutable] TraceKind Kind = TraceKind.Started;
+  [Immutable] DateTime At = DateTime.UtcNow;
+  /// The step, in a sentence — and its SHA-256, which is what the chain holds. Once erased the sentence is `Erased.`
+  /// and the line says when (`ErasedAt`).
+  [MaxLength(600), Classification(Personal.Content)] string Summary = "";
+  [Immutable, MaxLength(64)] string SummaryHash = "";
+  DateTime? ErasedAt;
+
+  /// A model call: the model that served it (the app's name for it), the rule of the router that chose it, how many
+  /// models were tried, the meter's id for the call, and what it cost in millionths of a US dollar.
+  [Immutable, MaxLength(200)] string Model = "";
+  [Immutable, MaxLength(200)] string RouteRule = "";
+  [Immutable] int Attempts = 0;
+  [Immutable] Guid? Call;
+  [Immutable] long CostMicros = 0;
+  /// A tool call or its result: the tool, by the name of the action it is.
+  [Immutable, MaxLength(300)] string Tool = "";
+  /// A request for help: the row that holds it.
+  [Immutable] AgentHelp? Help;
+
+  /// The content, and its SHA-256 (the hash is "" when the line has none). Erased content is "": the hash stays.
+  [Classification(Personal.Content)] string? Payload;
+  [Immutable, MaxLength(64)] string PayloadHash = "";
+  /// The chain: the hash of the line before (empty for the first), and this line's own.
+  [Immutable, MaxLength(64)] string PrevHash = "";
+  [Immutable, MaxLength(64)] string Hash = "";
+
+  security {
+    allow read when UsesAgents where Task.Requester == user || Task.StartedBy == user;
+    allow read when SupervisesAgents || AuditsAgents || TeachesAgents || ErasesAgentRecords;
+    // What was said is for whoever it was for, whoever gave the work, the auditors and whoever teaches the agents —
+    // not for everyone who may see that it happened (`agents-whoever-teaches-reads-the-work-with-what-it-said`).
+    deny read Payload when !AuditsAgents && !TeachesAgents where Task.Requester != user && Task.StartedBy != user;
+    allow create when UsesAgents;
+    allow update, delete when ErasesAgentRecords;
+    deny create except via AppendAgentTrace;
+    // SECURITY-INVARIANT(an-agent-record-changes-only-by-losing-its-words): every other member is immutable, and
+    // these three are written only by the kit's erasure functions, for a caller `ErasesAgentRecords` admits. A grant
+    // or an `except via` widened here lets a record be rewritten; `CheckChain` is what finds one that was. Guarded by
+    // tests/erasure.test.osy `only_whoever_the_app_names_erases_and_only_through_the_kit` and
+    // `a_changed_line_is_still_found_after_an_erasure`.
+    deny update Payload except via EraseAgentWorkContent;
+    deny update Summary, ErasedAt except via AnonymiseAgentWork;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+/// The turnstile of one chain: lines are appended one at a time, each waiting for the one before it to be stored. It
+/// holds nothing worth protecting — the chain is in the lines themselves.
+[Unique(Root)]
+public entity AgentTraceHead {
+  [Required, Immutable] Guid Root;
+  long Turn = 0;
+
+  security {
+    allow read, create, update when UsesAgents;
+    allow delete when ErasesAgentRecords;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+/// What a new line is written from.
+public class TraceEntry {
+  public TraceKind Kind = TraceKind.Started;
+  public string Summary = "";
+  public string Model = "";
+  public string RouteRule = "";
+  public int Attempts = 0;
+  public Guid? Call;
+  public long CostMicros = 0;
+  public string Tool = "";
+  public Guid? Help;
+  /// The content, as JSON. Null: none.
+  public string? PayloadJson;
+}
+
+/// ⭐ APPEND ONE LINE to the chain of `root`, for the piece of work `task`.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal void AppendAgentTrace(Guid root, Guid task, TraceEntry entry) {
+  // One at a time per chain: whoever arrives second waits here for the first to be stored, then reads its hash.
+  AgentTraceHead.Where(h => h.Root == root).Update(h => { h.Turn = h.Turn + 1; });
+  var last = TraceEvent.Where(e => e.Root.Id == root).OrderByDescending(e => e.Seq).FirstOrDefault();
+  var seq = last == null ? 1 : last.Seq + 1;
+  var prev = last == null ? "" : last.Hash;
+  var at = DateTime.UtcNow;
+  var summary = Clipped(entry.Summary, 600);
+  var summaryHash = Crypto.Sha256Hex(summary);
+  var payloadHash = entry.PayloadJson == null ? "" : Crypto.Sha256Hex(entry.PayloadJson!);
+  var line = new TraceEvent {
+    Task = AgentTask.Single(t => t.Id == task), Root = AgentTask.Single(t => t.Id == root), Seq = seq,
+    Kind = entry.Kind, At = at, Summary = summary, SummaryHash = summaryHash, Model = entry.Model, RouteRule = entry.RouteRule,
+    Attempts = entry.Attempts, Call = entry.Call, CostMicros = entry.CostMicros, Tool = Clipped(entry.Tool, 300),
+    Help = entry.Help == null ? null : AgentHelp.FirstOrDefault(h => h.Id == entry.Help),
+    PayloadHash = payloadHash, PrevHash = prev,
+  };
+  if (entry.PayloadJson != null) { line.Payload = entry.PayloadJson!; }
+  line.Hash = LineHash(prev, root, task, seq, entry.Kind, at, summaryHash, entry.Model, entry.RouteRule, entry.Attempts,
+                       entry.Call, entry.CostMicros, line.Tool, entry.Help, payloadHash);
+}
+
+/// The hash of one line: the line before it, then this line's own facts, each on a line of its own. What the line
+/// said goes in as its hashes — the sentence's and the content's — so erasing either leaves this hash true.
+string LineHash(string prev, Guid root, Guid task, int seq, TraceKind kind, DateTime at, string summaryHash, string model,
+                string routeRule, int attempts, Guid? call, long costMicros, string tool, Guid? help, string payloadHash) {
+  var facts = string.Join("\n", [
+    prev, root.ToString(), task.ToString(), seq.ToString(), kind.Name, at.Ticks.ToString(), summaryHash, model, routeRule,
+    attempts.ToString(), call == null ? "" : call!.ToString(), costMicros.ToString(), tool,
+    help == null ? "" : help!.ToString(), payloadHash,
+  ]);
+  return Crypto.Sha256Hex(facts);
+}
+
+/// What checking a chain found.
+public class TraceCheck {
+  /// Every line is where it was written, as it was written.
+  public bool Intact = true;
+  /// How many lines were checked.
+  public int Lines = 0;
+  /// The first line that does not fit — its place in the chain — and what is wrong with it. 0 when intact.
+  public int BrokenAt = 0;
+  public string Problem = "";
+  /// How many lines no longer say what they said: their sentence was erased. They still fit the chain.
+  public int Erased = 0;
+}
+
+/// What stands where a line's sentence was, once it is erased. The same for every line, so nothing can be written
+/// in an erased line's place.
+public string ErasedSummary() { return "Erased."; }
+
+/// One line of a record as plain values — what an export carries, and what `CheckChain` checks.
+public class TraceLine {
+  public Guid Task;
+  public Guid Root;
+  public int Seq = 0;
+  public TraceKind Kind = TraceKind.Started;
+  public DateTime At;
+  public string Summary = "";
+  public string SummaryHash = "";
+  /// Its sentence was erased: `Summary` is `ErasedSummary()`.
+  public bool Erased = false;
+  public string Model = "";
+  public string RouteRule = "";
+  public int Attempts = 0;
+  public Guid? Call;
+  public long CostMicros = 0;
+  public string Tool = "";
+  public Guid? Help;
+  /// The content — null when the line has none or the reader may not see it; "" when it was erased.
+  public string? Payload;
+  public string PayloadHash = "";
+  public string PrevHash = "";
+  public string Hash = "";
+}
+
+/// The record of the work `task` belongs to — every line of its chain, in order — as plain values. Each line carries
+/// its content only when whoever is reading may see it.
+public List<TraceLine> TraceOf(AgentTask task) {
+  var root = task.Root ?? task;
+  List<TraceLine> lines = [];
+  foreach (var line in TraceEvent.Where(e => e.Root == root).OrderBy(e => e.Seq).ToList()) {
+    lines.Add(new TraceLine {
+      Task = line.Task.Id, Root = root.Id, Seq = line.Seq, Kind = line.Kind, At = line.At, Summary = line.Summary,
+      SummaryHash = line.SummaryHash, Erased = line.ErasedAt != null,
+      Model = line.Model, RouteRule = line.RouteRule, Attempts = line.Attempts, Call = line.Call,
+      CostMicros = line.CostMicros, Tool = line.Tool, Help = line.Help == null ? null : line.Help.Id,
+      Payload = line.Payload, PayloadHash = line.PayloadHash, PrevHash = line.PrevHash, Hash = line.Hash,
+    });
+  }
+  return lines;
+}
+
+/// ⭐ CHECK A RECORD: recompute the chain of the work `task` belongs to and say whether every line is as it was
+/// written — none changed, none removed, none slipped in. The first line that does not fit is named.
+///
+/// A line whose content or sentence was erased still fits: the chain holds their hashes, not the words. A line
+/// whose words are there and were changed does not — and nor does an erased line with anything but `Erased.` in it.
+public TraceCheck VerifyTrace(AgentTask task) { return CheckChain(TraceOf(task)); }
+
+/// The same check, over lines held as values — a record that was exported, or read some other way.
+public TraceCheck CheckChain(List<TraceLine> lines) {
+  var check = new TraceCheck();
+  var prev = "";
+  var expected = 1;
+  foreach (var line in lines) {
+    check.Lines = check.Lines + 1;
+    if (line.Seq != expected) { return Broken(check, expected, $"Line {expected} is missing."); }
+    if (line.PrevHash != prev) { return Broken(check, line.Seq, $"Line {line.Seq} does not follow the line before it."); }
+    var hash = LineHash(prev, line.Root, line.Task, line.Seq, line.Kind, line.At, line.SummaryHash, line.Model, line.RouteRule,
+                        line.Attempts, line.Call, line.CostMicros, line.Tool, line.Help, line.PayloadHash);
+    if (hash != line.Hash) { return Broken(check, line.Seq, $"Line {line.Seq} is not as it was written."); }
+    if (line.Erased) {
+      if (line.Summary != ErasedSummary()) { return Broken(check, line.Seq, $"Line {line.Seq} was erased, and something was written in its place."); }
+      check.Erased = check.Erased + 1;
+    } else if (Crypto.Sha256Hex(line.Summary) != line.SummaryHash) {
+      return Broken(check, line.Seq, $"Line {line.Seq} is not as it was written.");
+    }
+    if (line.Payload != null && line.Payload != "" && Crypto.Sha256Hex(line.Payload!) != line.PayloadHash) {
+      return Broken(check, line.Seq, $"The content of line {line.Seq} is not what was written.");
+    }
+    prev = line.Hash;
+    expected = expected + 1;
+  }
+  return check;
+}
+
+TraceCheck Broken(TraceCheck check, int at, string problem) {
+  check.Intact = false;
+  check.BrokenAt = at;
+  check.Problem = problem;
+  return check;
+}

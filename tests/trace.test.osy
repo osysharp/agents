@@ -1,0 +1,209 @@
+// Osysharp.Agents — the record: every step of a piece of work in plain words, each model call with the model and why,
+// chained so a changed line is found, its content read only by whoever asked and by the auditors.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Packhouse;
+
+string WeighArg(Crate crate) { return "{\"crate\":\"" + crate.Id.ToString() + "\"}"; }
+string FlagArg(Crate crate) { return "{\"crate\":\"" + crate.Id.ToString() + "\",\"flag\":\"short\"}"; }
+
+/// One graded crate, as Ada: weighed, flagged, handed back.
+Guid GradedByAda() {
+  var crate = Crate.Single(c => c.Code == "A-2");
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(Weigh), WeighArg(crate), 400, 40),
+    Says.Tool(Actions.Of(FlagCrate), FlagArg(crate), 500, 40),
+    Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true }, 600, 60));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  return Inspect(crate).Task;
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void the_record_says_every_step_in_order_in_plain_words() {
+  var task = GradedByAda();
+
+  Assert.Equal(["Started", "ModelCall", "ToolCall", "ToolResult", "ModelCall", "ToolCall", "ToolResult", "ModelCall", "Ended"],
+               Trajectory.Kinds(task));
+  Assert.Equal([
+    "Inspector was given grade crate: Crate A-2.",
+    "Small (chosen by llm:default) asked for a tool; it cost $0.0006.",
+    "It asked for Weigh (reads only); it is one of this work's tools, so it runs as the agent, for whoever asked.",
+    "Weigh answered.",
+    "Small (chosen by llm:default) asked for a tool; it cost $0.0007.",
+    "It asked for FlagCrate (changes data); it is one of this work's tools, so it runs as the agent, for whoever asked.",
+    "FlagCrate answered.",
+    "Small (chosen by llm:default) asked for a tool; it cost $0.0009.",
+    "Done. It handed back its result.",
+  ], Trajectory.Said(task));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_model_call_is_recorded_with_the_model_why_it_was_chosen_and_what_it_cost() {
+  var task = GradedByAda();
+
+  var calls = TraceEvent.Where(e => e.Task.Id == task && e.Kind == TraceKind.ModelCall).OrderBy(e => e.Seq).ToList();
+  Assert.Equal(3, calls.Count);
+  Assert.Equal("Small", calls[0].Model);
+  Assert.Equal("llm:default", calls[0].RouteRule);
+  Assert.Equal(1, calls[0].Attempts);
+  Assert.Equal(600, calls[0].CostMicros);
+  Assert.NotNull(calls[0].Call);
+  // What the record says a call cost is what the receipt adds up.
+  Assert.Equal(2200, calls[0].CostMicros + calls[1].CostMicros + calls[2].CostMicros);
+  Assert.Equal(2200, AgentTask.Single().SpentMicros);
+}
+
+[Test(Yard)]
+void what_the_record_says_a_call_cost_is_what_the_meter_says() {
+  Guid task;
+  runas (Ada) { task = GradedByAda(); }
+  // The lead reads the meter: each line's call is a row of it, at the same cost, charged to this piece of work.
+  runas (Dana) {
+    foreach (var line in TraceEvent.Where(e => e.Task.Id == task && e.Kind == TraceKind.ModelCall).ToList()) {
+      var row = ModelCall.Single(c => c.Call == line.Call);
+      Assert.Equal(line.CostMicros, row.CostMicros);
+      Assert.Equal(line.Model, row.Model);
+      Assert.Contains("task:" + task.ToString(), row.Scopes);
+      Assert.Contains("agent:Packhouse.Inspector", row.Scopes);
+      Assert.Contains("skill:Packhouse.GradeCrate", row.Scopes);
+    }
+    Assert.Equal(0.0022m, SpentOn("task:" + task.ToString()));
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_tool_line_holds_what_the_tool_was_given_and_what_it_answered() {
+  var task = GradedByAda();
+  var crate = Crate.Single(c => c.Code == "A-2");
+
+  var asked = TraceEvent.Where(e => e.Task.Id == task && e.Kind == TraceKind.ToolCall).OrderBy(e => e.Seq).ToList();
+  var answered = TraceEvent.Where(e => e.Task.Id == task && e.Kind == TraceKind.ToolResult).OrderBy(e => e.Seq).ToList();
+  Assert.Equal("Packhouse.Weigh", asked[0].Tool);
+  Assert.Equal(WeighArg(crate), asked[0].Payload);
+  Assert.Equal("8", answered[0].Payload);
+  Assert.Equal("Packhouse.FlagCrate", asked[1].Tool);
+  Assert.Equal("\"A-2 is flagged short.\"", answered[1].Payload);
+}
+
+// ── the chain ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+[runas(Ada)]
+void a_record_as_it_was_written_verifies() {
+  var task = GradedByAda();
+  var check = VerifyTrace(AgentTask.Single(t => t.Id == task));
+  Assert.True(check.Intact);
+  Assert.Equal(9, check.Lines);
+  Assert.Equal(0, check.BrokenAt);
+
+  // Every line carries the hash of the one before it; the first carries none.
+  var lines = TraceOf(AgentTask.Single(t => t.Id == task));
+  Assert.Equal("", lines[0].PrevHash);
+  Assert.Equal(lines[0].Hash, lines[1].PrevHash);
+  Assert.Equal(lines[7].Hash, lines[8].PrevHash);
+  Assert.Equal(64, lines[8].Hash.Length);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_line_that_was_changed_removed_or_slipped_in_is_found() {
+  var task = GradedByAda();
+  var receipt = AgentTask.Single(t => t.Id == task);
+
+  // A sentence rewritten.
+  var lines = TraceOf(receipt);
+  lines[3].Summary = "Weigh was never asked for.";
+  var changed = CheckChain(lines);
+  Assert.False(changed.Intact);
+  Assert.Equal(4, changed.BrokenAt);
+  Assert.Equal("Line 4 is not as it was written.", changed.Problem);
+
+  // What a call cost, turned down.
+  lines = TraceOf(receipt);
+  lines[1].CostMicros = 6;
+  Assert.Equal(2, CheckChain(lines).BrokenAt);
+
+  // What a tool was given, swapped for something else.
+  lines = TraceOf(receipt);
+  lines[2].Payload = "{\"crate\":\"another\"}";
+  var swapped = CheckChain(lines);
+  Assert.Equal(3, swapped.BrokenAt);
+  Assert.Equal("The content of line 3 is not what was written.", swapped.Problem);
+
+  // A line taken out.
+  lines = TraceOf(receipt);
+  lines.RemoveAt(5);
+  var removed = CheckChain(lines);
+  Assert.Equal(6, removed.BrokenAt);
+  Assert.Equal("Line 6 is missing.", removed.Problem);
+
+  // The last lines cut off and one written in their place, with a hash of its own making.
+  lines = TraceOf(receipt);
+  lines[8].Summary = "Done. Nothing was flagged.";
+  lines[8].Hash = Crypto.Sha256Hex("made up");
+  Assert.Equal(9, CheckChain(lines).BrokenAt);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_line_whose_content_is_gone_still_verifies() {
+  var task = GradedByAda();
+  // Content can be erased — it is personal data — and the record of what happened still stands.
+  var lines = TraceOf(AgentTask.Single(t => t.Id == task));
+  foreach (var line in lines) { line.Payload = null; }
+  Assert.True(CheckChain(lines).Intact);
+}
+
+// ── who reads it ────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Yard)]
+void the_record_is_read_by_whoever_asked_the_supervisor_and_the_auditor_and_its_content_by_fewer() {
+  Guid task;
+  runas (Ada) {
+    task = GradedByAda();
+    // Whoever asked reads all of it, content included.
+    Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == task));
+    Assert.NotNull(TraceEvent.First(e => e.Task.Id == task && e.Kind == TraceKind.ToolCall).Payload);
+  }
+  // Another grower reads none of it — not the receipt, not a line.
+  runas (Ben) {
+    Assert.Equal(0, AgentTask.Count());
+    Assert.Equal(0, TraceEvent.Count());
+  }
+  // The lead supervises: she sees that it happened, in words, and not what was said.
+  runas (Dana) {
+    Assert.Equal(1, AgentTask.Count());
+    var line = TraceEvent.First(e => e.Task.Id == task && e.Kind == TraceKind.ToolCall);
+    Assert.StartsWith("It asked for Weigh", line.Summary);
+    Assert.Null(line.Payload);
+    // The chain still checks for her: it holds the content's hash, not the content.
+    Assert.True(VerifyTrace(AgentTask.Single(t => t.Id == task)).Intact);
+  }
+  // The auditor reads everything.
+  runas (Omar) {
+    Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == task));
+    Assert.NotNull(TraceEvent.First(e => e.Task.Id == task && e.Kind == TraceKind.ToolCall).Payload);
+  }
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void the_record_is_written_only_by_the_kit_and_never_changed() {
+  var task = GradedByAda();
+  var receipt = AgentTask.Single(t => t.Id == task);
+  var line = TraceEvent.First(e => e.Task.Id == task && e.Kind == TraceKind.ToolCall);
+
+  Assert.Denied(() => { ForgeLine(receipt); UnitOfWork.Commit(); });
+  UnitOfWork.Discard();
+  Assert.Denied(() => { RewriteLine(line); UnitOfWork.Commit(); });
+  UnitOfWork.Discard();
+  Assert.Denied(() => { line.Delete(); UnitOfWork.Commit(); });
+  UnitOfWork.Discard();
+  Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == task));
+  Assert.True(VerifyTrace(receipt).Intact);
+}

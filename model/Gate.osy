@@ -1,0 +1,244 @@
+// The gate — what an agent may do alone, what it must propose to a person first, and what it never does.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+
+/// What an agent may do with a tool. ⚠ Appended, never inserted: an enum is stored by position.
+public enum Leave {
+  /// It runs it, as the agent and never past the person it works for.
+  [Label("Alone")] Alone,
+  /// It proposes it: a person sees exactly what would be done and says yes or no. A person the app trusts with that
+  /// may say "from now on, do this alone" for work done for them (`AllowAlone`).
+  [Label("Proposes first")] Propose,
+  /// It proposes it, every time. Nobody's "from now on" covers it.
+  [Label("Proposes every time")] ProposeEveryTime,
+  /// It does not, and nothing a person approves makes it.
+  [Label("Never")] Never,
+}
+
+/// ⭐ WHAT AN AGENT MAY DO ALONE — said by what a tool DOES, and tool by tool where one is different.
+///
+///     public override Permits May => new Permits {
+///       Changes = Leave.Alone,                        // it files and flags by itself
+///       Sends = Leave.Propose,                        // a letter to a customer is proposed first
+///       Never = [Actions.Of(CondemnCrate)],           // and it never condemns a crate
+///     };
+///
+/// ⚑ THE DEFAULT IS SAFE: an agent that says nothing may look things up alone, and proposes everything else. What a
+///   tool does — changes the app's data, sends something to somebody, spends, reaches outside — is what the compiler
+///   proved of the action, so nothing is written twice and nothing can be declared safer than it is.
+///
+/// An agent's `May` is its ceiling; a skill's `May` can only be stricter for that skill. The stricter of the two
+/// decides, tool by tool.
+public class Permits {
+  /// A tool that creates, changes or deletes the app's own data.
+  public Leave Changes = Leave.Propose;
+  /// A tool that sends something to somebody — a mail, a message.
+  public Leave Sends = Leave.Propose;
+  /// A tool that spends money or an allowance.
+  public Leave Spends = Leave.Propose;
+  /// A tool that reaches outside the app in some other way.
+  public Leave ReachesOut = Leave.Propose;
+  /// Tool by tool, whatever it does. A tool named in two lists gets the stricter.
+  public List<ActionInfo> Alone = [];
+  public List<ActionInfo> Propose = [];
+  public List<ActionInfo> ProposeEveryTime = [];
+  public List<ActionInfo> Never = [];
+
+  /// Everything a skill lists, alone — for a skill whose tools are all safe to run unasked.
+  public static Permits Everything() {
+    return new Permits { Changes = Leave.Alone, Sends = Leave.Alone, Spends = Leave.Alone, ReachesOut = Leave.Alone };
+  }
+  /// The app's own data alone; anything that leaves it — a send, a spend, a call outside — proposed.
+  public static Permits ChangesAlone() { return new Permits { Changes = Leave.Alone }; }
+
+  /// What this says about one tool.
+  public Leave For(ActionInfo tool) {
+    var leave = Leave.Alone;
+    var named = false;
+    foreach (var a in Never) { if (a.Name == tool.Name) { return Leave.Never; } }
+    foreach (var a in ProposeEveryTime) { if (a.Name == tool.Name) { leave = Stricter(leave, Leave.ProposeEveryTime); named = true; } }
+    foreach (var a in Propose) { if (a.Name == tool.Name) { leave = Stricter(leave, Leave.Propose); named = true; } }
+    foreach (var a in Alone) { if (a.Name == tool.Name) { named = true; } }
+    if (named) { return leave; }
+    // Not named: by what it does. A query only reads, and is always its own to run.
+    if (tool.Query) { return Leave.Alone; }
+    var effects = tool.Effects;
+    if (effects.Spends) { leave = Stricter(leave, Spends); }
+    if (effects.Sends) { leave = Stricter(leave, Sends); }
+    if (effects.External && !effects.Sends && !effects.Spends) { leave = Stricter(leave, ReachesOut); }
+    if (effects.Creates.Count + effects.Modifies.Count + effects.Deletes.Count > 0) { leave = Stricter(leave, Changes); }
+    return leave;
+  }
+}
+
+/// The stricter of two.
+public Leave Stricter(Leave a, Leave b) { return Rank(a) >= Rank(b) ? a : b; }
+int Rank(Leave leave) { return leave == Leave.Never ? 3 : leave == Leave.ProposeEveryTime ? 2 : leave == Leave.Propose ? 1 : 0; }
+
+/// Who may tell an agent "from now on, do this alone" — a standing rule for the work it does for them — and take
+/// it back. Nobody, until the app says: `policy WidensAgentAutonomy => IsLead;`.
+virtual policy WidensAgentAutonomy => false;
+
+/// ⭐ A STANDING RULE: one tool an agent may run alone from now on, where its declaration says "propose" — said by a
+/// person after seeing what it proposes ("approve all like this"), and theirs to take back.
+///
+/// ⚑ IT WIDENS NOTHING PAST THE DECLARATION. A tool the agent never runs, or proposes every time, takes no standing
+///   rule; and the tool still runs as the agent and never past the person the work is for.
+public entity AgentStandingRule {
+  /// The agent and the tool, each by its full name; and the skill it holds for ("" for every skill of the agent).
+  [Required, Immutable, MaxLength(200), Index] string Agent;
+  [Required, Immutable, MaxLength(300)] string Action;
+  [Immutable, MaxLength(200)] string Skill = "";
+  /// Whose work it covers: work the agent does FOR this person. Null: for anybody — said by whoever supervises —
+  /// or, once `ErasedAt` is set, for a person who has since been erased: such a rule is taken back first.
+  [Classification(Personal.Identity)] Principal? For;
+  /// Who gave it. Nobody: they have been taken off it (`ForgetWhoOversawAgents`).
+  [Classification(Personal.Identity)] Principal? GrantedBy;
+  [Immutable] DateTime At = DateTime.UtcNow;
+  /// The proposal it was said on, when it was, by its id.
+  [Immutable] Guid? FromProposal;
+  DateTime? RevokedAt;
+  [Classification(Personal.Identity)] Principal? RevokedBy;
+  [MaxLength(300)] string RevokedWhy = "";
+  /// When the person whose work it covered was erased: it was taken back, and no longer says whose work it was.
+  DateTime? ErasedAt;
+  /// How many times a tool has run alone because of it, and when it last did. Counted by the kit as the tool runs.
+  int Used = 0;
+  DateTime? LastUsedAt;
+
+  security {
+    // A rule is read by whoever it covers — a rule for anybody's work, by anybody who gives agents work.
+    allow read when UsesAgents where For == null || For == user || GrantedBy == user;
+    allow read when SupervisesAgents || AuditsAgents;
+    allow create when WidensAgentAutonomy;
+    allow update when WidensAgentAutonomy where GrantedBy == user;
+    allow update when SupervisesAgents;
+    deny create except via AllowAlone;
+    deny update RevokedAt, RevokedWhy except via RevokeStandingRule, EraseStandingRulesFor;
+    deny update RevokedBy except via RevokeStandingRule, ForgetWhoOversawAgents;
+    // Whose it was goes only with the person: who gave it, when they are taken off it; whose work it covered, when
+    // that person is erased — and then the rule has been taken back, so a rule never widens to everybody's work.
+    deny update GrantedBy except via ForgetWhoOversawAgents;
+    deny update For, ErasedAt except via EraseStandingRulesFor;
+    // Its use is counted as whoever the work is for: every other member is immutable or written above, so this
+    // grant lets them write nothing else.
+    allow update when UsesAgents;
+    deny update Used, LastUsedAt except via NoteStandingRuleUsed;
+    deny delete;
+  }
+}
+
+/// ⭐ FROM NOW ON, ALONE: let an agent run one of its tools without proposing it, for the work it does for whoever
+/// says so. `forEverybody` covers the work it does for anybody, and is for whoever supervises the agents.
+///
+///     AllowAlone(Agents.Of<Clerk>().Name, Actions.Of(FileReceipt));
+///
+/// Refused for a tool the agent's declaration says it never runs or proposes every time, and for a tool none of its
+/// skills holds.
+[Server, Authorize(WidensAgentAutonomy)]
+public AgentStandingRule AllowAlone(string agent, ActionInfo tool, string skill = "", bool forEverybody = false, Guid? fromProposal = null) {
+  var definition = Definition(agent);
+  var me = Security.CurrentUserId;
+  if (me == null) { throw new AgentRefused("A standing rule is a person's to give: nobody is signed in."); }
+  var person = Principal.Single(p => p.Id == me);
+  if (forEverybody && !Security.Authorize(person, SupervisesAgents)) {
+    throw new AgentRefused("A rule for the work an agent does for anybody is for whoever supervises the agents. Leave `forEverybody` out to say it for your own.");
+  }
+  var declared = DeclaredLeave(definition, skill, tool);
+  var bare = BareName(tool.Name);
+  if (declared == null) { throw new AgentRefused($"{BareName(agent)} has no tool {bare}" + (skill == "" ? "." : $" in {BareName(skill)}.")); }
+  if (declared == Leave.Never) { throw new AgentRefused($"{BareName(agent)} never runs {bare}: its declaration says so, and no rule changes that."); }
+  if (declared == Leave.ProposeEveryTime) { throw new AgentRefused($"{BareName(agent)} proposes {bare} every time: its declaration says so, and no rule changes that."); }
+  Principal? whose = forEverybody ? null : person;
+  var there = AgentStandingRule.FirstOrDefault(r => r.Agent == agent && r.Action == tool.Name && r.Skill == skill && r.For == whose && r.RevokedAt == null);
+  if (there != null) { return there!; }
+  return new AgentStandingRule { Agent = agent, Action = tool.Name, Skill = skill, For = whose, GrantedBy = person, FromProposal = fromProposal };
+}
+
+/// Take a standing rule back: the agent proposes that tool again from its next step. Whoever gave it, or whoever
+/// supervises the agents.
+[Server, Authorize(IsAuthenticated)]
+public void RevokeStandingRule(AgentStandingRule rule, string why = "") {
+  if (rule.RevokedAt != null) { return; }
+  var me = Security.CurrentUserId;
+  var person = Principal.Single(p => p.Id == me);
+  if ((rule.GrantedBy == null || rule.GrantedBy!.Id != person.Id) && !Security.Authorize(person, SupervisesAgents)) {
+    throw new AgentRefused("A standing rule is taken back by whoever gave it, or by whoever supervises the agents.");
+  }
+  rule.RevokedAt = DateTime.UtcNow;
+  rule.RevokedBy = person;
+  rule.RevokedWhy = Clipped(why, 300);
+}
+
+/// Count one use of a standing rule: a tool ran alone because of it.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal void NoteStandingRuleUsed(Guid rule) {
+  var row = AgentStandingRule.FirstOrDefault(r => r.Id == rule);
+  if (row == null) { return; }
+  row.Used = row.Used + 1;
+  row.LastUsedAt = DateTime.UtcNow;
+}
+
+/// What an agent's declaration says about one tool: the stricter of the agent's own and — for work on a skill — the
+/// skill's. Null: no skill of the agent holds the tool (for `skill`, when one is named).
+Leave? DeclaredLeave(Agent definition, string skill, ActionInfo tool) {
+  Leave? leave = null;
+  foreach (var s in definition.Skills) {
+    if (skill != "" && SkillNameOf(s) != skill) { continue; }
+    var held = false;
+    foreach (var t in s.Tools) { if (t.Name == tool.Name) { held = true; } }
+    if (!held) { continue; }
+    var here = definition.May.For(tool);
+    var skills = s.May;
+    if (skills != null) { here = Stricter(here, skills!.For(tool)); }
+    // A tool several skills hold, asked about for the agent as a whole: the strictest of them.
+    leave = leave == null ? here : Stricter(leave!.Value, here);
+  }
+  return leave;
+}
+
+/// What the gate says about one tool for one piece of work, and why — in words for the record.
+public class GateVerdict {
+  public Leave Leave = Leave.Propose;
+  /// A standing rule let it run alone: which.
+  public Guid? Rule;
+  /// The standing rules given for agents ABOVE this work that let it run alone here — each lifted that agent's
+  /// "propose" for what it hands on.
+  public List<Guid> RulesAbove = [];
+  public string Why = "";
+}
+
+/// ⭐ THE GATE, asked before every tool: the declaration first; then, for a tool it says is proposed, whether a
+/// person has said "alone from now on" for the work this is.
+GateVerdict GateFor(AgentRun run, Agent definition, ActionInfo tool) {
+  var declared = DeclaredLeave(definition, run.Skill, tool);
+  if (declared == null) { return new GateVerdict { Leave = Leave.Never, Why = "it is not one of this work's tools" }; }
+  if (declared == Leave.Never) { return new GateVerdict { Leave = Leave.Never, Why = "the agent's declaration says it never does" }; }
+  // Work that was handed on: the gate of every piece of work above it holds here too — see `GateAbove`.
+  List<Guid> lifted = [];
+  var above = run.Parent == null ? null : GateAbove(run, tool, lifted);
+  if (above != null && above!.Leave == Leave.Never) { return above!; }
+  if (above != null && above!.Leave == Leave.ProposeEveryTime) { return above!; }
+  if (declared == Leave.ProposeEveryTime) { return new GateVerdict { Leave = Leave.ProposeEveryTime, Why = "its declaration says it is proposed every time" }; }
+  if (above != null && above!.Leave == Leave.Propose) { return above!; }
+  if (declared == Leave.Alone) {
+    var why = tool.Query ? "it only reads" : "its declaration lets it";
+    if (lifted.Count > 0) { why = why + ", and a person said the work above it may, from now on"; }
+    return new GateVerdict { Leave = Leave.Alone, RulesAbove = lifted, Why = why };
+  }
+  var rule = StandingRuleFor(run.Agent, run.Skill, tool.Name, run.Person);
+  if (rule != null) { return new GateVerdict { Leave = Leave.Alone, Rule = rule, RulesAbove = lifted, Why = "a person said it may, from now on" }; }
+  return new GateVerdict { Leave = Leave.Propose, Why = "its declaration says it is proposed first" };
+}
+
+/// The standing rule that covers a tool for work done for `person`, if one stands. Read where it is stored, so a
+/// rule taken back a moment ago no longer counts.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal Guid? StandingRuleFor(string agent, string skill, string action, Guid? person) {
+  foreach (var rule in AgentStandingRule.Where(r => r.Agent == agent && r.Action == action && r.RevokedAt == null).Take(50).ToList()) {
+    if (rule.Skill != "" && rule.Skill != skill) { continue; }
+    if (rule.For == null || (person != null && rule.For!.Id == person)) { return rule.Id; }
+  }
+  return null;
+}

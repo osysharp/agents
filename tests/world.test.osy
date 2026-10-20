@@ -1,0 +1,41 @@
+// The packhouse the tests run in: two growers, the lead who is in charge of the agents, an auditor, the records clerk,
+// and a few crates.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse;
+
+[TestFixture]
+void Yard() {
+  var ada = new Person { Email = "ada@packhouse.example", DisplayName = "Ada" };
+  var ben = new Person { Email = "ben@packhouse.example", DisplayName = "Ben", NoSecondOpinions = true };
+  var dana = new Person { Email = "dana@packhouse.example", DisplayName = "Dana" };
+  var omar = new Person { Email = "omar@packhouse.example", DisplayName = "Omar" };
+  new RoleGrant { Member = ada, Role = PackhouseRole.Grower };
+  new RoleGrant { Member = ben, Role = PackhouseRole.Grower };
+  new RoleGrant { Member = dana, Role = PackhouseRole.Lead };
+  new RoleGrant { Member = omar, Role = PackhouseRole.Auditor };
+  var rita = new Person { Email = "rita@packhouse.example", DisplayName = "Rita" };
+  new RoleGrant { Member = rita, Role = PackhouseRole.Records };
+  new Crate { Code = "A-1", Grower = ada, Kilos = 12.5m };
+  new Crate { Code = "A-2", Grower = ada, Kilos = 8m };
+  new Crate { Code = "B-1", Grower = ben, Kilos = 11m };
+  // The lead answers for both agents.
+  new AgentSeat { Agent = "Packhouse.Inspector", Sponsor = dana };
+  new AgentSeat { Agent = "Packhouse.Sorter", Sponsor = dana };
+  new AgentSeat { Agent = "Packhouse.Clerk", Sponsor = dana };
+  new AgentSeat { Agent = "Packhouse.Porter", Sponsor = dana };
+  // The crew that hands work on: the lead answers for the foreman and the usher, the auditor for the two at the top.
+  new AgentSeat { Agent = "Packhouse.Foreman", Sponsor = dana };
+  new AgentSeat { Agent = "Packhouse.Usher", Sponsor = dana };
+  new AgentSeat { Agent = "Packhouse.Director", Sponsor = omar };
+  new AgentSeat { Agent = "Packhouse.Yardmaster", Sponsor = omar };
+  new AgentSeat { Agent = "Packhouse.Steward", Sponsor = dana };
+  new AgentSeat { Agent = "Packhouse.Warden", Sponsor = dana };
+}
+
+principal Ada  => Person.Single(p => p.Email == "ada@packhouse.example");
+principal Ben  => Person.Single(p => p.Email == "ben@packhouse.example");
+principal Dana => Person.Single(p => p.Email == "dana@packhouse.example");
+principal Omar => Person.Single(p => p.Email == "omar@packhouse.example");
+principal Rita => Person.Single(p => p.Email == "rita@packhouse.example");

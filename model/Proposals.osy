@@ -1,0 +1,408 @@
+// Proposals — what an agent wants to do and may not do alone: the exact call, what it would change, why — put to a
+// person, and run as that person when they say yes.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+
+/// Where a proposal stands. ⚠ Appended, never inserted: an enum is stored by position.
+public enum ProposalStatus {
+  /// It waits for a person.
+  [Label("Waiting")] Waiting,
+  /// A person said yes and it ran, as them.
+  [Label("Approved and done")] Done,
+  /// A person said yes and it did not run: what they may do did not cover it, or the action failed.
+  [Label("Approved, and it could not be done")] Failed,
+  /// A person said no, with a reason the agent is given.
+  [Label("Rejected")] Rejected,
+  /// What it was about changed after it was proposed, so a yes no longer covers it. The agent looks again.
+  [Label("Out of date")] Stale,
+  /// The work it belonged to ended before anybody decided.
+  [Label("Withdrawn")] Withdrawn,
+}
+
+/// ⭐ ONE PROPOSAL: the tool an agent wants to run, with the arguments it would run it with — exactly — what running
+/// it does, why the agent wants to, and what it had looked at. A person decides; a yes runs it AS THAT PERSON, and
+/// only as it was proposed.
+///
+/// Made and decided only by this package's own functions.
+public entity AgentProposal {
+  [Required, Immutable, Index] AgentTask Task;
+  /// The agent, the skill and its version, and the tool, each by its full name.
+  [Required, Immutable, MaxLength(200), Index] string Agent;
+  [Immutable, MaxLength(200)] string Skill = "";
+  [Immutable, MaxLength(40)] string SkillVersion = "";
+  [Required, Immutable, MaxLength(300)] string Action;
+  /// The tool as a person reads it — "Refund the order" — and what running it does, in a few words.
+  [Immutable, MaxLength(200)] string Label = "";
+  [Immutable, MaxLength(300)] string Does = "";
+  [Immutable] bool Changes = false;
+  [Immutable] bool Sends = false;
+  [Immutable] bool Spends = false;
+  /// The arguments, as the one JSON object the tool would be run with.
+  [Classification(Personal.Content)] string ArgumentsJson = "{}";
+  /// The same arguments as a person reads them — each with its name and what the skill calls its value (`Names`) —
+  /// as a JSON list of `ProposalLine`.
+  [Classification(Personal.Content)] string ShownJson = "[]";
+  /// Why the agent wants to: what it said as it proposed it.
+  [Classification(Personal.Content), MaxLength(4000)] string Why = "";
+  /// What it had looked at first: the tools it ran before this, each with what came back, as a list of `ProposalEvidence`.
+  [Classification(Personal.Content)] string EvidenceJson = "[]";
+  /// The version of what it would act on, as the skill says it (`VersionOf`) — "" when the skill says nothing.
+  [Immutable, MaxLength(200)] string SubjectVersion = "";
+  /// The instruction set the agent was working under as it proposed, by its number and its hash (Instructions.osy).
+  [Immutable] int InstructionSet = 0;
+  [Immutable, MaxLength(64)] string InstructionSetHash = "";
+  /// What a yes is a yes TO: the SHA-256 of the agent, the skill and its version, the tool, its arguments, the
+  /// subject's version and the instruction set. Worked out again when somebody decides; a yes to anything else is not
+  /// a yes to this.
+  [Immutable, MaxLength(64)] string Fingerprint = "";
+  /// Who it is put to: the person the work is for; the agent's sponsor when it is for nobody — or the one person its
+  /// skill names (`Routed`). Null when the skill sends it to a queue.
+  [Classification(Personal.Identity)] Principal? DecideBy;
+  /// The skill sent it somewhere other than the person the work is for (`SkillBase.DecidedBy`): to one person
+  /// (`DecideBy`) or to a work queue, by its name (`DecideQueue`). Such a proposal is not decided by the person the
+  /// work is for.
+  [Immutable] bool Routed = false;
+  [Immutable, MaxLength(200)] string DecideQueue = "";
+  /// Through whom it comes, when the work was handed on: "Checker, working for Coordinator". "": the agent's own work.
+  [Immutable, MaxLength(600)] string AskedThrough = "";
+  /// The model's id for the call, so its answer is paired with it.
+  [Immutable, MaxLength(200)] string ToolUseId = "";
+  [Immutable] DateTime At = DateTime.UtcNow;
+
+  ProposalStatus Status = ProposalStatus.Waiting;
+  [Classification(Personal.Identity)] Principal? DecidedBy;
+  DateTime? DecidedAt;
+  /// Why not — what the agent is told.
+  [Classification(Personal.Content), MaxLength(2000)] string Reason = "";
+  /// What the tool answered when it ran, as JSON; or why it did not.
+  [Classification(Personal.Content)] string? ResultJson;
+  [Classification(Personal.Content), MaxLength(2000)] string Problem = "";
+
+  security {
+    // Whoever it is put to, whoever the work is for and whoever gave it; whoever supervises or audits reads all.
+    allow read when IsAuthenticated where DecideBy == user || Task.Requester == user || Task.StartedBy == user;
+    allow read when SupervisesAgents || AuditsAgents || DecidesAgentProposals || TeachesAgents;
+    allow create when UsesAgents;
+    deny create except via ProposeAgentAction;
+    allow update when IsAuthenticated where DecideBy == user || Task.Requester == user;
+    allow update when SupervisesAgents || DecidesAgentProposals;
+    // SECURITY-INVARIANT(agents-a-proposal-is-decided-once-by-a-person-and-run-as-them): how a proposal ended is
+    // written by `SettleAgentProposal` alone, which every way of deciding one goes through — after it has asked who
+    // is deciding, worked the fingerprint out again and asked the gate again. Guarded by tests/autonomy.test.osy
+    // `an_approved_proposal_runs_as_the_approver`, `a_proposal_is_decided_only_through_the_kit`.
+    deny update Status, DecidedAt except via SettleAgentProposal;
+    deny update Reason, ResultJson, Problem except via SettleAgentProposal, EraseAgentWorkContent;
+    deny update DecidedBy except via SettleAgentProposal, AnonymiseAgentWork, ForgetWhoOversawAgents;
+    // What was proposed is never changed — it is what a yes was said to — and goes only when the work's content does.
+    deny update ArgumentsJson, ShownJson, Why, EvidenceJson except via EraseAgentWorkContent;
+    deny update DecideBy except via AnonymiseAgentWork, ForgetWhoOversawAgents;
+    allow update, delete when ErasesAgentRecords;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+/// One argument of a proposed call, as a person reads it.
+public class ProposalLine {
+  public string Name = "";
+  public string Value = "";
+}
+
+/// One thing an agent had looked at before it proposed: the tool, and what came back.
+public class ProposalEvidence {
+  public string Tool = "";
+  public string Said = "";
+}
+
+/// What a proposal is made from.
+public class ProposalDraft {
+  public Guid Task;
+  public string Agent = "";
+  public string Skill = "";
+  public string SkillVersion = "";
+  public string Action = "";
+  public string Label = "";
+  public string Does = "";
+  public bool Changes = false;
+  public bool Sends = false;
+  public bool Spends = false;
+  public string ArgumentsJson = "{}";
+  public string ShownJson = "[]";
+  public string Why = "";
+  public string EvidenceJson = "[]";
+  public string SubjectVersion = "";
+  public int InstructionSet = 0;
+  public string InstructionSetHash = "";
+  public Guid? DecideBy;
+  public bool Routed = false;
+  public string DecideQueue = "";
+  public string ToolUseId = "";
+  public string AskedThrough = "";
+}
+
+/// What a yes is a yes to.
+public string ProposalFingerprint(string agent, string skill, string skillVersion, string action, string argumentsJson, string subjectVersion, string instructionSetHash) {
+  return Crypto.Sha256Hex(string.Join("\n", [agent, skill, skillVersion, action, argumentsJson, subjectVersion, instructionSetHash]));
+}
+
+/// Put a proposal to a person. Answers its id.
+[Server, Authorize(UsesAgents), OwnUnitOfWork]
+internal Guid ProposeAgentAction(ProposalDraft draft) {
+  var proposal = new AgentProposal {
+    Task = AgentTask.Single(t => t.Id == draft.Task), Agent = draft.Agent, Skill = draft.Skill, SkillVersion = draft.SkillVersion,
+    Action = draft.Action, Label = Clipped(draft.Label, 200), Does = Clipped(draft.Does, 300), Changes = draft.Changes,
+    Sends = draft.Sends, Spends = draft.Spends, ArgumentsJson = draft.ArgumentsJson, ShownJson = draft.ShownJson, Why = Clipped(draft.Why, 4000),
+    EvidenceJson = draft.EvidenceJson, SubjectVersion = Clipped(draft.SubjectVersion, 200),
+    InstructionSet = draft.InstructionSet, InstructionSetHash = draft.InstructionSetHash,
+    Fingerprint = ProposalFingerprint(draft.Agent, draft.Skill, draft.SkillVersion, draft.Action, draft.ArgumentsJson, draft.SubjectVersion, draft.InstructionSetHash),
+    DecideBy = draft.DecideBy == null ? null : Principal.FirstOrDefault(p => p.Id == draft.DecideBy), ToolUseId = draft.ToolUseId,
+    Routed = draft.Routed, DecideQueue = Clipped(draft.DecideQueue, 200),
+    AskedThrough = Clipped(draft.AskedThrough, 600),
+  };
+  Raise(new AgentProposed { Proposal = proposal });
+  return proposal.Id;
+}
+
+/// What became of a decision.
+public class ProposalDecision {
+  public ProposalStatus Status = ProposalStatus.Waiting;
+  /// What to tell the person who decided.
+  public string Said = "";
+  /// What the tool answered, as JSON, when it ran.
+  public string ResultJson = "";
+}
+
+/// What a proposal's fingerprint is NOW: the same sum over the skill as it stands, the subject as it stands and the
+/// instruction set the agent is on. When it differs from the proposal's own, what was proposed is no longer what
+/// would be done — or no longer what the agent, told what it is told now, would propose.
+public string ProposalFingerprintNow(AgentProposal proposal) {
+  return ProposalFingerprintWith(proposal, InstructionSetHashNow(proposal.Agent));
+}
+
+/// The same sum, with the instruction set said — the proposal's own, to ask whether anything ELSE changed.
+string ProposalFingerprintWith(AgentProposal proposal, string instructionSetHash) {
+  var definition = Definition(proposal.Agent);
+  var version = proposal.SkillVersion;
+  var subject = proposal.SubjectVersion;
+  foreach (var s in definition.Skills) {
+    if (SkillNameOf(s) == proposal.Skill) {
+      version = s.Version;
+      subject = s.VersionOf(proposal.Action, proposal.ArgumentsJson);
+    }
+  }
+  return ProposalFingerprint(proposal.Agent, proposal.Skill, version, proposal.Action, proposal.ArgumentsJson, subject, instructionSetHash);
+}
+
+/// ⭐ SAY YES TO A PROPOSAL. It runs now, AS WHOEVER SAYS YES — and as the agent: the tool does only what both may —
+/// and only as it was proposed: the same tool, the same arguments, for the same version of what it acts on. The
+/// agent's work then goes on from where it stood, with what the tool answered.
+///
+/// For the person it is put to, the person the work is for, and whoever supervises the agents. `alwaysLikeThis`:
+/// also let the agent run this tool alone from now on, for the work it does for you (`AllowAlone`).
+///
+/// It does NOT run — and says why — when what it was about has changed since it was proposed (the agent looks
+/// again), when the agent's declaration no longer lets it be done at all, or when what you may do does not cover it.
+[Server, Authorize(IsAuthenticated)]
+public ProposalDecision ApproveAgentProposal(AgentProposal proposal, bool alwaysLikeThis = false) {
+  var me = RequireDecider(proposal);
+  if (alwaysLikeThis) {
+    var tool = Actions.Find(proposal.Action);
+    if (tool == null) { throw new AgentRefused($"There is no action {BareName(proposal.Action)} any more."); }
+    AllowAlone(proposal.Agent, tool!, proposal.Skill, fromProposal: proposal.Id);
+  }
+  return DecideAgentProposal(proposal.Id, true, "", me.Id);
+}
+
+/// ⭐ SAY NO, with the reason — which the agent is given, and goes on from.
+[Server, Authorize(IsAuthenticated)]
+public ProposalDecision RejectAgentProposal(AgentProposal proposal, string reason) {
+  var me = RequireDecider(proposal);
+  if (reason.Trim() == "") { throw new ValidationException("Say why not: the agent is told, and can do something about it."); }
+  return DecideAgentProposal(proposal.Id, false, reason.Trim(), me.Id);
+}
+
+/// A decision a person made somewhere else — on a request in their inbox — carried to the proposal by the code that
+/// received it. `by` is that person: the tool runs as them. A no needs nobody — a request that ran out of time is
+/// a no with its reason.
+///
+/// ⚑ FOR CODE THAT RUNS AS THE APP ONLY. No signed-in caller reaches it: a person says yes with `ApproveAgentProposal`,
+///   which reads who they are from the session.
+[Server, Authorize(IsTheApp)]
+public ProposalDecision RelayProposalDecision(AgentProposal proposal, bool approved, string reason, Principal? by) {
+  if (approved && by == null) { throw new AgentRefused("A yes is somebody's: say who approved."); }
+  // The same line `RequireDecider` holds, for a yes that arrives from an inbox: see the invariant there.
+  if (approved && proposal.Routed && proposal.Task.Requester != null && proposal.Task.Requester!.Id == by!.Id
+      && (proposal.DecideBy == null || proposal.DecideBy!.Id != by!.Id) && !Security.Authorize(by!, DecidesAgentProposals)) {
+    throw new AgentRefused($"This proposal is decided by {RouteWords(proposal)}: the skill that proposed it says so. The work is for {NameOfPrincipal(by!)}; the decision is not theirs.");
+  }
+  return DecideAgentProposal(proposal.Id, approved, reason, by == null ? null : by!.Id);
+}
+
+/// Whoever is signed in, when a proposal is theirs to decide.
+Principal RequireDecider(AgentProposal proposal) {
+  var me = Security.CurrentUserId;
+  var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+  if (person == null) { throw new AgentRefused("A proposal is decided by a person: nobody is signed in."); }
+  var forThem = proposal.Task.Requester != null && proposal.Task.Requester!.Id == person!.Id;
+  // SECURITY-INVARIANT(agents-a-routed-proposal-is-not-decided-by-who-the-work-is-for): a proposal its skill sends
+  // somewhere else — to a queue, to one person it names — is decided there, by whoever `DecidesAgentProposals` admits,
+  // and by nobody else: the person the work is for reads it and does not decide it. Failure mode: somebody asks an
+  // agent for a refund and approves it themselves, past the people the skill says approve refunds. Guarded by
+  // tests/routing.test.osy `a_proposal_a_skill_sends_elsewhere_is_not_decided_by_who_the_work_is_for`.
+  var theirs = (proposal.DecideBy != null && proposal.DecideBy!.Id == person!.Id)
+            || (!proposal.Routed && forThem)
+            || Security.Authorize(person!, DecidesAgentProposals);
+  if (!theirs && proposal.Routed && forThem) {
+    throw new AgentRefused($"This proposal is decided by {RouteWords(proposal)}: the skill that proposed it says so. The work is for you; the decision is not yours.");
+  }
+  // SECURITY-INVARIANT(agents-another-persons-proposal-is-decided-by-who-the-app-names): a proposal is decided by the
+  // person it is put to, the person the work is for, and whoever `DecidesAgentProposals` admits — whoever supervises,
+  // until the app says more — and by nobody else. Failure mode: anybody who can read a proposal says yes to it.
+  // Guarded by tests/roles.test.osy `a_proposal_put_to_somebody_else_is_decided_by_who_the_app_names` and
+  // tests/autonomy.test.osy `a_proposal_is_decided_only_through_the_kit_by_who_it_is_put_to`.
+  if (!theirs) { throw new AgentRefused("This proposal is not put to you."); }
+  return person!;
+}
+
+/// Where a proposal was put, as a person reads it: "Ada", "the Finance queue".
+public string RouteWords(AgentProposal proposal) {
+  if (proposal.DecideQueue != "") { return "the " + proposal.DecideQueue + " queue"; }
+  if (proposal.DecideBy != null) { return NameOfPrincipal(proposal.DecideBy!); }
+  return "whoever decides agents' proposals";
+}
+
+/// One decision, however it arrived: checked, run when it is a yes, written down, and the work woken.
+ProposalDecision DecideAgentProposal(Guid id, bool approved, string reason, Guid? by) {
+  var proposal = AgentProposal.Single(p => p.Id == id);
+  var bare = BareName(proposal.Agent);
+  if (proposal.Status != ProposalStatus.Waiting) {
+    throw new AgentRefused($"This proposal has already been decided: {proposal.Status.Label.ToLower()}.");
+  }
+  if (!approved) {
+    SettleAgentProposal(id, ProposalStatus.Rejected, by, reason, null, "");
+    WakeAgentWork(proposal.Task.Id);
+    return new ProposalDecision { Status = ProposalStatus.Rejected, Said = $"{bare} has been told no, and why." };
+  }
+
+  // SECURITY-INVARIANT(agents-out-of-envelope-is-never-approvable): a yes cannot make an agent do what its declaration
+  // says it never does, or run a tool its skill no longer holds — the gate is asked again, now, and a tool outside
+  // it does not run whoever approves. Guarded by tests/autonomy.test.osy `out_of_envelope_is_never_approvable`.
+  var definition = Definition(proposal.Agent);
+  var tool = Actions.Find(proposal.Action);
+  var declared = tool == null ? null : DeclaredLeave(definition, proposal.Skill, tool!);
+  // …and so is the gate of every piece of work above the one that proposed it.
+  if (declared != null && NeverAbove(proposal.Task.Id, tool!) != "") { declared = Leave.Never; }
+  if (declared == null || declared == Leave.Never) {
+    SettleAgentProposal(id, ProposalStatus.Stale, by, "", null, $"{bare} may no longer do this at all.");
+    WakeAgentWork(proposal.Task.Id);
+    return new ProposalDecision { Status = ProposalStatus.Stale, Said = $"{bare} may no longer do this at all, so it was not done." };
+  }
+  // SECURITY-INVARIANT(agents-an-approval-is-of-what-was-proposed): a yes is to the fingerprint that was shown. When
+  // the skill or what the tool would act on has changed since, the same sum comes out different and nothing runs:
+  // the agent is told, and proposes again from what is true now. Guarded by tests/autonomy.test.osy
+  // `a_yes_does_not_cover_what_changed_after_it_was_proposed`.
+  if (ProposalFingerprintNow(proposal) != proposal.Fingerprint) {
+    // SECURITY-INVARIANT(agents-an-approval-is-of-the-instruction-set-it-was-proposed-under): the fingerprint covers
+    // the agent's instruction set. A yes to something the agent proposed under one set does not carry to another: an
+    // instruction made active, retired or rolled back since may be the very thing that would have stopped it. Nothing
+    // runs; the work takes up the instructions as they stand and proposes again. Guarded by tests/teaching.test.osy
+    // `a_yes_does_not_carry_from_one_instruction_set_to_another`.
+    var onlyInstructions = ProposalFingerprintWith(proposal, proposal.InstructionSetHash) == proposal.Fingerprint;
+    var changed = onlyInstructions ? $"What {bare} is told has changed since it proposed this." : "What this would act on has changed since it was proposed.";
+    SettleAgentProposal(id, ProposalStatus.Stale, by, "", null, changed);
+    WakeAgentWork(proposal.Task.Id);
+    return new ProposalDecision { Status = ProposalStatus.Stale,
+      Said = onlyInstructions ? $"What {bare} is told has changed since it proposed this, so it was not done. {bare} is looking again, with what it is told now."
+                              : $"What this would act on has changed since {bare} proposed it, so it was not done. {bare} is looking again." };
+  }
+
+  // SECURITY-INVARIANT(agents-an-approved-proposal-runs-as-the-approver): the tool runs as the agent ON BEHALF OF
+  // whoever approved — both must be allowed, by the app's own rules — and never as the app or as the person who first
+  // asked. Guarded by tests/autonomy.test.osy `an_approved_proposal_runs_as_the_approver`.
+  var actor = Principal.Single(p => p.Id == proposal.Task.Actor.Id);
+  var approver = Principal.Single(p => p.Id == by!.Value);
+  var task = AgentTask.Single(t => t.Id == proposal.Task.Id);
+  // Read before the switch of who is acting: inside it, the proposal is read as the agent and the approver may.
+  var action = proposal.Action;
+  var cause = "agent-task:" + task.Id.ToString();
+  var values = Actions.ValuesFromJson(action, proposal.ArgumentsJson);
+  ActionResult result;
+  try {
+    runas (Actor.From(actor), onBehalfOf: approver, scope: task) {
+      result = Actions.Run(action, values, cause: cause);
+    }
+  } catch (Exception e) {
+    result = new ActionResult { Outcome = ActionOutcome.Failed, Said = "", Value = "", Problem = e.Message, RanAs = "" };
+  }
+  if (result.Outcome == ActionOutcome.Done) {
+    SettleAgentProposal(id, ProposalStatus.Done, by, "", result.Value == "" ? JsonSerializer.Serialize("Done.") : result.Value, "");
+    WakeAgentWork(task.Id);
+    return new ProposalDecision { Status = ProposalStatus.Done, Said = "Done, as you.", ResultJson = result.Value };
+  }
+  SettleAgentProposal(id, ProposalStatus.Failed, by, "", null, result.Outcome.Label + ": " + result.Problem);
+  WakeAgentWork(task.Id);
+  return new ProposalDecision { Status = ProposalStatus.Failed, Said = "It could not be done: " + result.Problem };
+}
+
+/// The one place a proposal's ending is written.
+[Server, Authorize(IsAuthenticated)]
+internal void SettleAgentProposal(Guid id, ProposalStatus status, Guid? by, string reason, string? resultJson, string problem) {
+  var proposal = AgentProposal.Single(p => p.Id == id);
+  if (proposal.Status != ProposalStatus.Waiting) { return; }
+  proposal.Status = status;
+  proposal.DecidedBy = by == null ? null : Principal.FirstOrDefault(p => p.Id == by);
+  proposal.DecidedAt = DateTime.UtcNow;
+  proposal.Reason = Clipped(reason, 2000);
+  if (resultJson != null) { proposal.ResultJson = resultJson; }
+  proposal.Problem = Clipped(problem, 2000);
+  UnitOfWork.Commit();
+  Raise(new AgentProposalDecided { Proposal = proposal });
+}
+
+/// The proposals waiting for whoever is signed in.
+public List<AgentProposal> ProposalsForMe() {
+  var me = Security.CurrentUserId;
+  if (me == null) { return []; }
+  return AgentProposal.Where(p => p.Status == ProposalStatus.Waiting && p.DecideBy.Id == me).OrderBy(p => p.At).Take(200).ToList();
+}
+
+/// The arguments of a call as a person reads them: each with its name, and its value as the skill names it.
+string ShownOf(SkillBase skill, string action, string argumentsJson) {
+  List<ProposalLine> lines = [];
+  try {
+    var values = JsonSerializer.Deserialize<Dictionary<string, Json>>(argumentsJson);
+    foreach (var key in values.Keys) {
+      var text = values[key].ToString();
+      if (text.StartsWith("\"") && text.EndsWith("\"") && text.Length >= 2) { text = text.Substring(1, text.Length - 2); }
+      lines.Add(new ProposalLine { Name = key, Value = Clipped(skill.Names(action, key, text), 300) });
+    }
+  } catch (Exception e) { }
+  return JsonSerializer.Serialize(lines);
+}
+
+/// A JSON object's members as a person reads them — "crate: C-104 · flag: short" — for a list or a line of a record.
+public string ArgumentsInWords(string argumentsJson) {
+  List<string> parts = [];
+  try {
+    var values = JsonSerializer.Deserialize<Dictionary<string, Json>>(argumentsJson);
+    foreach (var key in values.Keys) {
+      var text = values[key].ToString();
+      if (text.StartsWith("\"") && text.EndsWith("\"") && text.Length >= 2) { text = text.Substring(1, text.Length - 2); }
+      parts.Add(key + ": " + Clipped(text, 120));
+    }
+  } catch (Exception e) { return Clipped(argumentsJson, 300); }
+  return string.Join(" · ", parts);
+}
+
+/// ⭐ THE ARGUMENTS OF A CALL AN AGENT MADE, AS A PERSON READS THEM — each with its name, and its value as the skill
+/// that made the call names it (`SkillBase.Names`: a supplier's name, not its id). What a proposal shows a person
+/// before they decide, for any call on a record: `ArgumentsAsRead(line's task's Agent, its Skill, line.Tool, line.Payload)`.
+/// An agent or a skill the app no longer has names nothing: the values come back as they were sent.
+public List<ProposalLine> ArgumentsAsRead(string agent, string skill, string action, string argumentsJson) {
+  SkillBase named = new Conversation();
+  foreach (var a in App.Setting<AgentsSetup>().Agents) {
+    if (AgentNameOf(a) != agent) { continue; }
+    foreach (var s in a.Skills) { if (SkillNameOf(s) == skill) { named = s; } }
+  }
+  return JsonSerializer.Deserialize<List<ProposalLine>>(ShownOf(named, action, argumentsJson));
+}

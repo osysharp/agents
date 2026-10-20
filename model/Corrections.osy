@@ -1,0 +1,215 @@
+// Corrections — a person who sees a piece of an agent's work says what was wrong with it, what right looks like, and
+// why. A correction is a record on that exact piece of work; it changes nothing the agent does until somebody draws
+// an instruction from it and a person the app trusts with that makes the instruction active (Instructions.osy).
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+
+/// What of a piece of work a correction is about. ⚠ Appended, never inserted: an enum is stored by position.
+public enum CorrectionAbout {
+  /// What the work handed back.
+  [Label("The result")] Result,
+  /// Something it proposed to a person.
+  [Label("A proposal")] Proposal,
+  /// One step of its record.
+  [Label("A step")] Step,
+}
+
+/// How much it mattered. ⚠ Appended, never inserted.
+public enum CorrectionSeverity {
+  /// Right enough to use; it could have been better.
+  [Label("Could be better")] Minor,
+  /// Wrong: it had to be put right before it was used.
+  [Label("Wrong")] Mistake,
+  /// Wrong in a way that did, or would have done, harm.
+  [Label("Serious")] Serious,
+}
+
+/// ⭐ ONE CORRECTION: on which piece of work and which part of it, what was wrong, what right looks like, why — and
+/// who says so.
+///
+/// ⚑ A CORRECTION TEACHES NOTHING BY ITSELF. It is what an instruction is drawn from (`ProposeAgentInstruction`,
+///   `DraftAgentInstruction`), and an instruction reaches the agent only once a person has made it active.
+///
+/// Made only by `CorrectAgentWork`; what it says is never changed afterwards, only taken back or erased.
+public entity AgentCorrection {
+  /// The piece of work it corrects. Nobody: that work's record has since been deleted (`ForgetAgentWork`) — its
+  /// words went with the record, and the correction is kept as a count: that this agent's work was corrected, when,
+  /// how much it mattered, and what was drawn from it.
+  [Index] AgentTask? Task;
+  /// The agent and the skill the work was on, each by its class's full name.
+  [Required, Immutable, MaxLength(200), Index] string Agent;
+  [Immutable, MaxLength(200)] string Skill = "";
+  [Immutable] CorrectionAbout About = CorrectionAbout.Result;
+  /// The step it is about: that line's place in the work's record, and what the line said. 0 and "": not a step.
+  [Immutable] int Step = 0;
+  [MaxLength(600), Classification(Personal.Content)] string StepSaid = "";
+  /// The proposal it is about.
+  AgentProposal? Proposal;
+
+  /// What was wrong; what it should have been; and why — the reason is what makes it a lesson rather than a fix.
+  [Required, MaxLength(2000), Classification(Personal.Content)] string Wrong;
+  [Required, MaxLength(2000), Classification(Personal.Content)] string Right;
+  [Required, MaxLength(2000), Classification(Personal.Content)] string Because;
+  /// The right result, as JSON of the skill's result type, when there is one to give.
+  [Classification(Personal.Content)] string? CorrectedOutput;
+  [Immutable] CorrectionSeverity Severity = CorrectionSeverity.Mistake;
+
+  /// The instruction set the corrected work ran with — so "it had not been told yet" and "it had been told, and
+  /// still did it" can be told apart.
+  [Immutable] int InstructionSet = 0;
+  /// The instructions that work was sent, by their ids, one to a line — the receipt's own, kept here so that what
+  /// an instruction did can be counted by whoever teaches, and after the work's record is gone.
+  [Immutable] string Sent = "";
+  /// An instruction the work HAD been sent and did not follow, when whoever corrects says so.
+  [Immutable] AgentInstruction? Despite;
+
+  /// Who corrected it. Nobody: they have been taken off it.
+  [Classification(Personal.Identity)] Principal? By;
+  [Immutable] DateTime At = DateTime.UtcNow;
+  /// It was taken back — a correction that was itself mistaken — and no longer counts.
+  DateTime? WithdrawnAt;
+  [MaxLength(300), Classification(Personal.Content)] string WithdrawnWhy = "";
+  /// When what it said was erased, and why. That the work was corrected, and how much it mattered, stay.
+  DateTime? ErasedAt;
+  [MaxLength(300)] string ErasedWhy = "";
+
+  security {
+    // Whoever wrote it; whoever the work was for and whoever gave it; and everybody in charge of the agents.
+    allow read when IsAuthenticated where By == user || Task.Requester == user || Task.StartedBy == user;
+    allow read when SupervisesAgents || AuditsAgents || TeachesAgents || ErasesAgentRecords;
+    allow create when IsAuthenticated;
+    deny create except via CorrectAgentWork;
+    allow update when IsAuthenticated where By == user;
+    allow update when SupervisesAgents || TeachesAgents || ErasesAgentRecords;
+    deny update WithdrawnAt, WithdrawnWhy except via WithdrawAgentCorrection;
+    // What it said goes only when it is erased; whose it was, when they are taken off it.
+    deny update Wrong, Right, Because, CorrectedOutput, StepSaid, ErasedAt, ErasedWhy except via EraseAgentCorrection, ForgetAgentWork;
+    deny update By except via ForgetWhoTaughtAgents;
+    deny update Task, Proposal except via ForgetAgentWork;
+    deny delete;
+  }
+}
+
+/// What a correction is made from.
+///
+///     CorrectAgentWork(task, new Correction {
+///       Wrong = "It put a class of eight-year-olds on the late viewing.",
+///       Right = "Groups under ten go to the dusk viewing.",
+///       Because = "The late viewing ends after ten at night.",
+///     });
+public class Correction {
+  public string Wrong = "";
+  public string Right = "";
+  public string Because = "";
+  /// The right result, as JSON of the skill's result type, when there is one.
+  public string? CorrectedOutput;
+  public CorrectionSeverity Severity = CorrectionSeverity.Mistake;
+  /// The step it is about — that line's place in the record (`TraceLine.Seq`). 0: the result as a whole.
+  public int Step = 0;
+  /// The proposal it is about.
+  public Guid? Proposal;
+  /// An instruction the work had been sent and did not follow.
+  public Guid? Despite;
+}
+
+/// A piece of an agent's work was corrected.
+[Event("Agent work corrected")]
+public sealed class AgentWorkCorrected { public AgentCorrection Correction; }
+
+/// ⭐ CORRECT A PIECE OF WORK: what was wrong, what right looks like, and why — on the result, on one step of the
+/// record (`Step`), or on something it proposed (`Proposal`). Answers the correction.
+///
+/// For whoever the work was for, whoever gave it, whoever a proposal of it was put to, and whoever supervises or
+/// teaches the agents.
+///
+/// ⚑ THE AGENT IS NOT CHANGED BY THIS. Draw an instruction from it — `ProposeAgentInstruction` — and have a person
+///   the app trusts with that make it active.
+[Server, Authorize(IsAuthenticated)]
+public AgentCorrection CorrectAgentWork(AgentTask task, Correction correction) {
+  var me = Security.CurrentUserId;
+  var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+  if (person == null) { throw new AgentRefused("A correction is a person's: nobody is signed in."); }
+  if (correction.Wrong.Trim() == "") { throw new ValidationException("Say what was wrong."); }
+  if (correction.Right.Trim() == "") { throw new ValidationException("Say what it should have been."); }
+  if (correction.Because.Trim() == "") {
+    throw new ValidationException("Say why: the reason is what lets the agent get the next one right, not only this one.");
+  }
+  AgentProposal? proposal = null;
+  if (correction.Proposal != null) {
+    proposal = AgentProposal.FirstOrDefault(p => p.Id == correction.Proposal);
+    if (proposal == null || proposal!.Task.Id != task.Id) { throw new ValidationException("That proposal is not part of this piece of work."); }
+  }
+  var theirs = (task.Requester != null && task.Requester!.Id == person!.Id)
+            || (task.StartedBy != null && task.StartedBy!.Id == person!.Id)
+            || (proposal != null && proposal!.DecideBy != null && proposal!.DecideBy!.Id == person!.Id)
+            || Security.Authorize(person!, SupervisesAgents) || Security.Authorize(person!, TeachesAgents);
+  if (!theirs) { throw new AgentRefused("This piece of work is not yours to correct."); }
+
+  var said = "";
+  if (correction.Step > 0) {
+    var root = task.Root ?? task;
+    var line = TraceEvent.FirstOrDefault(e => e.Root == root && e.Task == task && e.Seq == correction.Step);
+    if (line == null) { throw new ValidationException($"This piece of work has no step {correction.Step}."); }
+    said = line!.Summary;
+  }
+  AgentInstruction? despite = null;
+  if (correction.Despite != null) {
+    despite = AgentInstruction.FirstOrDefault(i => i.Id == correction.Despite);
+    if (despite == null || despite!.Agent != task.Agent) { throw new ValidationException("That instruction is not one of this agent's."); }
+  }
+  var made = new AgentCorrection {
+    Task = task, Agent = task.Agent, Skill = task.Skill,
+    About = proposal != null ? CorrectionAbout.Proposal : correction.Step > 0 ? CorrectionAbout.Step : CorrectionAbout.Result,
+    Step = correction.Step, StepSaid = said, Proposal = proposal,
+    Wrong = Clipped(correction.Wrong.Trim(), 2000), Right = Clipped(correction.Right.Trim(), 2000),
+    Because = Clipped(correction.Because.Trim(), 2000), CorrectedOutput = correction.CorrectedOutput,
+    Severity = correction.Severity, InstructionSet = task.InstructionSet, Sent = task.InstructionsSent, Despite = despite, By = person,
+  };
+  Raise(new AgentWorkCorrected { Correction = made });
+  return made;
+}
+
+/// Take a correction back — it was itself mistaken. It no longer counts, and nothing new is drawn from it; an
+/// instruction already drawn from it stands until somebody retires it. Whoever wrote it, or whoever teaches the agents.
+[Server, Authorize(IsAuthenticated)]
+public void WithdrawAgentCorrection(AgentCorrection correction, string why) {
+  if (correction.WithdrawnAt != null) { return; }
+  var me = Security.CurrentUserId;
+  var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+  if (person == null) { throw new AgentRefused("A correction is taken back by a person: nobody is signed in."); }
+  var theirs = (correction.By != null && correction.By!.Id == person!.Id) || Security.Authorize(person!, TeachesAgents);
+  if (!theirs) { throw new AgentRefused("A correction is taken back by whoever wrote it, or by whoever teaches the agents."); }
+  if (why.Trim() == "") { throw new ValidationException("Say why it is taken back."); }
+  correction.WithdrawnAt = DateTime.UtcNow;
+  correction.WithdrawnWhy = Clipped(why.Trim(), 300);
+}
+
+/// ⭐ ERASE WHAT A CORRECTION SAID: what was wrong, what right looks like, why, the right result and the step's own
+/// words. That the work was corrected, when, how much it mattered and what was drawn from it stay.
+[Server, Authorize(ErasesAgentRecords)]
+public void EraseAgentCorrection(AgentCorrection correction, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is erased: that much is kept."); }
+  if (correction.ErasedAt != null) { return; }
+  correction.Wrong = ErasedSummary();
+  correction.Right = ErasedSummary();
+  correction.Because = ErasedSummary();
+  correction.CorrectedOutput = null;
+  correction.StepSaid = "";
+  correction.ErasedAt = DateTime.UtcNow;
+  correction.ErasedWhy = ClippedWhy(why);
+}
+
+/// The corrections made on a piece of work, oldest first — those whoever is reading may see.
+public List<AgentCorrection> CorrectionsOf(AgentTask task) {
+  return AgentCorrection.Where(c => c.Task == task).OrderBy(c => c.At).Take(200).ToList();
+}
+
+/// The corrections made of an agent's work that still count — not taken back — newest first. `skill`: one skill's.
+public List<AgentCorrection> CorrectionsOfAgent(string agent, string skill = "") {
+  var all = AgentCorrection.Where(c => c.Agent == agent && c.WithdrawnAt == null).OrderByDescending(c => c.At).Take(500).ToList();
+  if (skill == "") { return all; }
+  List<AgentCorrection> held = [];
+  foreach (var c in all) { if (c.Skill == skill) { held.Add(c); } }
+  return held;
+}

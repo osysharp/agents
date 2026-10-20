@@ -1,0 +1,250 @@
+// Erasing what a piece of work said, and whose it was. The receipt and the record's chain stay, and still check.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+
+/// Who may erase what an agent's record said, take a person off it, and delete work whose time is up. Nobody, until
+/// the app says: `policy ErasesAgentRecords => IsRecordsOfficer;`. A privacy request's own run needs nobody: it
+/// erases as the app itself.
+virtual policy ErasesAgentRecords => false;
+
+/// What an agent's work said was erased, or whose it was taken off it.
+[Event("Agent work erased")]
+public sealed class AgentWorkErased {
+  /// The top piece of the work.
+  public AgentTask Task;
+  /// True when who it was for and what it was about went too; false when only what it said did.
+  public bool Anonymised = false;
+  public string Why = "";
+}
+
+/// The top of the work `task` is part of, and every piece of work under it.
+List<AgentTask> TreeOf(AgentTask task) {
+  var root = task.Root ?? task;
+  List<AgentTask> tree = [root];
+  foreach (var under in AgentTask.Where(t => t.Root == root).ToList()) { tree.Add(under); }
+  return tree;
+}
+
+/// ⭐ ERASE WHAT A PIECE OF WORK SAID: the content of every line of its record (what the agent was shown, what each
+/// tool was given and answered, what the model said), what was asked and answered when it asked for help, and the
+/// result it handed back — for the whole of the work `task` is part of, once it has ended. Answers how many lines
+/// lost their content.
+///
+/// The receipt, every line's sentence, the models, the tools and the costs stay, and `VerifyTrace` still answers
+/// intact: the chain holds each content's hash, not the content.
+[Server, Authorize(ErasesAgentRecords)]
+public int EraseAgentWorkContent(AgentTask task, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is erased: that much is kept."); }
+  var root = task.Root ?? task;
+  var tree = TreeOf(root);
+  RequireEnded(tree);
+  if (root.ContentErasedAt != null) { return 0; }
+  var now = DateTime.UtcNow;
+  var gone = 0;
+  // Every line that had content — told by its hash, which whoever erases may read; the content itself they may
+  // not. An erased content is "", never null: null is what a reader who may not see it reads, and writing back
+  // what one read changes nothing.
+  foreach (var line in TraceEvent.Where(e => e.Root == root && e.PayloadHash != "").ToList()) {
+    line.Payload = "";
+    gone = gone + 1;
+  }
+  foreach (var piece in tree) {
+    foreach (var help in AgentHelp.Where(h => h.Task == piece).ToList()) {
+      help.Question = "";
+      help.Context = "";
+      help.Answer = "";
+      if (help.ErasedAt == null) { help.ErasedAt = now; }
+    }
+    // What it proposed: the arguments, its reasons, what it had looked at, and what came of it.
+    foreach (var proposal in AgentProposal.Where(p => p.Task == piece).ToList()) {
+      proposal.ArgumentsJson = "{}";
+      proposal.ShownJson = "[]";
+      proposal.Why = "";
+      proposal.EvidenceJson = "[]";
+      proposal.Reason = "";
+      proposal.ResultJson = null;
+      proposal.Problem = "";
+    }
+    if (piece.Result != null) { piece.Result = null; }
+    if (piece.ContentErasedAt == null) {
+      piece.ContentErasedAt = now;
+      piece.ErasedWhy = ClippedWhy(why);
+    }
+  }
+  Raise(new AgentWorkErased { Task = root, Why = ClippedWhy(why) });
+  return gone;
+}
+
+/// ⭐ TAKE THE PERSON OFF A PIECE OF WORK: who it was for and who gave it, what it was about, how it ended in words,
+/// and every line's sentence — for the whole of the work `task` is part of. Each line then says `Erased.` and when.
+///
+/// What stays is that the work happened: which agent and skill, when, each step's kind, model, tool and cost, how it
+/// ended, and the chain — which `VerifyTrace` still answers intact, saying how many lines were erased. Nobody but
+/// whoever supervises or audits the agents reads it afterwards.
+[Server, Authorize(ErasesAgentRecords)]
+public void AnonymiseAgentWork(AgentTask task, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is erased: that much is kept."); }
+  var root = task.Root ?? task;
+  var tree = TreeOf(root);
+  RequireEnded(tree);
+  if (root.AnonymisedAt != null) { return; }
+  var now = DateTime.UtcNow;
+  foreach (var line in TraceEvent.Where(e => e.Root == root && e.ErasedAt == null).ToList()) {
+    line.Summary = ErasedSummary();
+    line.ErasedAt = now;
+  }
+  foreach (var piece in tree) {
+    foreach (var help in AgentHelp.Where(h => h.Task == piece).ToList()) {
+      help.Requester = null;
+      help.StartedBy = null;
+      help.AskedPerson = null;
+      help.AnsweredBy = null;
+      if (help.ErasedAt == null) { help.ErasedAt = now; }
+    }
+    foreach (var proposal in AgentProposal.Where(p => p.Task == piece).ToList()) {
+      proposal.DecideBy = null;
+      proposal.DecidedBy = null;
+    }
+    piece.WaitingOn = "";
+    piece.Requester = null;
+    piece.StartedBy = null;
+    piece.About = "";
+    piece.Outcome = "";
+    piece.StopWhy = "";
+    piece.AnonymisedAt = now;
+    piece.ErasedWhy = ClippedWhy(why);
+  }
+  Raise(new AgentWorkErased { Task = root, Anonymised = true, Why = ClippedWhy(why) });
+}
+
+/// Erase one request for help — what was asked and answered, and whose it was. For help asked outside any piece of
+/// work (a decision an agent was not sure of); help asked during work goes with the work.
+[Server, Authorize(ErasesAgentRecords)]
+public void EraseAgentHelp(AgentHelp help, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is erased: that much is kept."); }
+  help.Question = "";
+  help.Context = "";
+  help.Answer = "";
+  help.Requester = null;
+  help.StartedBy = null;
+  help.AskedPerson = null;
+  help.AnsweredBy = null;
+  help.ErasedAt = DateTime.UtcNow;
+}
+
+/// ⭐ DELETE A PIECE OF WORK WHOSE TIME IS UP: the receipt of `task`, of the work it is part of and of everything
+/// under it, every line of the record and every request for help. Refused while any of it is still being worked on.
+/// Answers how many receipts went. What the work cost stays counted against the budgets it fell under.
+[Server, Authorize(ErasesAgentRecords)]
+public int ForgetAgentWork(AgentTask task) {
+  var root = task.Root ?? task;
+  var tree = TreeOf(root);
+  RequireEnded(tree);
+  foreach (var line in TraceEvent.Where(e => e.Root == root).ToList()) { line.Delete(); }
+  foreach (var head in AgentTraceHead.Where(h => h.Root == root.Id).ToList()) { head.Delete(); }
+  // The pieces of work furthest down go first: each names the one that handed it on.
+  foreach (var piece in tree.OrderByDescending(t => t.Depth).ToList()) {
+    foreach (var help in AgentHelp.Where(h => h.Task == piece).ToList()) { help.Delete(); }
+    foreach (var wait in AgentWait.Where(w => w.Task == piece).ToList()) { wait.Delete(); }
+    foreach (var wait in AgentWorkWait.Where(w => w.Task == piece).ToList()) { wait.Delete(); }
+    foreach (var parking in AgentTaskParking.Where(p => p.Task == piece).ToList()) { parking.Delete(); }
+    // That it was corrected, and what was learned from it, outlive the record. What each correction SAID was about
+    // this work, and goes with it; the correction lets go of the work.
+    foreach (var correction in AgentCorrection.Where(c => c.Task == piece).ToList()) {
+      if (correction.ErasedAt == null) {
+        correction.Wrong = ErasedSummary();
+        correction.Right = ErasedSummary();
+        correction.Because = ErasedSummary();
+        correction.CorrectedOutput = null;
+        correction.StepSaid = "";
+        correction.ErasedAt = DateTime.UtcNow;
+        correction.ErasedWhy = "The record of the work it corrects was deleted, and its words went with it.";
+      }
+      correction.Task = null;
+      correction.Proposal = null;
+    }
+    foreach (var learned in AgentInstruction.Where(i => i.LearnedIn == piece).ToList()) { learned.LearnedIn = null; }
+    foreach (var proposal in AgentProposal.Where(p => p.Task == piece).ToList()) { proposal.Delete(); }
+    piece.Delete();
+  }
+  return tree.Count;
+}
+
+/// Work is erased once it has ended: a record still being written would go on gathering what was just erased.
+void RequireEnded(List<AgentTask> tree) {
+  foreach (var piece in tree) {
+    if (piece.Status == AgentTaskStatus.Working || piece.Status == AgentTaskStatus.Waiting) {
+      throw new ValidationException($"{BareName(piece.Agent)} is still working on it. Stop the work first (`StopAgentTask`), then erase it.");
+    }
+  }
+}
+
+string ClippedWhy(string why) { return Clipped(why.Trim(), 300); }
+
+// ── the people who oversaw the agents ─────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ TAKE A PERSON OFF HOW THEY OVERSAW THE AGENTS: the standing rules they gave or took back, the changes they made
+/// to an agent's place and the times they were named its sponsor, the questions agents put to them and what they
+/// answered, and the proposals sent to them or decided by them no longer say who. What was decided, answered and
+/// changed stays. Answers how many records they were taken off.
+///
+/// ⚑ Ask `WhatWaitsOnThem` first: a question or a proposal still waiting on the person, or an agent they sponsor now,
+///   is theirs to answer or hand on before they are taken off it.
+[Server, Authorize(ErasesAgentRecords)]
+public int ForgetWhoOversawAgents(Principal person) {
+  var gone = 0;
+  foreach (var r in AgentStandingRule.Where(x => x.GrantedBy == person || x.RevokedBy == person).ToList()) {
+    if (r.GrantedBy != null && r.GrantedBy!.Id == person.Id) { r.GrantedBy = null; }
+    if (r.RevokedBy != null && r.RevokedBy!.Id == person.Id) { r.RevokedBy = null; }
+    gone = gone + 1;
+  }
+  foreach (var c in AgentSeatChange.Where(x => x.By == person || x.Sponsor == person).ToList()) {
+    if (c.By != null && c.By!.Id == person.Id) { c.By = null; }
+    if (c.Sponsor != null && c.Sponsor!.Id == person.Id) { c.Sponsor = null; }
+    gone = gone + 1;
+  }
+  foreach (var h in AgentHelp.Where(x => x.AskedPerson == person || x.AnsweredBy == person).ToList()) {
+    if (h.AskedPerson != null && h.AskedPerson!.Id == person.Id) { h.AskedPerson = null; }
+    if (h.AnsweredBy != null && h.AnsweredBy!.Id == person.Id) { h.AnsweredBy = null; }
+    gone = gone + 1;
+  }
+  foreach (var proposal in AgentProposal.Where(x => x.DecideBy == person || x.DecidedBy == person).ToList()) {
+    if (proposal.DecideBy != null && proposal.DecideBy!.Id == person.Id) { proposal.DecideBy = null; }
+    if (proposal.DecidedBy != null && proposal.DecidedBy!.Id == person.Id) { proposal.DecidedBy = null; }
+    gone = gone + 1;
+  }
+  return gone;
+}
+
+/// What still waits on a person before they can be taken off how they oversaw the agents — a question an agent put
+/// to them, a proposal sent to them, an agent they sponsor now — in words; "" when nothing does. Read as the caller:
+/// a privacy request asks it as the app, and sees all of it.
+public string WhatWaitsOnThem(Principal person) {
+  var questions = AgentHelp.Count(h => h.AskedPerson == person && h.Status == HelpStatus.Waiting);
+  var proposals = AgentProposal.Count(p => p.DecideBy == person && p.Status == ProposalStatus.Waiting);
+  var seats = AgentSeat.Where(s => s.Sponsor == person).ToList();
+  List<string> said = [];
+  if (questions > 0) { said.Add(questions == 1 ? "an agent's question waits for their answer" : $"{questions} agents' questions wait for their answer"); }
+  if (proposals > 0) { said.Add(proposals == 1 ? "a proposal waits for their decision" : $"{proposals} proposals wait for their decision"); }
+  foreach (var seat in seats) { said.Add($"they sponsor {AgentName(seat.Agent)}: name another sponsor first"); }
+  return string.Join("; ", said);
+}
+
+/// ⭐ ERASE THE STANDING RULES FOR ONE PERSON'S WORK: each is taken back — the agent proposes that tool again for
+/// their work — and no longer says whose work it was. Answers how many.
+[Server, Authorize(ErasesAgentRecords)]
+public int EraseStandingRulesFor(Principal person, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is erased: that much is kept."); }
+  var gone = 0;
+  foreach (var r in AgentStandingRule.Where(x => x.For == person).ToList()) {
+    if (r.RevokedAt == null) {
+      r.RevokedAt = DateTime.UtcNow;
+      r.RevokedWhy = ClippedWhy(why);
+    }
+    r.For = null;
+    r.ErasedAt = DateTime.UtcNow;
+    gone = gone + 1;
+  }
+  return gone;
+}
