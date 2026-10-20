@@ -1,0 +1,17 @@
+// The producer's test project for Osysharp.Agents.Teaching — a small maritime museum whose labels are written by an
+// AI agent. One case, walked from end to end: the captioner writes "circa" on a label, a curator corrects it, an
+// instruction is drawn from the correction, the registrar reads it and makes it active, the next label is right, the
+// work says which instruction set it ran under, and a rollback brings the old behaviour back. No model is ever
+// called: its one model is scripted, and answers by what it was sent.
+app Museum {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Agents@1;
+  use Osysharp.Agents.Testing@1;
+  use Osysharp.Agents.Teaching@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.Ui;
+}

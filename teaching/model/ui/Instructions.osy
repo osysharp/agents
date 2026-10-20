@@ -1,0 +1,323 @@
+// An agent's Instructions page — what it is told beyond what its developers wrote: what is waiting to be read, what
+// is active, what is past, and every change to the set, with the presses for those who teach.
+namespace Osysharp.Agents.Teaching;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Ui;
+
+/// ⭐ AN AGENT'S INSTRUCTIONS, as a page's body. Whoever teaches the agents reads what is proposed — with the
+/// corrections it was drawn from — and activates, edits or rejects it; retires what is active; and puts the agent
+/// back to an earlier set from its history. Everybody else reads what the agent is told for their own work.
+///
+///     [Route("/agents/captioner/instructions")] [Authorize(UsesAgents)]
+///     component CaptionerInstructions() { render { AgentInstructions(Agents.Of<Captioner>().Name); } }
+///
+/// In a test: `Ui.Click("Activate")`, `Ui.Click("Retire")` then fill "Why is it retired?", `Ui.Click("Roll back to
+/// set 1")` then fill "Why is it put back?".
+[Composable]
+public component AgentInstructions(string agent) {
+  InstructionBoard? board = null;
+  bool loaded = false;
+  string problem = "";
+  bool proposing = false;
+  bool showPast = false;
+  string guidance = "";
+  string why = "";
+  string skill = "";
+  string notice = "";
+
+  action Load() {
+    try { board = InstructionBoardOf(agent); problem = ""; } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+
+  action Changed(string said) { notice = said; Load(); }
+  action StartProposing() { proposing = true; notice = ""; problem = ""; }
+  action StopProposing() { proposing = false; guidance = ""; why = ""; skill = ""; problem = ""; }
+  action PickSkill(string s) { skill = s; }
+  action Propose() {
+    problem = "";
+    try {
+      ProposeFromPage(agent, skill, guidance, why);
+      proposing = false;
+      guidance = "";
+      why = "";
+      skill = "";
+      Changed("Proposed. It is waiting to be read.");
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action TogglePast() { showPast = !showPast; }
+
+  render {
+    Stack(gap: 7, w: "100%", maxW: "820px", label: "Instructions") {
+      if (!loaded) {
+        Stack(gap: 5, label: "Loading the instructions") {
+          Skeleton(SkeletonShape.HalfLine);
+          Skeleton(SkeletonShape.Block);
+          Stack(gap: 2) { Skeleton(); Skeleton(); Skeleton(SkeletonShape.HalfLine); }
+        }
+      }
+      if (loaded && board == null) { Alert("The instructions could not be shown: " + problem, tone: Tone.Danger); }
+      if (board != null) {
+        // Where it stands: the set, said large, and what that means in a sentence.
+        Row(gap: 5, align: Align.End, justify: Justify.Between, wrap: Wrapping.Wrap, label: "Where it stands") {
+          Stack(gap: 2) {
+            Text(board.Name + " is on", fontSize: FontSize.Label, color: Colors.TextMuted);
+            Text(board.Set == 0 ? "No instructions yet" : "Instruction set " + board.Set.ToString(), fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", lineHeight: "1.2");
+            Text(board.Active.Count == 0
+                   ? board.Name + " works from what its developers wrote, and nothing more."
+                   : board.Name + " is told " + (board.Active.Count == 1 ? "one thing" : board.Active.Count.ToString() + " things") + " beyond what its developers wrote.",
+                 fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "60ch");
+          }
+          if (board.MayPropose && !proposing) { Button("Propose an instruction", onPress: StartProposing); }
+        }
+        if (notice != "") { Alert(notice, tone: Tone.Success); }
+
+        if (proposing) {
+          Stack(gap: 4, px: 5, py: 5, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "New instruction") {
+            Text("Propose an instruction", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            TextAreaField("What should " + board.Name + " do?", value: guidance, rows: 2, hint: "One thing, in the words it will be sent. At most 600 characters.");
+            TextAreaField("Why?", value: why, rows: 2, hint: "For whoever reads it before it is made active. The agent is not sent this.");
+            if (board.Skills.Count > 0) {
+              Stack(gap: 2, label: "For which work") {
+                Text("For which work", fontSize: FontSize.Label, fontWeight: FontWeight.Medium);
+                Row(gap: 2, wrap: Wrapping.Wrap) {
+                  Button("Everything it does", onPress: () => PickSkill(""), tone: skill == "" ? Tone.Primary : Tone.Default, size: Size.Sm);
+                  foreach (var s in board.Skills) {
+                    Button(s.Label, onPress: () => PickSkill(s.Skill), tone: skill == s.Skill ? Tone.Primary : Tone.Default, size: Size.Sm);
+                  }
+                }
+              }
+            }
+            if (problem != "") { Alert(problem, tone: Tone.Danger); }
+            Row(gap: 2, justify: Justify.End) {
+              Button("Cancel", onPress: StopProposing, tone: Tone.Ghost);
+              Button("Propose", onPress: Propose, tone: Tone.Primary, disabled: guidance.Trim() == "" || why.Trim() == "");
+            }
+          }
+        }
+
+        // Waiting to be read: what needs somebody. First, and only when there is something.
+        if (board.Proposed.Count > 0) {
+          Stack(gap: 3, label: "Waiting to be read") {
+            Stack(gap: 1) {
+              Text("Waiting to be read", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+              Text(board.MayTeach ? board.Name + " is sent none of these until you make one active."
+                                  : board.Name + " is sent none of these until somebody who teaches the agents makes one active.",
+                   fontSize: FontSize.Label, color: Colors.TextSecondary);
+            }
+            foreach (var card in board.Proposed) { InstructionRow(card, board.MayTeach, board.Name, Changed); }
+          }
+        }
+
+        Stack(gap: 3, label: "Active") {
+          Text("Active", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          if (board.Active.Count == 0) {
+            EmptyState("Nothing is active",
+                       body: board.Proposed.Count > 0 ? "Read what is waiting above."
+                           : "An instruction starts as a correction: open a piece of " + board.Name + "'s work and choose Correct this.");
+          }
+          foreach (var card in board.Active) { InstructionRow(card, board.MayTeach, board.Name, Changed); }
+        }
+
+        if (board.Past.Count > 0) {
+          Stack(gap: 3, label: "Retired and rejected") {
+            Row(gap: 3, align: Align.Center) {
+              Text("Retired and rejected", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+              Button(showPast ? "Hide" : "Show " + board.Past.Count.ToString(), onPress: TogglePast, tone: Tone.Ghost, size: Size.Sm);
+            }
+            if (showPast) { foreach (var card in board.Past) { InstructionRow(card, board.MayTeach, board.Name, Changed); } }
+          }
+        }
+
+        Stack(gap: 3, label: "History") {
+          Stack(gap: 1) {
+            Text("History", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Text("Every change to what " + board.Name + " is told is a set. Work under way finishes under the set it started with.",
+                 fontSize: FontSize.Label, color: Colors.TextSecondary, maxW: "68ch", lineHeight: "1.5");
+          }
+          Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg) {
+            foreach (var set in board.History) { SetRow(set, board.Agent, board.Name, board.MayTeach, Changed); }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// One instruction: what the agent is told, what work it is for, where it came from, who decided — and, for whoever
+/// teaches, what can be done with it.
+[Composable]
+public component InstructionRow(InstructionCard card, bool mayTeach, string agent, Action<string> changed) {
+  string mode = "";
+  string reason = "";
+  string guidance = "";
+  string why = "";
+  string problem = "";
+  bool sources = false;
+
+  action Activate() {
+    problem = "";
+    try {
+      var set = ActivateFromPage(card.Id);
+      changed("Active. " + agent + " is on instruction set " + set.ToString() + "; work it starts from now on is sent this.");
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action AskReject() { mode = "reject"; reason = ""; problem = ""; }
+  action AskRetire() { mode = "retire"; reason = ""; problem = ""; }
+  action Edit() { mode = "edit"; guidance = card.Guidance; why = card.Why; problem = ""; }
+  action Back() { mode = ""; problem = ""; }
+  action Reject() {
+    problem = "";
+    try { RejectFromPage(card.Id, reason); mode = ""; changed("Rejected. Whoever proposed it can read why."); } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Retire() {
+    problem = "";
+    try {
+      var set = RetireFromPage(card.Id, reason);
+      mode = "";
+      changed("Retired. " + agent + " is on instruction set " + set.ToString() + "; work it starts from now on is not sent this.");
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+  action Save() {
+    problem = "";
+    try { ReviseFromPage(card.Id, guidance, why); mode = ""; changed("Saved. It is still waiting to be made active."); } catch (Exception ex) { problem = ex.Message; }
+  }
+  action ToggleSources() { sources = !sources; }
+
+  render {
+    Stack(gap: 3, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Instruction") {
+      if (card.Erased) { Text("What this instruction said has been erased.", fontSize: FontSize.Body, color: Colors.TextMuted); }
+      if (!card.Erased && mode != "edit") {
+        Text(card.Guidance, fontSize: FontSize.Subhead, fontWeight: FontWeight.Medium, lineHeight: "1.45", maxW: "64ch",
+             color: card.State == InstructionState.Active || card.State == InstructionState.Proposed ? Colors.OnSurface : Colors.TextSecondary);
+        Text("Because " + LowerFirst(card.Why), fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+      }
+      Stack(gap: 1) {
+        Text(card.Scope, fontSize: FontSize.Label, color: Colors.TextMuted);
+        Text(card.From, fontSize: FontSize.Label, color: Colors.TextMuted);
+        if (card.Decided != "") { Text(card.Decided + (card.DecidedWhy == "" ? "" : ": " + card.DecidedWhy), fontSize: FontSize.Label, color: Colors.TextMuted, maxW: "70ch"); }
+      }
+      if (card.State == InstructionState.Active) {
+        Text(EffectWords(card), fontSize: FontSize.Label, color: card.NotFollowed > 0 ? Colors.Warning.Text : Colors.TextSecondary, maxW: "70ch", lineHeight: "1.5", label: "Whether it helped");
+      }
+
+      if (card.Sources.Count > 0) {
+        Row(gap: 2) { Button(sources ? "Hide what it was drawn from" : "Show what it was drawn from", onPress: ToggleSources, tone: Tone.Ghost, size: Size.Sm); }
+        if (sources) {
+          Stack(gap: 0, bg: Colors.Sunken, rounded: Radius.Md, label: "Drawn from") {
+            foreach (var c in card.Sources) { CorrectionLine(c); }
+          }
+        }
+      }
+
+      if (mode == "edit") {
+        Stack(gap: 3, label: "Edit instruction") {
+          TextAreaField("What " + agent + " is told", value: guidance, rows: 2);
+          TextAreaField("Why", value: why, rows: 2);
+          if (problem != "") { Alert(problem, tone: Tone.Danger); }
+          Row(gap: 2, justify: Justify.End) {
+            Button("Back", onPress: Back, tone: Tone.Ghost);
+            Button("Save", onPress: Save, tone: Tone.Primary, disabled: guidance.Trim() == "" || why.Trim() == "");
+          }
+        }
+      }
+      if (mode == "reject") {
+        Stack(gap: 3, label: "Reject instruction") {
+          TextAreaField("Why not?", value: reason, rows: 2, hint: "Whoever proposed it reads this.");
+          if (problem != "") { Alert(problem, tone: Tone.Danger); }
+          Row(gap: 2, justify: Justify.End) {
+            Button("Back", onPress: Back, tone: Tone.Ghost);
+            Button("Reject", onPress: Reject, tone: Tone.Danger, disabled: reason.Trim() == "");
+          }
+        }
+      }
+      if (mode == "retire") {
+        Stack(gap: 3, label: "Retire instruction") {
+          TextAreaField("Why is it retired?", value: reason, rows: 2, hint: "Kept with the change. Work already under way finishes as it started.");
+          if (problem != "") { Alert(problem, tone: Tone.Danger); }
+          Row(gap: 2, justify: Justify.End) {
+            Button("Back", onPress: Back, tone: Tone.Ghost);
+            Button("Retire", onPress: Retire, tone: Tone.Danger, disabled: reason.Trim() == "");
+          }
+        }
+      }
+
+      if (mode == "" && mayTeach && !card.Erased) {
+        if (problem != "") { Alert(problem, tone: Tone.Danger); }
+        Row(gap: 2, wrap: Wrapping.Wrap) {
+          if (card.State == InstructionState.Proposed) {
+            Button("Activate", onPress: Activate, tone: Tone.Primary);
+            Button("Edit", onPress: Edit);
+            Button("Reject", onPress: AskReject, tone: Tone.Ghost);
+          }
+          if (card.State == InstructionState.Active) { Button("Retire", onPress: AskRetire); }
+          if (card.State == InstructionState.Retired) { Button("Activate again", onPress: Activate); }
+        }
+      }
+    }
+  }
+}
+
+/// Whether an instruction helped, in a sentence — counts, nothing guessed.
+string EffectWords(InstructionCard card) {
+  var corrected = card.CorrectedSince == 0 ? "None of it has been corrected since." : Plural(card.CorrectedSince, "piece of it was", "pieces of it were") + " still corrected.";
+  var missed = card.NotFollowed == 0 ? "" : " " + Plural(card.NotFollowed, "correction says", "corrections say") + " this instruction was not followed.";
+  if (!card.CountsAllWork) { return (card.CorrectedSince == 0 ? "No work sent this has been corrected since." : Plural(card.CorrectedSince, "piece of work sent this was", "pieces of work sent this were") + " still corrected.") + missed; }
+  if (card.WorkSince == 0) { return "No work has been sent this yet."; }
+  return "Sent to " + Plural(card.WorkSince, "piece of work", "pieces of work") + ". " + corrected + missed;
+}
+
+/// One line of the history: a change to the set, and the way back to it.
+[Composable]
+public component SetRow(SetCard set, string agent, string agentName, bool mayTeach, Action<string> changed) {
+  bool asking = false;
+  string reason = "";
+  string problem = "";
+
+  action Ask() { asking = true; reason = ""; problem = ""; }
+  action Back() { asking = false; problem = ""; }
+  action RollBack() {
+    problem = "";
+    try {
+      var now = RollBackFromPage(agent, set.Number, reason);
+      asking = false;
+      changed(agentName + " is put back. That is instruction set " + now.ToString() + "; work it starts from now on runs under it.");
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    Stack(gap: 2, px: 4, py: 3, label: set.Number == 0 ? "Before any instruction" : "Set " + set.Number.ToString()) {
+      Row(gap: 3, align: Align.Start, justify: Justify.Between, wrap: Wrapping.Wrap) {
+        Stack(gap: 1, grow: 1, minW: "0") {
+          Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+            if (set.Number > 0) { Text("Set " + set.Number.ToString(), fontSize: FontSize.Label, fontWeight: FontWeight.Semibold); }
+            Text(set.Said, fontSize: FontSize.Body);
+            if (set.Current) { Badge("Now", tone: Tone.Primary); }
+          }
+          if (set.Instruction != "") { Text("“" + set.Instruction + "”", fontSize: FontSize.Label, color: Colors.TextSecondary, maxW: "66ch", lineHeight: "1.5"); }
+          if (set.Why != "") { Text(set.Why, fontSize: FontSize.Label, color: Colors.TextSecondary, maxW: "66ch", lineHeight: "1.5"); }
+          if (set.Number > 0) { Text(set.When + ". " + (set.Count == 0 ? "Nothing active after it." : Plural(set.Count, "instruction", "instructions") + " active after it."), fontSize: FontSize.Caption, color: Colors.TextMuted); }
+        }
+        if (mayTeach && !set.SameAsNow && !asking) {
+          Button(set.Number == 0 ? "Roll back to the start" : "Roll back to set " + set.Number.ToString(), onPress: Ask, tone: Tone.Ghost, size: Size.Sm);
+        }
+      }
+      if (asking) {
+        Stack(gap: 3, px: 4, py: 3, bg: Colors.Sunken, rounded: Radius.Md, label: "Going back") {
+          Text(set.Number == 0 ? agentName + " will be told nothing beyond what its developers wrote. Everything active now is retired."
+                               : agentName + " will be told exactly what it was told in set " + set.Number.ToString() + ". What has been made active since is retired.",
+               fontSize: FontSize.Body, lineHeight: "1.5", maxW: "64ch");
+          TextAreaField("Why is it put back?", value: reason, rows: 2, hint: "Kept with the change.");
+          if (problem != "") { Alert(problem, tone: Tone.Danger); }
+          Row(gap: 2, justify: Justify.End) {
+            Button("Back", onPress: Back, tone: Tone.Ghost);
+            Button("Roll back", onPress: RollBack, tone: Tone.Danger, disabled: reason.Trim() == "");
+          }
+        }
+      }
+    }
+  }
+}

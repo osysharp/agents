@@ -1,0 +1,30 @@
+// Osysharp.Agents.Teaching — the two places people teach an agent, drawn: "Correct this" on a piece of its work, and
+// the page that shows what it is told.
+//
+//     /// On the page that shows a piece of an agent's work:
+//     WorkTeaching(task);                      // what it was told, its result and steps with "Correct this", and
+//                                              // the corrections people have made
+//
+//     /// On an agent's own page:
+//     AgentInstructions(Agents.Of<Captioner>().Name);   // what is proposed, active and retired, who decided, what
+//                                                       // each was drawn from, whether it helped — and the history
+//
+// ⚑ THE SCREENS DECIDE NOTHING. Who may correct, who may make an instruction active, retire one or put an agent back
+//   to an earlier set is `Osysharp.Agents`' to say (`TeachesAgents`, and the rest); a control a person may not use is
+//   not offered, and one that is refused says why, in the kit's own words.
+//
+// ⚑ A PIECE, NOT A WHOLE. `CorrectThis(task, step: n)` is the button alone, for a run page of your own.
+package Osysharp.Agents.Teaching {
+  version     "1.2.0";
+  minPlatform "0.14.0";
+  summary     "the screens people teach an AI agent on: Correct this on a piece of its work — the result, a step, a proposal — with what was wrong, what right looks like and why, and an instruction proposed from it in the same breath; and an agent's Instructions page: what is waiting to be read, what is active and since when, who decided, what each was drawn from, how much work was sent it and how often it was still corrected, with Activate, Edit, Reject, Retire and Roll back for those the app admits.";
+
+  model "model/**/*.osy";
+  tests "tests";
+  use Osysharp.Agents@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Workflow;
+  use Osysharp.Observability;
+  use Osysharp.Ui;
+}

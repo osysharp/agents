@@ -1,0 +1,267 @@
+// Osysharp.Agents.Teaching — on screen, driven as a person: a curator corrects the captioner's work and proposes an
+// instruction from it; the registrar reads it, makes it active, later retires it and puts the captioner back; and
+// each of them sees only what is theirs to do. `osy test --pixels` photographs each stage — wide and on a phone,
+// light and dark (`Ui.Shot`).
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Teaching;
+using Museum;
+
+/// The sextant's label, written wrong — and where its work is shown.
+Guid TheSextantIsLabelled() {
+  Guid task = Guid.Empty;
+  runas (Ines) { task = LabelFor("1887.4", "first"); }
+  return task;
+}
+
+/// ⭐ "CORRECT THIS", ON THE WORK. Ines opens the captioner's work on the sextant, reads what it handed back and what
+/// it was told, and corrects it: what was wrong, what it should have been, why — and what the captioner should be
+/// told from now on. It is kept on the work; nothing the captioner does has changed.
+[Test(Rooms)]
+void a_curator_corrects_a_label_and_proposes_an_instruction_from_it() {
+  TestClock.Set(new DateTime(2031, 3, 3, 9, 0, 0, DateTimeKind.Utc));
+  var task = TheSextantIsLabelled();
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ines);
+  Ui.Visit("/");
+  Assert.Visible("A brass sextant with a silvered scale, made by Thomas Reid of Leith circa 1850.", within: "Piece 1887.4");
+  Ui.Visit("/work/" + task);
+  Assert.Visible("Label for 1887.4, Brass sextant", within: "Result");
+  Assert.Visible("A brass sextant with a silvered scale, made by Thomas Reid of Leith circa 1850.", within: "What it handed back");
+  Assert.Visible("It ran before anybody had taught Captioner anything.", within: "What it was told");
+  Assert.Clickable("Correct this");
+  Assert.NoOverflow();
+  Ui.Shot("work-wide-light");
+
+  Ui.Click("Correct this");
+  Assert.Visible("Say it as you would to a colleague. It is kept with this piece of work.", within: "Correction");
+  // Nothing to send until it says what was wrong, what right is, and why.
+  Assert.Disabled("Send correction");
+  Ui.Fill("What was wrong?", "The label says circa 1850.");
+  Ui.Fill("What should it have been?", "About 1850.");
+  Ui.Fill("Why?", "Visitors do not read Latin, and the style sheet says about.");
+  Assert.Checked("Propose an instruction from this");
+  Ui.Fill("From now on", StyleRule());
+  Assert.Clickable("Send correction");
+  Assert.NoOverflow();
+  Ui.Shot("correct-this-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("correct-this-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Click("Send correction");
+  Assert.Visible("Corrected, and an instruction is proposed. Captioner does nothing differently until somebody who teaches the agents makes it active.", within: "Correction sent");
+  Assert.Visible("One correction", within: "Corrections");
+  Assert.Visible("It should have been: About 1850.", within: "Corrections");
+  Assert.Visible("Because visitors do not read Latin, and the style sheet says about.", within: "Corrections");
+  Assert.Visible("Ines Okafor, 3 Mar 2031", within: "Corrections");
+  Ui.Shot("corrected-wide-light");
+
+  runas (Ines) {
+    var correction = AgentCorrection.Single();
+    Assert.Equal(task, correction.Task!.Id);
+    Assert.Equal("About 1850.", correction.Right);
+    var proposed = AgentInstruction.Single();
+    Assert.Equal(InstructionState.Proposed, proposed.State);
+    Assert.Equal(StyleRule(), proposed.Guidance);
+    Assert.Equal("Museum.WriteLabel", proposed.Skill);
+    // The next label is as wrong as the first: the model was sent nothing new.
+    LabelFor("1902.11", "second");
+    Assert.Equal("", SentIn("second"));
+  }
+
+  // On her own page of the captioner she sees it waiting — and nothing to press: making it active is not hers.
+  Ui.Visit("/captioner");
+  Assert.Visible("No instructions yet", within: "Where it stands");
+  Assert.Visible(StyleRule(), within: "Waiting to be read");
+  Assert.Visible("Captioner is sent none of these until somebody who teaches the agents makes one active.", within: "Waiting to be read");
+  Assert.Hidden("Activate");
+  Assert.Hidden("Propose an instruction");
+
+  // A step of the record is corrected the same way, on a phone.
+  Ui.Viewport(390, 844);
+  Ui.Visit("/work/" + task);
+  Ui.Click("Show the steps");
+  Assert.Visible("Captioner was given write label: Label for 1887.4, Brass sextant.", within: "Step 1");
+  Assert.Visible("Correct step 6", within: "Step 6");
+  Assert.NoOverflow();
+  Ui.Shot("work-steps-phone-light");
+  Ui.Click("Correct step 6");
+  Ui.Fill("What was wrong?", "It copied the catalogue entry.");
+  Ui.Fill("What should it have been?", "Say it for a visitor.");
+  Ui.Fill("Why?", "Nobody reads a catalogue aloud.");
+  Ui.Uncheck("Propose an instruction from this");
+  Assert.NoOverflow();
+  Ui.Theme("dark");
+  Ui.Shot("correct-step-phone-dark");
+  Ui.Theme("light");
+  Ui.Click("Send correction");
+  Assert.Visible("2 corrections", within: "Corrections");
+  runas (Ines) {
+    Assert.Equal(1, AgentCorrection.Count(c => c.About == CorrectionAbout.Step && c.Step == 6));
+    Assert.Equal(1, AgentInstruction.Count());
+  }
+}
+
+/// ⭐ THE INSTRUCTIONS PAGE. The registrar reads what is waiting, with the correction it was drawn from, and makes it
+/// active: the captioner is on instruction set 1, and its next label is right. Later he puts it back to the start,
+/// with the reason — and the page's history says every step.
+[Test(Rooms)]
+void the_registrar_reads_activates_and_rolls_back_on_the_agents_page() {
+  TestClock.Set(new DateTime(2031, 3, 3, 9, 0, 0, DateTimeKind.Utc));
+  var task = TheSextantIsLabelled();
+  runas (Ines) { InesCorrects(task); UnitOfWork.Commit(); }
+
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Marek);
+  Ui.Visit("/captioner");
+  Assert.Visible("No instructions yet", within: "Where it stands");
+  Assert.Visible("Captioner works from what its developers wrote, and nothing more.", within: "Where it stands");
+  Assert.Visible(StyleRule(), within: "Waiting to be read");
+  Assert.Visible("Captioner is sent none of these until you make one active.", within: "Waiting to be read");
+  Assert.Visible("Its work on write label", within: "Waiting to be read");
+  Assert.Visible("Proposed by Ines Okafor from 1 correction", within: "Waiting to be read");
+  Assert.Visible("Nothing is active", within: "Active");
+  Assert.Visible("Before anybody taught it anything", within: "History");
+  Ui.Click("Show what it was drawn from");
+  Assert.Visible("The label says circa 1850.", within: "Drawn from");
+  Assert.Clickable("Activate");
+  Assert.Clickable("Edit");
+  Assert.Clickable("Reject");
+  Assert.NoOverflow();
+  Ui.Shot("instructions-proposed-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("instructions-proposed-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Click("Activate");
+  Assert.Visible("Instruction set 1", within: "Where it stands");
+  Assert.Visible("Captioner is told one thing beyond what its developers wrote.", within: "Where it stands");
+  Assert.Visible("Active. Captioner is on instruction set 1; work it starts from now on is sent this.");
+  Assert.Visible(StyleRule(), within: "Active");
+  Assert.Visible("Made active by Marek Havel on 3 Mar 2031", within: "Active");
+  Assert.Visible("No work has been sent this yet.", within: "Whether it helped");
+  Assert.Visible("Marek Havel made an instruction active", within: "Set 1");
+  Assert.Hidden("Waiting to be read");
+
+  // The next label is right, because the model was sent it.
+  runas (Ines) {
+    LabelFor("1921.2", "third");
+    Assert.Contains("1. " + StyleRule(), SentIn("third"));
+    Assert.Contains("about 1870", LabelOn("1921.2"));
+  }
+  Ui.Visit("/captioner");
+  Assert.Visible("Sent to 1 piece of work. None of it has been corrected since.", within: "Whether it helped");
+  Assert.Clickable("Retire");
+  Assert.Visible("Roll back to the start", within: "Before any instruction");
+  Assert.NoOverflow();
+  Ui.Shot("instructions-active-wide-light");
+
+  // Back to the start, with the reason.
+  Ui.Click("Roll back to the start");
+  Assert.Visible("Captioner will be told nothing beyond what its developers wrote. Everything active now is retired.", within: "Going back");
+  Assert.Disabled("Roll back");
+  Ui.Fill("Why is it put back?", "The style sheet is being rewritten.");
+  Ui.Shot("roll-back-wide-light");
+  Ui.Click("Roll back");
+  Assert.Visible("Instruction set 2", within: "Where it stands");
+  Assert.Visible("Captioner is put back. That is instruction set 2; work it starts from now on runs under it.");
+  Assert.Visible("Nothing is active", within: "Active");
+  Assert.Visible("Marek Havel put Captioner back to before it was taught anything", within: "Set 2");
+  Assert.Visible("The style sheet is being rewritten.", within: "Set 2");
+  Ui.Click("Show 1");
+  Assert.Visible("Retired by Marek Havel on 3 Mar 2031: Put back to instruction set 0: The style sheet is being rewritten.", within: "Retired and rejected");
+  Assert.Clickable("Activate again");
+  Assert.NoOverflow();
+  Ui.Shot("instructions-rolled-back-wide-light");
+  runas (Ines) {
+    LabelFor("1934.7", "fourth");
+    Assert.Equal("", SentIn("fourth"));
+    Assert.Contains("circa 1905", LabelOn("1934.7"));
+  }
+
+  // The same page on a phone, in the dark.
+  Ui.Viewport(390, 844);
+  Ui.Visit("/captioner");
+  Assert.Visible("Instruction set 2", within: "Where it stands");
+  Assert.NoOverflow();
+  Ui.Theme("dark");
+  Ui.Shot("instructions-phone-dark");
+  Ui.Theme("light");
+  Ui.Shot("instructions-phone-light");
+}
+
+/// What the registrar does to a proposal other than making it active: he proposes one outright, edits it, rejects
+/// another with the reason, and retires an active one — each refusal and each reason said on the page.
+[Test(Rooms)]
+void the_registrar_proposes_edits_rejects_and_retires() {
+  TestClock.Set(new DateTime(2031, 3, 3, 9, 0, 0, DateTimeKind.Utc));
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Marek);
+  Ui.Visit("/captioner");
+  // Nothing yet: the page says where an instruction comes from.
+  Assert.Visible("Nothing is active", within: "Active");
+  Assert.Visible("An instruction starts as a correction: open a piece of Captioner's work and choose Correct this.", within: "Active");
+  Ui.Shot("instructions-empty-wide-light");
+
+  Ui.Click("Propose an instruction");
+  Assert.Disabled("Propose");
+  Ui.Fill("What should Captioner do?", "Give a maker's town after the name.");
+  Ui.Fill("Why?", "Visitors ask where things were made.");
+  Ui.Click("Write label");
+  Ui.Shot("propose-wide-light");
+  Ui.Click("Propose");
+  Assert.Visible("Proposed. It is waiting to be read.");
+  Assert.Visible("Give a maker's town after the name.", within: "Waiting to be read");
+  Assert.Visible("Proposed by Marek Havel", within: "Waiting to be read");
+
+  Ui.Click("Edit");
+  Ui.Fill("What Captioner is told", "After a maker's name, give the town they worked in.");
+  Ui.Click("Save");
+  Assert.Visible("After a maker's name, give the town they worked in.", within: "Waiting to be read");
+  Assert.Visible("Saved. It is still waiting to be made active.");
+
+  Ui.Click("Activate");
+  Assert.Visible("Instruction set 1", within: "Where it stands");
+  Ui.Click("Retire");
+  Assert.Disabled("Retire");
+  Ui.Fill("Why is it retired?", "The labels got too long.");
+  Ui.Shot("retire-wide-light");
+  Ui.Click("Retire");
+  Assert.Visible("Instruction set 2", within: "Where it stands");
+  Assert.Visible("Marek Havel retired an instruction", within: "Set 2");
+  Assert.Visible("The labels got too long.", within: "Set 2");
+
+  // A second proposal is rejected, with the reason.
+  Ui.Click("Propose an instruction");
+  Ui.Fill("What should Captioner do?", "Write every label in capitals.");
+  Ui.Fill("Why?", "It looks important.");
+  Ui.Click("Propose");
+  Ui.Click("Reject");
+  Ui.Fill("Why not?", "Capitals are harder to read.");
+  Ui.Click("Reject");
+  Assert.Visible("Rejected. Whoever proposed it can read why.");
+  Assert.Hidden("Waiting to be read");
+  Ui.Click("Show 2");
+  Assert.Visible("Rejected by Marek Havel on 3 Mar 2031: Capitals are harder to read.", within: "Retired and rejected");
+  runas (Marek) {
+    Assert.Equal(1, AgentInstruction.Count(i => i.State == InstructionState.Rejected));
+    Assert.Equal(1, AgentInstruction.Count(i => i.State == InstructionState.Retired));
+    Assert.Equal(2, InstructionSetOf(TheCaptioner));
+  }
+}
+
+/// What is not somebody's is not shown as theirs: another curator's work is not June's to see, and the page says so.
+[Test(Rooms)]
+void work_that_is_not_yours_says_so() {
+  var task = TheSextantIsLabelled();
+  Ui.Viewport(390, 844);
+  Ui.SignInAs(June);
+  Ui.Visit("/work/" + task);
+  Assert.Visible("This piece of work is not yours to see");
+  Assert.Hidden("Correct this");
+  Assert.NoOverflow();
+  Ui.Shot("work-not-yours-phone-light");
+}

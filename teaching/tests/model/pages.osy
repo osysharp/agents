@@ -1,0 +1,88 @@
+// The museum's screens: the collection with each piece's label, one piece of the captioner's work — where a curator
+// corrects it — and the captioner's own page, where the registrar reads what is proposed and decides.
+namespace Museum;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Agents.Teaching;
+
+[Layout]
+component MuseumFrame() {
+  live var me = Session.CurrentUser;
+  live var myName = me == null ? "" : me.DisplayName;
+  action SignOut() { Session.SignOut(); }
+  action Appearance() { Theme.Toggle(); }
+  render {
+    TabbedShell(new AppChrome {
+      Product = "Tidewater Museum",
+      Tagline = "Collection",
+      Mark = Icons.Building,
+      Home = "/",
+      User = new ShellUser {
+        Name = myName, Initials = InitialsOf(myName == "" ? "?" : myName),
+        Menu = [
+          new MenuAction { Label = "Appearance", Icon = Icons.Eye, OnPress = Appearance },
+          new MenuAction { Label = "Sign out", Icon = Icons.Logout, OnPress = SignOut, Tone = Tone.Danger, Divided = true },
+        ],
+      },
+      Nav = [
+        new NavItem { Label = "Collection", To = "/", Icon = Icons.Home, Exact = true },
+        new NavItem { Label = "Captioner", To = "/captioner", Icon = Icons.Users },
+      ],
+    }) {
+      Outlet();
+    }
+  }
+}
+
+string InitialsOf(string name) {
+  var initials = "";
+  foreach (var part in name.Split(" ")) { if (part != "" && initials.Length < 2) { initials = initials + part.Substring(0, 1).ToUpper(); } }
+  return initials;
+}
+
+/// The collection: each piece, its label, and the way to the captioner's work on it.
+[Route("/")] [Layout(MuseumFrame)] [Authorize(UsesAgents)] [Render(CSR)] [Title("Collection")]
+component CollectionPage() {
+  live var pieces = Piece.OrderBy(p => p.Number).ToList();
+  render {
+    Stack(gap: 6, px: 5, py: 6, w: "100%", maxW: "860px", mx: "auto") {
+      PageHead("Collection", subtitle: "The label beside each piece is written by the captioner and read by a curator.");
+      Stack(gap: 4) {
+        foreach (var p in pieces) {
+          Stack(gap: 2, pb: 4, label: "Piece " + p.Number) {
+            Row(gap: 3, align: Align.Baseline, wrap: Wrapping.Wrap) {
+              Text(p.Number, fontSize: FontSize.Label, color: Colors.TextMuted, fontFamily: Font.Mono);
+              Text(p.Name, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            }
+            if (p.Label == "") { Text("No label yet.", fontSize: FontSize.Body, color: Colors.TextMuted); }
+            if (p.Label != "") { Text(p.Label, fontSize: FontSize.Body, lineHeight: "1.55", maxW: "62ch"); }
+            if (p.LastWork != null) { Row { TextLink("How the captioner wrote it", to: "/work/" + p.LastWork.ToString()); } }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// One piece of the captioner's work: what it handed back, what it was told, and "Correct this".
+[Route("/work/{task}")] [Layout(MuseumFrame)] [Authorize(UsesAgents)] [Render(CSR)] [Title("The captioner's work")]
+component WorkPage(Guid task) {
+  render {
+    Stack(gap: 5, px: 5, py: 6, w: "100%", maxW: "860px", mx: "auto") {
+      Row { TextLink("The collection", to: "/"); }
+      WorkTeaching(task);
+    }
+  }
+}
+
+/// The captioner's page: what it is told.
+[Route("/captioner")] [Layout(MuseumFrame)] [Authorize(UsesAgents)] [Render(CSR)] [Title("Captioner")]
+component CaptionerPage() {
+  render {
+    Stack(gap: 6, px: 5, py: 6, w: "100%", maxW: "860px", mx: "auto") {
+      PageHead("Captioner", subtitle: "Writes the labels visitors read beside each piece.");
+      AgentInstructions("Museum.Captioner");
+    }
+  }
+}

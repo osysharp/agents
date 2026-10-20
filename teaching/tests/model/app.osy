@@ -1,0 +1,101 @@
+// The Tidewater Museum: a few rooms of instruments, charts and ship models. The label a visitor reads beside each
+// piece is written by the captioner — an AI agent — from the catalogue entry; the curators have it write them, and
+// the registrar is in charge of it and decides what it is told.
+namespace Museum;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Teaching;
+
+[Role] enum MuseumRole { Authenticator, Curator, Registrar, Labels }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsCurator   => RoleGrant.Any(g => g.Member == user && g.Role == MuseumRole.Curator);
+policy IsRegistrar => RoleGrant.Any(g => g.Member == user && g.Role == MuseumRole.Registrar);
+policy WritesLabels => RoleGrant.Any(g => g.Member == user && g.Role == MuseumRole.Labels);
+
+// The curators and the registrar give the captioner work. The registrar is in charge of it, reads everything it
+// did, and is the one who teaches it.
+policy UsesAgents       => IsCurator || IsRegistrar;
+policy SupervisesAgents => IsRegistrar;
+policy AuditsAgents     => IsRegistrar;
+policy TeachesAgents    => IsRegistrar;
+
+/// Somebody at the museum — and the captioner's own account.
+entity Person : Principal {
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+  }
+}
+
+/// One piece in the collection.
+entity Piece {
+  /// Its accession number, as the register has it: "1887.4".
+  [Required, Unique, MaxLength(40)] string Number;
+  [Required, MaxLength(200)] string Name;
+  /// The catalogue entry, as the registrar wrote it.
+  [MaxLength(1000)] string Entry = "";
+  /// The label a visitor reads.
+  [MaxLength(400)] string Label = "";
+  /// The captioner's last piece of work on it, by its receipt.
+  Guid? LastWork;
+  security {
+    allow read when IsAuthenticated;
+    allow update when IsCurator || IsRegistrar || WritesLabels;
+    allow create when IsRegistrar;
+  }
+}
+
+/// What the captioner hands back for one piece.
+public class Caption {
+  /// The label, as it will stand beside the piece.
+  public string Text = "";
+}
+
+/// The catalogue entry for a piece.
+[Action("Read the catalogue entry", Query)]
+public string CatalogueEntry(Piece piece) { return piece.Entry; }
+
+/// Put a label beside a piece.
+[Action("Put the label on the piece")]
+public string PutLabel(Piece piece, string text) {
+  piece.Label = text;
+  return $"The label of {piece.Number} is set.";
+}
+
+/// Writes the label for one piece.
+public class WriteLabel : Skill<Piece, Caption> {
+  public override string Description => "Write the label a visitor reads beside one piece.";
+  public override string Instructions => "Read the catalogue entry first. Two sentences at most: what it is, who made it and when. Then put the label on the piece.";
+  public override List<ActionInfo> Tools => [Actions.Of(CatalogueEntry), Actions.Of(PutLabel)];
+  public override string Brief(Piece p) => $"Piece {p.Number}, {p.Name}. Its id is {p.Id}.";
+  public override string? Check(Caption c) => c.Text.Trim() == "" ? "A label says something." : c.Text.Length > 400 ? "A label is at most 400 characters." : null;
+}
+
+/// Writes the museum's labels.
+[Actor(Roles = [MuseumRole.Labels])]
+public class Captioner : Agent {
+  public static Person Principal => new Person { Email = "captioner@tidewater.example", DisplayName = "Captioner" };
+  public override string Purpose => "You write the labels visitors read beside each piece in the Tidewater Museum.";
+  public override List<SkillBase> Skills => [new WriteLabel()];
+  // It sets labels by itself: a label is the museum's own data, and a curator reads every one.
+  public override Permits May => Permits.ChangesAlone();
+}
+
+/// Have the captioner write the label for a piece, for whoever is signed in. Answers the work's receipt.
+public Guid WriteLabelFor(Piece piece) {
+  var outcome = await Agents.Of<Captioner>().Do(new WriteLabel(), piece, about: "Label for " + piece.Number + ", " + piece.Name);
+  piece.LastWork = outcome.Task;
+  return outcome.Task;
+}
+
+/// What a scripted model is sent, for a test to read: the third part of its system prompt — what people have told the
+/// agent since it was written — or "" when there is none.
+entity ModelWasSent {
+  [Required, MaxLength(40)] string What;
+  [MaxLength(4000)] string Said = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}

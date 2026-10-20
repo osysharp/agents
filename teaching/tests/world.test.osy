@@ -1,0 +1,84 @@
+// The museum the tests run in: Ines and June are curators, Marek is the registrar — in charge of the captioner, and
+// the one who teaches it — and four pieces wait for their labels.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Teaching;
+using Museum;
+
+[TestFixture]
+void Rooms() {
+  var ines = new Person { Email = "ines@tidewater.example", DisplayName = "Ines Okafor" };
+  var june = new Person { Email = "june@tidewater.example", DisplayName = "June Park" };
+  var marek = new Person { Email = "marek@tidewater.example", DisplayName = "Marek Havel" };
+  new RoleGrant { Member = ines, Role = MuseumRole.Curator };
+  new RoleGrant { Member = june, Role = MuseumRole.Curator };
+  new RoleGrant { Member = marek, Role = MuseumRole.Registrar };
+  new Piece { Number = "1887.4", Name = "Brass sextant", Entry = "Sextant, brass with a silvered scale. Thomas Reid of Leith, circa 1850. Given by the harbour board, 1887." };
+  new Piece { Number = "1902.11", Name = "Chart of the firth", Entry = "Engraved chart. Surveyed by Captain A. Lyle, circa 1815. Bought at auction, 1902." };
+  new Piece { Number = "1921.2", Name = "Model of the brig Petrel", Entry = "Ship model, pine and linen. Built by John Darroch, shipwright, circa 1870. Bequeathed 1921." };
+  new Piece { Number = "1934.7", Name = "Harbour lamp", Entry = "Signal lamp, copper and glass. Abbey works, circa 1905. Taken down from the east pier, 1934." };
+  // The registrar answers for the captioner.
+  new AgentSeat { Agent = "Museum.Captioner", Sponsor = marek };
+}
+
+principal Ines  => Person.Single(p => p.Email == "ines@tidewater.example");
+principal June  => Person.Single(p => p.Email == "june@tidewater.example");
+principal Marek => Person.Single(p => p.Email == "marek@tidewater.example");
+
+const string TheCaptioner = "Museum.Captioner";
+
+/// What the registrar's style sheet says, as the captioner is to be told it.
+string StyleRule() { return "Before a date that is not certain, write about. Never write circa or c."; }
+
+/// The label the scripted captioner writes for a piece: the catalogue's own "circa", unless it has been told better.
+string LabelOf(string number, bool taught) {
+  var about = taught ? "about" : "circa";
+  if (number == "1887.4")  { return $"A brass sextant with a silvered scale, made by Thomas Reid of Leith {about} 1850."; }
+  if (number == "1902.11") { return $"An engraved chart of the firth, surveyed by Captain A. Lyle {about} 1815."; }
+  if (number == "1921.2")  { return $"A model of the brig Petrel in pine and linen, built by the shipwright John Darroch {about} 1870."; }
+  return $"A copper signal lamp from the east pier, made at the Abbey works {about} 1905.";
+}
+
+/// ⭐ THE CAPTIONER, SCRIPTED BY WHAT IT IS SENT. It reads the catalogue entry, puts the label on the piece and hands
+/// it back — writing "about" only when the instructions it was sent tell it to. So a label changes exactly when the
+/// model is sent the instruction, and never because a test said so. `note`: under which name the test finds what
+/// the model was sent on its first turn.
+void TheCaptionerAnswers(string note) {
+  ScriptedAnswer.Stub((model, request) => {
+    var told = request.SystemSegments.Count > 2 ? request.SystemSegments[2].Content : "";
+    var turn = request.Messages.Count(m => m.Role == "assistant");
+    if (turn == 0) { new ModelWasSent { What = note, Said = told }; }
+    // What it was given: "Piece 1887.4, Brass sextant. Its id is <id>."
+    var brief = request.Messages[0].Content[0].Text ?? "";
+    var number = brief.Substring(6, brief.IndexOf(",") - 6);
+    var at = brief.IndexOf("Its id is ") + 10;
+    var id = brief.Substring(at, 36);
+    var label = LabelOf(number, told.Contains("write about"));
+    if (turn == 0) { return Says.Tool(Actions.Of(CatalogueEntry), "{\"piece\":\"" + id + "\"}"); }
+    if (turn == 1) { return Says.Tool(Actions.Of(PutLabel), "{\"piece\":\"" + id + "\",\"text\":\"" + label + "\"}"); }
+    return Says.HandBack(new Caption { Text = label });
+  });
+}
+
+/// What the model was sent, in the run noted under `note`. "": nothing beyond who it is and its job.
+string SentIn(string note) { return ModelWasSent.Single(s => s.What == note).Said; }
+
+/// Whoever is signed in has the captioner write the label for a piece. Answers the work's receipt.
+Guid LabelFor(string number, string note) {
+  TheCaptionerAnswers(note);
+  var task = WriteLabelFor(Piece.Single(p => p.Number == number));
+  UnitOfWork.Commit();
+  return task;
+}
+
+string LabelOn(string number) { return Piece.Single(p => p.Number == number).Label; }
+
+/// Ines corrects a piece of work the way the screen does, and proposes the style rule from it.
+CorrectionSent InesCorrects(Guid task) {
+  return SendCorrection(task, new CorrectionForm {
+    Wrong = "The label says circa 1850.", Right = "About 1850.",
+    Because = "Visitors do not read Latin, and the style sheet says about.", Propose = true, Guidance = StyleRule(),
+  });
+}

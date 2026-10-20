@@ -1,0 +1,333 @@
+// What the screens read and send: an agent's instructions and one piece of work, each as whoever is looking may
+// see it, and each change a person makes on screen carried to `Osysharp.Agents`' own function for it.
+namespace Osysharp.Agents.Teaching;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+
+/// One correction, as a person reads it.
+public class CorrectionCard {
+  public Guid Id;
+  /// Who wrote it, and when — "Ines Okafor, 3 Mar 2031".
+  public string By = "";
+  public string When = "";
+  /// What of the work it is about: "The result", "Step 4: …", "A proposal: …".
+  public string About = "";
+  public string Wrong = "";
+  public string Right = "";
+  public string Because = "";
+  public string Severity = "";
+  public bool Serious = false;
+  public bool Withdrawn = false;
+  public bool Erased = false;
+}
+
+/// One instruction, as a person reads it.
+public class InstructionCard {
+  public Guid Id;
+  public string Guidance = "";
+  public string Why = "";
+  public InstructionState State = InstructionState.Proposed;
+  /// What work it is for, in words: "Everything it does", "Its work on write label", "Work done for Ines Okafor".
+  public string Scope = "";
+  /// Where it came from: "Proposed by Ines Okafor from 1 correction", "Suggested by Captioner itself", …
+  public string From = "";
+  /// Who decided, and when: "Made active by Marek Havel on 3 Mar 2031", "Rejected by …", "Retired by …".
+  public string Decided = "";
+  /// Why it was rejected or retired.
+  public string DecidedWhy = "";
+  /// Whether it helped, counted: the work sent it, how much of that was still corrected, and how many corrections
+  /// name it as not followed. `CountsAllWork`: whoever is looking reads every run, so `WorkSince` is all of it.
+  public int WorkSince = 0;
+  public int CorrectedSince = 0;
+  public int NotFollowed = 0;
+  public bool CountsAllWork = false;
+  /// The corrections it was drawn from.
+  public List<CorrectionCard> Sources = [];
+  public bool Erased = false;
+}
+
+/// One change to what an agent is told, as a line of its history.
+public class SetCard {
+  public int Number = 0;
+  /// What happened — "Marek Havel made an instruction active" — and when.
+  public string Said = "";
+  public string When = "";
+  public string Why = "";
+  /// The instruction it was about, in its own words; "" for a rollback.
+  public string Instruction = "";
+  /// How many instructions were active after it.
+  public int Count = 0;
+  /// It is the set the agent is on, or tells it exactly the same: there is nothing to go back to.
+  public bool Current = false;
+  public bool SameAsNow = false;
+}
+
+/// One skill an instruction can be for.
+public class SkillChoice {
+  public string Skill = "";
+  public string Label = "";
+}
+
+/// Everything the Instructions page shows for one agent.
+public class InstructionBoard {
+  /// The agent, by its class's full name, and as a person reads it.
+  public string Agent = "";
+  public string Name = "";
+  /// The set it is on — 0 before anybody taught it anything — and how many instructions are active.
+  public int Set = 0;
+  /// Whoever is looking may make active, edit, reject, retire and roll back; may propose one outright.
+  public bool MayTeach = false;
+  public bool MayPropose = false;
+  public List<InstructionCard> Proposed = [];
+  public List<InstructionCard> Active = [];
+  public List<InstructionCard> Past = [];
+  /// Newest first; the last line is "before anybody taught it anything".
+  public List<SetCard> History = [];
+  public List<SkillChoice> Skills = [];
+}
+
+string Named(Principal? p) { return p == null ? "somebody no longer here" : (p!.DisplayName != "" ? p!.DisplayName : p!.Email); }
+
+string Dated(DateTime at) { return at.ToString("d MMM yyyy"); }
+
+string Plural(int n, string one, string many) { return n == 1 ? "1 " + one : n.ToString() + " " + many; }
+
+/// A skill's class name as words — "write label".
+string SkillWords(string skill) {
+  var name = BareName(skill);
+  var words = "";
+  foreach (var c in name) {
+    if (char.IsUpper(c) && words != "") { words = words + " " + char.ToLower(c); }
+    else { words = words + char.ToLower(c); }
+  }
+  return words;
+}
+
+CorrectionCard CardOf(AgentCorrection c) {
+  var about = c.About == CorrectionAbout.Step ? $"Step {c.Step}" + (c.StepSaid == "" ? "" : ": " + c.StepSaid)
+            : c.About == CorrectionAbout.Proposal ? "A proposal" + (c.Proposal == null ? "" : ": " + c.Proposal!.Label)
+            : "The result";
+  return new CorrectionCard {
+    Id = c.Id, By = Named(c.By), When = Dated(c.At), About = about, Wrong = c.Wrong, Right = c.Right, Because = c.Because,
+    Severity = c.Severity.Label, Serious = c.Severity == CorrectionSeverity.Serious, Withdrawn = c.WithdrawnAt != null, Erased = c.ErasedAt != null,
+  };
+}
+
+InstructionCard CardOf(AgentInstruction i, bool counts, bool allWork) {
+  var scope = i.Skill == "" ? "Everything it does" : "Its work on " + SkillWords(i.Skill);
+  if (i.For != null) { scope = scope + ", for " + Named(i.For); }
+  if (i.OnScope != "") { scope = scope + ", charged to " + i.OnScope; }
+  var drawn = i.DrawnFrom == 0 ? "" : " from " + Plural(i.DrawnFrom, "correction", "corrections");
+  var from = i.ProposedByAgent != "" ? "Suggested by " + AgentName(i.ProposedByAgent) + " itself"
+           : i.DraftedBy != "" ? "Worded by " + i.DraftedBy + drawn + ", put forward by " + Named(i.ProposedBy)
+           : "Proposed by " + Named(i.ProposedBy) + drawn;
+  var decided = "";
+  var why = "";
+  if (i.State == InstructionState.Active && i.ActiveSince != null) { decided = "Made active by " + Named(i.ReviewedBy) + " on " + Dated(i.ActiveSince!.Value); }
+  if (i.State == InstructionState.Rejected && i.ReviewedAt != null) { decided = "Rejected by " + Named(i.ReviewedBy) + " on " + Dated(i.ReviewedAt!.Value); why = i.RetiredWhy; }
+  if (i.State == InstructionState.Retired && i.RetiredAt != null) {
+    decided = (i.RetiredBy == null ? "Taken out of use" : "Retired by " + Named(i.RetiredBy)) + " on " + Dated(i.RetiredAt!.Value);
+    why = i.RetiredWhy;
+  }
+  var card = new InstructionCard {
+    Id = i.Id, Guidance = i.Guidance, Why = i.Why, State = i.State, Scope = scope, From = from, Decided = decided, DecidedWhy = why,
+    Erased = i.ErasedAt != null, CountsAllWork = allWork,
+  };
+  if (counts) {
+    var effect = EffectOf(i);
+    card.WorkSince = effect.WorkSince;
+    card.CorrectedSince = effect.CorrectedSince;
+    card.NotFollowed = effect.NotFollowed;
+  }
+  foreach (var c in SourcesOf(i)) { card.Sources.Add(CardOf(c)); }
+  return card;
+}
+
+/// ⭐ AN AGENT'S INSTRUCTIONS, for its page: what is waiting to be read, what is active, what is past, and every
+/// change to the set — each as whoever is looking may read it. Somebody who only gives the agent work sees what it
+/// is told for their own work, and nothing that is only proposed.
+[Server, Authorize(IsAuthenticated)]
+public InstructionBoard InstructionBoardOf(string agent) {
+  var me = Session.CurrentUser;
+  var board = new InstructionBoard { Agent = agent, Name = AgentName(agent), Set = InstructionSetOf(agent) };
+  if (!Agents.Names().Contains(agent)) { return board; }
+  board.MayTeach = Security.Authorize(me, TeachesAgents);
+  board.MayPropose = board.MayTeach || Security.Authorize(me, SupervisesAgents);
+  var allWork = Security.Authorize(me, SupervisesAgents) || Security.Authorize(me, AuditsAgents);
+  foreach (var s in Skills.Of(agent)) { board.Skills.Add(new SkillChoice { Skill = s.Skill, Label = s.Label }); }
+  foreach (var i in InstructionsOfAgent(agent)) {
+    if (i.State == InstructionState.Proposed) { board.Proposed.Add(CardOf(i, false, allWork)); }
+    else if (i.State == InstructionState.Active) { board.Active.Add(CardOf(i, true, allWork)); }
+    else { board.Past.Add(CardOf(i, true, allWork)); }
+  }
+  var nowHash = InstructionSetHashNow(agent);
+  foreach (var set in InstructionSetsOf(agent)) {
+    var who = set.By == null ? (set.Change == InstructionChange.Erased || set.Change == InstructionChange.Withheld ? "A privacy request" : "Somebody no longer here") : Named(set.By);
+    var did = set.Change == InstructionChange.Activated ? "made an instruction active"
+            : set.Change == InstructionChange.Retired ? "retired an instruction"
+            : set.Change == InstructionChange.RolledBack ? (set.RestoredFrom == 0 ? "put " + board.Name + " back to before it was taught anything" : $"put {board.Name} back to set {set.RestoredFrom}")
+                                                           + (set.Skill == "" ? "" : ", for its work on " + SkillWords(set.Skill))
+            : set.Change == InstructionChange.Erased ? "erased an instruction"
+            : "took an instruction out of use";
+    board.History.Add(new SetCard {
+      Number = set.Number, Said = who + " " + did, When = Dated(set.At), Why = set.Why,
+      Instruction = set.Instruction == null ? "" : set.Instruction!.Guidance, Count = set.Count,
+      Current = set.Number == board.Set, SameAsNow = set.Hash == nowHash,
+    });
+  }
+  board.History.Add(new SetCard { Number = 0, Said = "Before anybody taught it anything", Count = 0, Current = board.Set == 0, SameAsNow = nowHash == "" });
+  return board;
+}
+
+/// One step of a piece of work's record.
+public class WorkStep {
+  public int Seq = 0;
+  public string Kind = "";
+  public string Said = "";
+}
+
+/// Everything "teaching" shows on one piece of work.
+public class WorkTeachingView {
+  public Guid Task;
+  public string Agent = "";
+  public string Name = "";
+  public string Skill = "";
+  public string About = "";
+  public string Status = "";
+  public bool Ended = false;
+  /// What it handed back, as text.
+  public string Result = "";
+  /// What it ran with, in a sentence; the instructions it was sent; and those made active since that it was not.
+  public string RanWith = "";
+  public List<InstructionCard> Sent = [];
+  public List<InstructionCard> NotYet = [];
+  public List<WorkStep> Steps = [];
+  public List<CorrectionCard> Corrections = [];
+  /// Whoever is looking may correct it.
+  public bool MayCorrect = false;
+}
+
+/// ⭐ ONE PIECE OF WORK, for teaching: what it was told, what it handed back, each step of its record, and the
+/// corrections people have made of it. Null when it is not whoever-is-looking's to read.
+[Server, Authorize(IsAuthenticated)]
+public WorkTeachingView? WorkTeachingOf(Guid task) {
+  var t = AgentTask.FirstOrDefault(x => x.Id == task);
+  if (t == null) { return null; }
+  var me = Session.CurrentUser;
+  var view = new WorkTeachingView {
+    Task = t!.Id, Agent = t!.Agent, Name = AgentName(t!.Agent), Skill = t!.Skill == "" ? "" : SkillWords(t!.Skill), About = t!.About,
+    Status = t!.Status.Label, Ended = t!.Status != AgentTaskStatus.Working && t!.Status != AgentTaskStatus.Waiting,
+    Result = ResultWords(t!.Result),
+  };
+  view.MayCorrect = me != null
+    && ((t!.Requester != null && t!.Requester!.Id == me!.Id) || (t!.StartedBy != null && t!.StartedBy!.Id == me!.Id)
+        || Security.Authorize(me, SupervisesAgents) || Security.Authorize(me, TeachesAgents));
+  var ran = InstructionsOf(t!);
+  view.RanWith = ran.Words;
+  foreach (var i in ran.Sent) { view.Sent.Add(CardOf(i, false, false)); }
+  foreach (var i in ran.NotYet) { view.NotYet.Add(CardOf(i, false, false)); }
+  foreach (var line in TraceOf(t!)) {
+    if (line.Task != t!.Id) { continue; }
+    view.Steps.Add(new WorkStep { Seq = line.Seq, Kind = line.Kind.Label, Said = line.Summary });
+  }
+  foreach (var c in CorrectionsOf(t!)) { view.Corrections.Add(CardOf(c)); }
+  return view;
+}
+
+/// A result as a person reads it: the one text of a result that is one, else the JSON as it was handed back.
+string ResultWords(string? result) {
+  if (result == null || result == "") { return ""; }
+  var text = result!;
+  if (text.StartsWith("\"") && text.EndsWith("\"") && text.Length >= 2) {
+    return text.Substring(1, text.Length - 2).Replace("\\n", "\n").Replace("\\\"", "\"").Replace("\\u0027", "'");
+  }
+  try {
+    var parts = JsonSerializer.Deserialize<Dictionary<string, Json>>(text);
+    List<string> lines = [];
+    foreach (var key in parts.Keys) {
+      var value = parts[key].ToString();
+      if (value.StartsWith("\"") && value.EndsWith("\"") && value.Length >= 2) {
+        value = value.Substring(1, value.Length - 2).Replace("\\n", "\n").Replace("\\\"", "\"").Replace("\\u0027", "'");
+      }
+      lines.Add(parts.Keys.Count == 1 ? value : key + ": " + value);
+    }
+    return string.Join("\n", lines);
+  } catch (Exception e) {
+    return text;
+  }
+}
+
+/// What "Correct this" sends.
+public class CorrectionForm {
+  public string Wrong = "";
+  public string Right = "";
+  public string Because = "";
+  public CorrectionSeverity Severity = CorrectionSeverity.Mistake;
+  public int Step = 0;
+  public Guid? Proposal;
+  /// Also propose an instruction from it — in these words, or in the words of `Right` when none are given — for all
+  /// that skill's work, or only for the work the agent does for whoever corrects.
+  public bool Propose = false;
+  public string Guidance = "";
+  public bool OnlyForMe = false;
+}
+
+/// What came of it, to tell the person.
+public class CorrectionSent {
+  public Guid Correction;
+  public Guid? Instruction;
+  public string Said = "";
+}
+
+/// ⭐ SEND A CORRECTION from the screen — and, when the person asked, propose an instruction from it in the same
+/// unit of work. The correction is `CorrectAgentWork`'s and the proposal `ProposeAgentInstruction`'s: who may is
+/// theirs to say.
+[Server, Authorize(IsAuthenticated)]
+public CorrectionSent SendCorrection(Guid task, CorrectionForm form) {
+  var t = AgentTask.FirstOrDefault(x => x.Id == task);
+  if (t == null) { throw new AgentRefused("This piece of work is not yours to correct."); }
+  var name = AgentName(t!.Agent);
+  var correction = CorrectAgentWork(t!, new Correction {
+    Wrong = form.Wrong, Right = form.Right, Because = form.Because, Severity = form.Severity, Step = form.Step, Proposal = form.Proposal,
+  });
+  var sent = new CorrectionSent { Correction = correction.Id, Said = "Corrected. " + name + " does nothing differently yet." };
+  if (!form.Propose) { return sent; }
+  var me = Session.CurrentUser;
+  var instruction = ProposeAgentInstruction(new InstructionDraft {
+    Agent = t!.Agent, Skill = t!.Skill, For = form.OnlyForMe && me != null ? me!.Id : null,
+    Guidance = form.Guidance.Trim() == "" ? form.Right : form.Guidance, Why = form.Because, From = [correction.Id],
+  });
+  sent.Instruction = instruction.Id;
+  sent.Said = "Corrected, and an instruction is proposed. " + name + " does nothing differently until somebody who teaches the agents makes it active.";
+  return sent;
+}
+
+// ── the Instructions page's presses ─────────────────────────────────────────────────────────────────────────────────
+
+AgentInstruction InstructionById(Guid id) {
+  var i = AgentInstruction.FirstOrDefault(x => x.Id == id);
+  if (i == null) { throw new AgentRefused("That instruction is not yours to see."); }
+  return i!;
+}
+
+/// Make a proposed or retired instruction active. Answers the agent's new set number.
+[Server, Authorize(IsAuthenticated)]
+public int ActivateFromPage(Guid instruction, string why = "") { return ActivateAgentInstruction(InstructionById(instruction), why).Number; }
+
+[Server, Authorize(IsAuthenticated)]
+public void RejectFromPage(Guid instruction, string why) { RejectAgentInstruction(InstructionById(instruction), why); }
+
+[Server, Authorize(IsAuthenticated)]
+public int RetireFromPage(Guid instruction, string why) { return RetireAgentInstruction(InstructionById(instruction), why).Number; }
+
+[Server, Authorize(IsAuthenticated)]
+public void ReviseFromPage(Guid instruction, string guidance, string why) { ReviseAgentInstruction(InstructionById(instruction), guidance, why); }
+
+[Server, Authorize(IsAuthenticated)]
+public int RollBackFromPage(string agent, int toSet, string why) { return RollBackAgentInstructions(agent, toSet, why).Number; }
+
+[Server, Authorize(IsAuthenticated)]
+public void ProposeFromPage(string agent, string skill, string guidance, string why) {
+  ProposeAgentInstruction(new InstructionDraft { Agent = agent, Skill = skill, Guidance = guidance, Why = why });
+}

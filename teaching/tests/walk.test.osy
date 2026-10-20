@@ -1,0 +1,137 @@
+// Osysharp.Agents.Teaching — one case, from a mistake to a rollback, through the functions the screens call. The
+// captioner writes "circa" on a label; a curator corrects it and an instruction is proposed; nothing changes until
+// the registrar makes it active; the next label says "about"; each piece of work says what it ran under; and a
+// rollback brings the old labels back. The model is scripted by what it is SENT (world.test.osy).
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Teaching;
+using Museum;
+
+[Test(Rooms)]
+void a_mistake_is_corrected_taught_and_then_rolled_back() {
+  TestClock.Set(new DateTime(2031, 3, 3, 9, 0, 0, DateTimeKind.Utc));
+  Guid first = Guid.Empty;
+  Guid third = Guid.Empty;
+
+  // 1. The captioner makes its mistake: the catalogue's Latin goes onto the wall.
+  runas (Ines) {
+    first = LabelFor("1887.4", "first");
+    Assert.Equal("A brass sextant with a silvered scale, made by Thomas Reid of Leith circa 1850.", LabelOn("1887.4"));
+    Assert.Equal("", SentIn("first"));
+
+    // 2. Ines corrects it, and proposes what the captioner should be told.
+    var sent = InesCorrects(first);
+    UnitOfWork.Commit();
+    Assert.Equal("Corrected, and an instruction is proposed. Captioner does nothing differently until somebody who teaches the agents makes it active.", sent.Said);
+    Assert.NotNull(sent.Instruction);
+    var onTheWork = WorkTeachingOf(first)!;
+    Assert.Equal("The result", onTheWork.Corrections.Single().About);
+    Assert.Equal("Ines Okafor", onTheWork.Corrections.Single().By);
+    Assert.Equal("3 Mar 2031", onTheWork.Corrections.Single().When);
+
+    // 3. Proposed is not active: the next label is as wrong as the first, because the model was sent nothing new.
+    LabelFor("1902.11", "second");
+    Assert.Equal("", SentIn("second"));
+    Assert.Contains("circa 1815", LabelOn("1902.11"));
+    // She sees her proposal waiting, and is offered no way to make it active.
+    var hers = InstructionBoardOf(TheCaptioner);
+    Assert.False(hers.MayTeach);
+    Assert.Equal(StyleRule(), hers.Proposed.Single().Guidance);
+    Assert.Equal(0, hers.Set);
+    Assert.Denied(() => ActivateFromPage(hers.Proposed.Single().Id));
+  }
+
+  // 4. Marek reads it — with the correction it was drawn from — and makes it active.
+  runas (Marek) {
+    var board = InstructionBoardOf(TheCaptioner);
+    Assert.True(board.MayTeach);
+    var proposed = board.Proposed.Single();
+    Assert.Equal("Its work on write label", proposed.Scope);
+    Assert.Equal("Proposed by Ines Okafor from 1 correction", proposed.From);
+    Assert.Equal("The label says circa 1850.", proposed.Sources.Single().Wrong);
+    Assert.Equal(1, ActivateFromPage(proposed.Id));
+    UnitOfWork.Commit();
+    var after = InstructionBoardOf(TheCaptioner);
+    Assert.Equal(1, after.Set);
+    Assert.Equal("Made active by Marek Havel on 3 Mar 2031", after.Active.Single().Decided);
+    Assert.Equal("Marek Havel made an instruction active", after.History[0].Said);
+    Assert.True(after.History[0].Current);
+  }
+
+  // 5. The next piece of work is sent it — and does the right thing.
+  runas (Ines) {
+    third = LabelFor("1921.2", "third");
+    Assert.Contains("1. " + StyleRule(), SentIn("third"));
+    Assert.Equal("A model of the brig Petrel in pine and linen, built by the shipwright John Darroch about 1870.", LabelOn("1921.2"));
+
+    // 6. Each piece of work says what it ran under, so the first label can be explained.
+    var receipt = AgentTask.Single(t => t.Id == third);
+    Assert.Equal(1, receipt.InstructionSet);
+    Assert.Equal("1", receipt.SkillVersion);
+    var now = WorkTeachingOf(third)!;
+    Assert.Equal("It ran under instruction set 1, sent 1 instruction.", now.RanWith);
+    Assert.Equal(StyleRule(), now.Sent.Single().Guidance);
+    var then = WorkTeachingOf(first)!;
+    Assert.Equal("It ran before anybody had taught Captioner anything. Since then 1 has been made active that it had not been sent.", then.RanWith);
+    Assert.Equal(StyleRule(), then.NotYet.Single().Guidance);
+  }
+
+  // 7. The registrar counts whether it helped, and then — the style sheet is being rewritten — puts the captioner back.
+  runas (Marek) {
+    var active = InstructionBoardOf(TheCaptioner).Active.Single();
+    Assert.Equal(1, active.WorkSince);
+    Assert.Equal(0, active.CorrectedSince);
+    Assert.Equal(2, RollBackFromPage(TheCaptioner, 0, "The style sheet is being rewritten."));
+    UnitOfWork.Commit();
+    var board = InstructionBoardOf(TheCaptioner);
+    Assert.Equal(2, board.Set);
+    Assert.Equal(0, board.Active.Count);
+    Assert.Equal("Marek Havel put Captioner back to before it was taught anything", board.History[0].Said);
+    Assert.Equal("The style sheet is being rewritten.", board.History[0].Why);
+    Assert.Equal("Retired by Marek Havel on 3 Mar 2031", board.Past.Single().Decided);
+    Assert.Equal("Put back to instruction set 0: The style sheet is being rewritten.", board.Past.Single().DecidedWhy);
+  }
+
+  // 8. The earlier behaviour is back: the model is sent nothing, and writes the catalogue's Latin again.
+  runas (Ines) {
+    var fourth = LabelFor("1934.7", "fourth");
+    Assert.Equal("", SentIn("fourth"));
+    Assert.Equal("A copper signal lamp from the east pier, made at the Abbey works circa 1905.", LabelOn("1934.7"));
+    Assert.Equal(2, AgentTask.Single(t => t.Id == fourth).InstructionSet);
+    Assert.Equal("It ran under instruction set 2, none of which was for this work.", WorkTeachingOf(fourth)!.RanWith);
+    // What ran under set 1 still says so, and that what it was sent has been retired since.
+    Assert.Equal("It ran under instruction set 1, sent 1 instruction. 1 of what it was sent has been retired since.", WorkTeachingOf(third)!.RanWith);
+    Assert.True(VerifyTrace(AgentTask.Single(t => t.Id == third)).Intact);
+  }
+}
+
+[Test(Rooms)]
+void a_piece_of_work_is_shown_to_those_it_is_for_and_corrected_by_them() {
+  Guid task = Guid.Empty;
+  runas (Ines) {
+    task = LabelFor("1887.4", "first");
+    var view = WorkTeachingOf(task)!;
+    Assert.True(view.MayCorrect);
+    Assert.True(view.Ended);
+    Assert.Equal("Captioner", view.Name);
+    Assert.Equal("write label", view.Skill);
+    Assert.Equal("Label for 1887.4, Brass sextant", view.About);
+    Assert.Equal("A brass sextant with a silvered scale, made by Thomas Reid of Leith circa 1850.", view.Result);
+    Assert.Equal(9, view.Steps.Count);
+    Assert.Equal("Captioner was given write label: Label for 1887.4, Brass sextant.", view.Steps[0].Said);
+    // A step is corrected by its place in the record.
+    SendCorrection(task, new CorrectionForm { Wrong = "It copied the entry.", Right = "Say it for a visitor.", Because = "Nobody reads a catalogue aloud.", Step = 6 });
+    UnitOfWork.Commit();
+    var corrected = WorkTeachingOf(task)!.Corrections.Single();
+    Assert.StartsWith("Step 6: ", corrected.About);
+    // Nothing was proposed: she did not ask for it.
+    Assert.Equal(0, InstructionBoardOf(TheCaptioner).Proposed.Count);
+  }
+  // Another curator's work is not June's to see, and so not hers to correct.
+  runas (June) {
+    Assert.Null(WorkTeachingOf(task));
+    Assert.Throws<AgentRefused>(() => SendCorrection(task, new CorrectionForm { Wrong = "x", Right = "y", Because = "z" }));
+  }
+}

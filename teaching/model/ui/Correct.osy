@@ -1,0 +1,232 @@
+// "Correct this" — on a piece of an agent's work: its result, one step of its record, something it proposed.
+namespace Osysharp.Agents.Teaching;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Ui;
+
+/// ⭐ "CORRECT THIS". A button; pressed, it opens in place: what was wrong, what it should have been, why, how much it
+/// mattered — and whether to propose an instruction from it. `step` is the line of the record it is about (0: the
+/// result); `label` is the button's own, so that several on one page can be told apart; `changed` is told once a
+/// correction was sent; `quiet` draws the button without its outline, for a row of them.
+///
+///     CorrectThis(task);                                         // the result
+///     CorrectThis(task, step: line.Seq, label: "Correct step " + line.Seq);
+///
+/// In a test: `Ui.Click("Correct this")`, fill "What was wrong?", "What should it have been?" and "Why?", then
+/// `Ui.Click("Send correction")`.
+[Composable]
+public component CorrectThis(Guid task, int step = 0, Guid? proposal = null, string label = "Correct this", string agent = "the agent", Action? changed = null, bool quiet = false) {
+  bool open = false;
+  string said = "";
+  string problem = "";
+  string wrong = "";
+  string right = "";
+  string because = "";
+  CorrectionSeverity severity = CorrectionSeverity.Mistake;
+  bool propose = true;
+  string guidance = "";
+  bool onlyForMe = false;
+
+  action Open() { open = true; said = ""; problem = ""; }
+  action Close() { open = false; problem = ""; }
+  action Send() {
+    problem = "";
+    try {
+      var sent = SendCorrection(task, new CorrectionForm {
+        Wrong = wrong, Right = right, Because = because, Severity = severity, Step = step, Proposal = proposal,
+        Propose = propose, Guidance = guidance, OnlyForMe = onlyForMe,
+      });
+      said = sent.Said;
+      open = false;
+      wrong = "";
+      right = "";
+      because = "";
+      guidance = "";
+      if (changed != null) { changed(); }
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    Stack(gap: 3, w: "100%") {
+      if (!open) {
+        Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+          Button(label, onPress: Open, size: Size.Sm, tone: quiet ? Tone.Ghost : Tone.Default);
+          if (said != "") { Text(said, fontSize: FontSize.Label, color: Colors.Success.Text, maxW: "62ch", lineHeight: "1.5", label: "Correction sent"); }
+        }
+      }
+      if (open) {
+        Stack(gap: 4, px: 5, py: 5, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Correction") {
+          Stack(gap: 1) {
+            Text(step > 0 ? "Correct step " + step.ToString() : "Correct this", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold, letterSpacing: "-0.01em");
+            Text("Say it as you would to a colleague. It is kept with this piece of work.", fontSize: FontSize.Label, color: Colors.TextSecondary, maxW: "62ch", lineHeight: "1.5");
+          }
+          TextAreaField("What was wrong?", value: wrong, rows: 2);
+          TextAreaField("What should it have been?", value: right, rows: 2);
+          TextAreaField("Why?", value: because, rows: 2, hint: "The reason is what lets it get the next one right, not only this one.");
+          RadioGroup("How much did it matter?", value: severity);
+          Stack(gap: 3, pt: 3, borderTW: 1, border: Colors.Border) {
+            Checkbox("Propose an instruction from this", value: propose);
+            if (propose) {
+              TextAreaField("From now on", value: guidance, rows: 2, placeholder: "Left empty, what it should have been is used.",
+                            hint: "What " + agent + " is told. Nothing it does changes until somebody who teaches the agents has read this and made it active.");
+              Checkbox("Only for the work it does for me", value: onlyForMe);
+            }
+          }
+          if (problem != "") { Alert(problem, tone: Tone.Danger); }
+          Row(gap: 2, justify: Justify.End) {
+            Button("Cancel", onPress: Close, tone: Tone.Ghost);
+            Button("Send correction", onPress: Send, tone: Tone.Primary, disabled: wrong.Trim() == "" || right.Trim() == "" || because.Trim() == "");
+          }
+        }
+      }
+    }
+  }
+}
+
+/// One correction, as it reads on the work it corrects.
+[Composable]
+public component CorrectionLine(CorrectionCard c) {
+  render {
+    Stack(gap: 2, px: 4, py: 3, opacity: c.Withdrawn ? "0.6" : "1") {
+      Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+        Text(c.About, fontSize: FontSize.Label, fontWeight: FontWeight.Medium);
+        if (c.Serious) { Badge(c.Severity, tone: Tone.Danger); }
+        if (!c.Serious) { Badge(c.Severity, tone: Tone.Ghost); }
+        if (c.Withdrawn) { Badge("Taken back", tone: Tone.Ghost); }
+        Spacer();
+        Text(c.By + ", " + c.When, fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+      if (c.Erased) { Text("What it said has been erased.", fontSize: FontSize.Body, color: Colors.TextMuted); }
+      if (!c.Erased) {
+        Stack(gap: 1) {
+          Text(c.Wrong, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "68ch");
+          Text("It should have been: " + c.Right, fontSize: FontSize.Body, fontWeight: FontWeight.Medium, lineHeight: "1.5", maxW: "68ch");
+          Text("Because " + LowerFirst(c.Because), fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "68ch");
+        }
+      }
+    }
+  }
+}
+
+string LowerFirst(string text) {
+  if (text.Length < 2) { return text; }
+  // A sentence that opens with a name or an initial keeps its capital.
+  if (char.IsUpper(text[1])) { return text; }
+  return char.ToLower(text[0]).ToString() + text.Substring(1);
+}
+
+/// ⭐ TEACHING, ON ONE PIECE OF WORK — what a run's page shows so that a person can correct it: what it was told when
+/// it ran (and what the agent has been told since), what it handed back, each step of its record, each with
+/// "Correct this"; and the corrections made so far.
+///
+///     [Route("/work/{task}")] component WorkPage(Guid task) { render { WorkTeaching(task); } }
+///
+/// `beside`: the page already shows the work — its result, what it was told, its steps — so only what teaching
+/// adds is drawn: "Correct this", the corrections made so far, and each step's own "Correct step". What a page that
+/// inspects a piece of work puts under it (`Osysharp.Agents.Inspector`'s `AgentWorkPanel`).
+[Composable]
+public component WorkTeaching(Guid task, bool beside = false) {
+  WorkTeachingView? view = null;
+  bool loaded = false;
+  string problem = "";
+  bool steps = false;
+
+  action Load() {
+    try { view = WorkTeachingOf(task); } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+  action ShowSteps() { steps = !steps; }
+
+  render {
+    Stack(gap: 6, w: "100%", maxW: "760px", label: "Teaching") {
+      if (!loaded) {
+        Stack(gap: 4, label: "Loading the work") {
+          Skeleton(SkeletonShape.HalfLine);
+          Skeleton(SkeletonShape.Block);
+          Stack(gap: 2) { Skeleton(); Skeleton(); Skeleton(SkeletonShape.HalfLine); }
+        }
+      }
+      if (loaded && problem != "") { Alert("This piece of work could not be shown: " + problem, tone: Tone.Danger); }
+      if (loaded && problem == "" && view == null && !beside) {
+        EmptyState("This piece of work is not yours to see", body: "It was done for somebody else, or its record has been deleted.");
+      }
+      if (view != null) {
+        // What it handed back: the one thing on the page that is big.
+        Stack(gap: 3, label: "Result") {
+          if (beside) { Text("Teaching", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold); }
+          if (!beside) {
+            Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+              Text(view.Name + (view.Skill == "" ? "" : ", " + view.Skill), fontSize: FontSize.Label, color: Colors.TextMuted);
+              Badge(view.Status, tone: view.Status == "Done" ? Tone.Success : Tone.Ghost);
+            }
+            if (view.About != "") { Text(view.About, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", lineHeight: "1.25"); }
+            if (view.Result != "") {
+              Stack(gap: 0, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "What it handed back") {
+                Text(view.Result, fontSize: FontSize.Subhead, lineHeight: "1.55", maxW: "62ch", whiteSpace: WhiteSpace.PreLine);
+              }
+            }
+            if (view.Result == "" && view.Ended) { Text("It handed nothing back.", fontSize: FontSize.Body, color: Colors.TextMuted); }
+          }
+          if (!view.Ended) { Text("It has not finished. A piece of work is corrected once it has ended.", fontSize: FontSize.Body, color: Colors.TextMuted); }
+          if (view.Ended && !view.MayCorrect && beside) { Text("Whoever the work was for, and whoever teaches the agents, corrects it here.", fontSize: FontSize.Body, color: Colors.TextMuted); }
+          if (view.MayCorrect && view.Ended) { CorrectThis(view.Task, agent: view.Name, changed: Load); }
+        }
+
+        if (!beside) {
+        Stack(gap: 2, label: "What it was told") {
+          Text(view.RanWith, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "68ch");
+          if (view.Sent.Count > 0) {
+            Stack(gap: 1, pl: 4, borderLW: 2, border: Colors.Border) {
+              foreach (var i in view.Sent) { Text(i.Guidance, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch"); }
+            }
+          }
+          if (view.NotYet.Count > 0) {
+            Stack(gap: 1, pl: 4, borderLW: 2, border: Colors.Primary.Muted, label: "Told since") {
+              Text("Told since, and not part of this work:", fontSize: FontSize.Label, color: Colors.TextMuted);
+              foreach (var i in view.NotYet) { Text(i.Guidance, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch"); }
+            }
+          }
+        }
+        }
+
+        if (view.Corrections.Count > 0) {
+          Stack(gap: 2, label: "Corrections") {
+            Text(view.Corrections.Count == 1 ? "One correction" : view.Corrections.Count.ToString() + " corrections", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg) {
+              foreach (var c in view.Corrections) { CorrectionLine(c); }
+            }
+          }
+        }
+
+        if (view.Steps.Count > 0 && (!beside || (view.MayCorrect && view.Ended))) {
+          Stack(gap: 2, label: beside ? "Correct a step" : "Steps") {
+            Row(gap: 3, align: Align.Center) {
+              if (!beside) { Text(view.Steps.Count.ToString() + " steps", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold); }
+              Button(steps ? "Hide the steps" : beside ? "Correct a step" : "Show the steps", onPress: ShowSteps, tone: Tone.Ghost, size: Size.Sm);
+            }
+            if (steps) {
+              Stack(gap: 3) {
+                foreach (var s in view.Steps) {
+                  Stack(gap: 2, label: "Step " + s.Seq.ToString()) {
+                    Row(gap: 3, align: Align.Baseline) {
+                      Text(s.Seq.ToString(), fontSize: FontSize.Label, color: Colors.TextMuted, minW: "1.5rem", fontFamily: Font.Mono);
+                      Stack(gap: 1, grow: 1, minW: "0") {
+                        Text(s.Said, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch");
+                        Text(s.Kind, fontSize: FontSize.Caption, color: Colors.TextMuted);
+                      }
+                    }
+                    if (view.MayCorrect && view.Ended) {
+                      Row(pl: 8) { CorrectThis(view.Task, step: s.Seq, label: "Correct step " + s.Seq.ToString(), agent: view.Name, changed: Load, quiet: true); }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
