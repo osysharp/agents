@@ -1,0 +1,82 @@
+// How the screens say things: a person, a day, a length of time, a sum of money, where a piece of work stands — and
+// where each screen lives.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Llm;
+
+string Named(Principal? p) { return p == null ? "" : (p!.DisplayName != "" ? p!.DisplayName : p!.Email); }
+
+string Dated(DateTime at) { return at.ToString("d MMM yyyy"); }
+
+string DatedWithTime(DateTime at) { return at.ToString("d MMM yyyy, HH:mm"); }
+
+string Plural(int n, string one, string many) { return n == 1 ? "1 " + one : n.ToString() + " " + many; }
+
+/// A sum in millionths of a dollar, as money. Under a dollar it is said to a hundredth of a cent — "$0.0052",
+/// "$0.0120" — because that is the size of what one piece of work costs; from a dollar up, to the cent: "$1.25".
+public string Money(long micros) {
+  var dollars = micros / 1000000m;
+  return "$" + (micros < 1000000 ? dollars.ToString("0.0000") : dollars.ToString("0.00"));
+}
+
+/// How long ago `since` was, in the largest unit that says it: "3 days", "5 hours", "20 minutes", "under a minute".
+public string HowLong(DateTime since, DateTime now) {
+  var span = now - since;
+  var minutes = (int)Math.Floor(span.TotalMinutes);
+  if (minutes < 1) { return "under a minute"; }
+  if (minutes < 60) { return Plural(minutes, "minute", "minutes"); }
+  var hours = (int)Math.Floor(span.TotalHours);
+  if (hours < 48) { return Plural(hours, "hour", "hours"); }
+  return Plural((int)Math.Floor(span.TotalDays), "day", "days");
+}
+
+/// A class's name as words — "AccessionReel" → "Accession reel".
+public string InWords(string fullName) {
+  var name = BareName(fullName);
+  var words = "";
+  foreach (var c in name) {
+    if (char.IsUpper(c) && words != "") { words = words + " " + char.ToLower(c); }
+    else { words = words + c; }
+  }
+  return words;
+}
+
+/// Where a piece of work stands, as a person reads it.
+public string StandsAs(AgentTaskStatus status) {
+  return status == AgentTaskStatus.Working ? "Working"
+       : status == AgentTaskStatus.Waiting ? "Waiting"
+       : status == AgentTaskStatus.Done ? "Done"
+       : status == AgentTaskStatus.Failed ? "Could not finish"
+       : status == AgentTaskStatus.Stopped ? "Stopped"
+       : "Called off";
+}
+
+/// What a piece of work was charged to, as a person reads it: "case 8f1c…" for `case:8f1c…`, a line each.
+string ChargedWords(string chargedTo) {
+  if (chargedTo.Trim() == "") { return ""; }
+  List<string> parts = [];
+  foreach (var line in chargedTo.Split("\n")) {
+    if (line.Trim() == "") { continue; }
+    var colon = line.IndexOf(":");
+    if (colon < 0) { parts.Add(line); continue; }
+    var subject = line.Substring(colon + 1);
+    parts.Add(line.Substring(0, colon) + " " + (subject.Length > 8 ? subject.Substring(0, 8) : subject));
+  }
+  return string.Join(", ", parts);
+}
+
+// ── where each screen lives ─────────────────────────────────────────────────────────────────────────────────────────
+// `at` is where the app mounted the screens — "/agents". Each screen is `at` and a word; an agent or a piece of work
+// is that and its name or id.
+
+public string RosterHref(string at) { return at; }
+public string AgentHref(string at, string agent) { return at + "/agent/" + agent; }
+public string WorkListHref(string at) { return at + "/work"; }
+public string WorkHref(string at, Guid task) { return at + "/work/" + task.ToString(); }
+public string WaitingHref(string at) { return at + "/waiting"; }
+public string RulesHref(string at) { return at + "/autonomy"; }
+public string SpendingHref(string at) { return at + "/spending"; }
+public string RolesHref(string at) { return at + "/roles"; }
+public string InstructionsHref(string at, string agent) { return at + "/instructions/" + agent; }

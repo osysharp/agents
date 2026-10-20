@@ -1,0 +1,121 @@
+// What the Autonomy screen reads and sends: every standing rule — "from now on, alone" — with who gave it and how
+// often it has been used; what a rule could still change; and taking one back, or giving one.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+
+/// One standing rule, as a person reads it.
+public class RuleLine {
+  public Guid Id;
+  public string Agent = "";
+  public string AgentName = "";
+  /// The tool it lets the agent run alone, as a person reads it — "Quarantine the reel".
+  public string Tool = "";
+  /// The skill it holds for, in words. "": every skill of the agent.
+  public string Skill = "";
+  /// Whose work it covers. "": the work the agent does for anybody.
+  public string For = "";
+  public string GivenBy = "";
+  public string When = "";
+  /// It was said on a proposal: "approve, and from now on alone".
+  public bool FromProposal = false;
+  /// How many times a tool has run alone because of it, and when it last did.
+  public int Used = 0;
+  public string LastUsed = "";
+  public bool TakenBack = false;
+  public string TakenBackBy = "";
+  public string TakenBackWhen = "";
+  public string TakenBackWhy = "";
+  /// Whoever is looking may take it back: they gave it, or they supervise the agents.
+  public bool MayTakeBack = false;
+}
+
+/// One tool an agent proposes first — what a standing rule could let it run alone.
+public class WidenLine {
+  public string Agent = "";
+  public string AgentName = "";
+  public string Action = "";
+  public string Tool = "";
+  public string Does = "";
+  public string Skill = "";
+  public string SkillWords = "";
+  /// A rule already covers it for whoever is looking, or for everybody.
+  public bool CoveredForMe = false;
+  public bool CoveredForAll = false;
+}
+
+/// Everything the Autonomy screen shows.
+public class RulesBoard {
+  public List<RuleLine> Standing = [];
+  public List<RuleLine> TakenBack = [];
+  public List<WidenLine> CouldWiden = [];
+  /// How many tools the agents' declarations say are proposed every time, or never run — which no rule changes.
+  public int Fixed = 0;
+  /// Whoever is looking may say "from now on, alone" for their own work; and for the work an agent does for anybody.
+  public bool MayWiden = false;
+  public bool MayWidenForAll = false;
+}
+
+string ToolLabel(string action) {
+  var tool = Actions.Find(action);
+  return tool == null ? InWords(action) : tool!.Label;
+}
+
+RuleLine RuleLineOf(AgentStandingRule r, Principal? me, bool supervises) {
+  return new RuleLine {
+    Id = r.Id, Agent = r.Agent, AgentName = AgentName(r.Agent), Tool = ToolLabel(r.Action), Skill = r.Skill == "" ? "" : InWords(r.Skill),
+    For = r.For == null ? "" : Named(r.For), GivenBy = Named(r.GrantedBy), When = Dated(r.At), FromProposal = r.FromProposal != null,
+    Used = r.Used, LastUsed = r.LastUsedAt == null ? "" : Dated(r.LastUsedAt!.Value),
+    TakenBack = r.RevokedAt != null, TakenBackBy = Named(r.RevokedBy), TakenBackWhen = r.RevokedAt == null ? "" : Dated(r.RevokedAt!.Value),
+    TakenBackWhy = r.RevokedWhy,
+    MayTakeBack = r.RevokedAt == null && me != null && ((r.GrantedBy != null && r.GrantedBy!.Id == me!.Id) || supervises),
+  };
+}
+
+/// ⭐ EVERY STANDING RULE, as whoever is looking may read it — and what a rule could still change.
+[Server, Authorize(IsAuthenticated)]
+public RulesBoard RulesBoardOf() {
+  var me = Session.CurrentUser;
+  var supervises = Security.Authorize(me, SupervisesAgents);
+  var board = new RulesBoard { MayWiden = Security.Authorize(me, WidensAgentAutonomy) };
+  board.MayWidenForAll = board.MayWiden && supervises;
+  var rules = AgentStandingRule.OrderByDescending(r => r.At).Take(300).Include(r => r.For).Include(r => r.GrantedBy).Include(r => r.RevokedBy).ToList();
+  foreach (var r in rules) {
+    if (r.RevokedAt == null) { board.Standing.Add(RuleLineOf(r, me, supervises)); } else { board.TakenBack.Add(RuleLineOf(r, me, supervises)); }
+  }
+  foreach (var s in Skills.Catalog()) {
+    foreach (var t in s.Tools) {
+      if (t.Leave == Leave.ProposeEveryTime || t.Leave == Leave.Never) { board.Fixed = board.Fixed + 1; }
+      if (t.Leave != Leave.Propose) { continue; }
+      var line = new WidenLine {
+        Agent = s.Agent, AgentName = AgentName(s.Agent), Action = t.Action, Tool = t.Label, Does = DoesWords(t), Skill = s.Skill, SkillWords = s.Label,
+      };
+      foreach (var r in rules) {
+        if (r.RevokedAt != null || r.Agent != s.Agent || r.Action != t.Action || (r.Skill != "" && r.Skill != s.Skill)) { continue; }
+        if (r.For == null) { line.CoveredForAll = true; }
+        else if (me != null && r.For!.Id == me!.Id) { line.CoveredForMe = true; }
+      }
+      board.CouldWiden.Add(line);
+    }
+  }
+  return board;
+}
+
+/// Take a standing rule back from the screen, with the reason. `RevokeStandingRule` says who may.
+[Server, Authorize(IsAuthenticated)]
+public void TakeBackRule(Guid rule, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is taken back: it is kept with the rule."); }
+  var row = AgentStandingRule.FirstOrDefault(r => r.Id == rule);
+  if (row == null) { throw new AgentRefused("That rule is not yours to see."); }
+  RevokeStandingRule(row!, why.Trim());
+}
+
+/// Say "from now on, alone" from the screen: for the work the agent does for whoever says it, or — `forEverybody` —
+/// for anybody. `AllowAlone` says who may, and refuses what an agent's declaration fixes.
+[Server, Authorize(IsAuthenticated)]
+public void AllowAloneFromManagement(string agent, string action, string skill, bool forEverybody) {
+  var tool = Actions.Find(action);
+  if (tool == null) { throw new AgentRefused($"There is no action {InWords(action)} any more."); }
+  AllowAlone(agent, tool!, skill, forEverybody);
+}

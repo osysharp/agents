@@ -1,0 +1,138 @@
+// The whole of it under one path: the strip that moves between the screens, and whichever screen the path names.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Agents.Teaching;
+using Osysharp.Ui;
+
+/// ⭐ EVERY MANAGEMENT SCREEN, UNDER ONE PATH. Mount it on three routes and the app has all of it:
+///
+///     [Route("/agents")]                [Authorize(UsesAgents)] component Agents() { render { AgentsManagement(); } }
+///     [Route("/agents/{section}")]      [Authorize(UsesAgents)] component AgentsSection(string section) { render { AgentsManagement(section); } }
+///     [Route("/agents/{section}/{id}")] [Authorize(UsesAgents)] component AgentsItem(string section, string id) { render { AgentsManagement(section, id); } }
+///
+/// `at` is where it is mounted, when that is not "/agents". `request` says where a request's own page is — the
+/// inbox item — so everything that waits on a person is a press away from the person's answer.
+///
+/// In a test: `Ui.Visit("/agents")`, `Ui.Click("Work", within: "Agent management")`, `Ui.Visit("/agents/agent/" + name)`.
+/// A link to an agent's page, by what people call it.
+component AgentLink(string agent, string at) {
+  string name = "";
+  on mount { name = AgentName(agent); }
+  render { if (name != "") { TextLink(name, to: AgentHref(at, agent)); } }
+}
+
+[Composable]
+public component AgentsManagement(string section = "", string id = "", string at = "/agents", Func<Guid, string>? request = null) {
+  render {
+    Stack(gap: 6, px: 5, py: 6, w: "100%", maxW: "1040px", label: "Agent management") {
+      ManagementStrip(section, at);
+      if (section == "") { AgentRoster(at); }
+      if (section == "agent") { AgentProfilePage(id, at, request); }
+      if (section == "instructions") {
+        Stack(gap: 5, label: "What it is told") {
+          Row { AgentLink(id, at); }
+          AgentInstructions(id);
+        }
+      }
+      if (section == "work" && id == "") { AgentWorkList(at); }
+      if (section == "workof") { AgentWorkList(at, agent: id); }
+      if (section == "work" && id != "") { AgentWorkDetail(Guid.Parse(id), at, request); }
+      if (section == "waiting") { PeopleAgentsWaitOn(at, request); }
+      if (section == "autonomy") { AgentStandingRules(at); }
+      if (section == "spending") { AgentSpending(at); }
+      if (section == "roles") { AgentRoles(at); }
+      if (section != "" && section != "agent" && section != "instructions" && section != "work" && section != "workof"
+          && section != "waiting" && section != "autonomy" && section != "spending" && section != "roles") {
+        EmptyState("There is no such page", body: "Choose one of the screens above.");
+      }
+    }
+  }
+}
+
+/// The strip that moves between the screens. Links, so each screen has an address of its own.
+[Composable]
+public component ManagementStrip(string section, string at = "/agents") {
+  render {
+    Row(gap: 1, w: "100%", overflowX: Overflow.Auto, borderBW: 1, border: Colors.Border, label: "Screens") {
+      StripLink("Agents", RosterHref(at), section == "" || section == "agent" || section == "instructions");
+      StripLink("Work", WorkListHref(at), section == "work" || section == "workof");
+      StripLink("Waiting on people", WaitingHref(at), section == "waiting");
+      StripLink("Autonomy", RulesHref(at), section == "autonomy");
+      StripLink("Spending", SpendingHref(at), section == "spending");
+      StripLink("Roles", RolesHref(at), section == "roles");
+    }
+  }
+}
+
+[Composable]
+component StripLink(string label, string to, bool here) {
+  render {
+    Link(href: to, label: label) {
+      Box(px: 3, py: 2, borderBW: 2, border: here ? Colors.Primary : Colors.Transparent, whiteSpace: WhiteSpace.Nowrap) {
+        Text(label, fontSize: FontSize.Body, fontWeight: here ? FontWeight.Semibold : FontWeight.Regular, color: here ? Colors.OnSurface : Colors.TextSecondary);
+      }
+    }
+  }
+}
+
+/// The tone a state of work is shown in.
+Tone ToneOf(AgentTaskStatus status) {
+  return status == AgentTaskStatus.Done ? Tone.Success
+       : status == AgentTaskStatus.Waiting ? Tone.Warning
+       : status == AgentTaskStatus.Working ? Tone.Primary
+       : status == AgentTaskStatus.Cancelled ? Tone.Ghost
+       : Tone.Danger;
+}
+
+/// A fact with its name over it — "Started" over "5 May 2031, 08:00".
+[Composable]
+component FactOf(string name, string value) {
+  render {
+    Stack(gap: 1, minW: "9rem", label: name) {
+      Text(name, fontSize: FontSize.Caption, color: Colors.TextMuted);
+      Text(value, fontSize: FontSize.Body, fontWeight: FontWeight.Medium);
+    }
+  }
+}
+
+/// A screen while it loads: its heading's line, then lines in the shape of a list.
+[Composable]
+component ListSkeleton(string label) {
+  render {
+    Stack(gap: 5, label: label) {
+      Skeleton(SkeletonShape.HalfLine);
+      Stack(gap: 3) { Skeleton(SkeletonShape.Block); Skeleton(SkeletonShape.Block); Skeleton(SkeletonShape.Block); }
+    }
+  }
+}
+
+/// A line of work, as every list of work shows it: what it is about, who is doing what for whom, when, what it
+/// cost, and where it stands.
+[Composable]
+public component WorkRow(WorkLine line, string at = "/agents", bool first = false, bool showAgent = true) {
+  // A piece another piece handed on carries the same "about" as the work at the top: it is told apart by its job.
+  live var what = line.Parent != null && line.Skill != "" ? line.Skill + (line.About == "" ? "" : " (" + line.About + ")")
+                : line.About != "" ? line.About : (line.Skill != "" ? line.Skill : "A question");
+  live var who = (showAgent ? line.AgentName + (line.Skill == "" ? "" : ", " + line.Skill.ToLower()) + ", for " : "For ") + line.For;
+  render {
+    Row(gap: 3, px: 4, py: 3, align: Align.Start, borderTW: first ? 0 : 1, border: Colors.Border, label: "Work: " + what + (line.Attempt > 1 ? " (attempt " + line.Attempt.ToString() + ")" : "")) {
+      Stack(gap: 1, grow: 1, minW: "0") {
+        Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+          TextLink(what, to: WorkHref(at, line.Task));
+          if (line.Attempt > 1) { Text("attempt " + line.Attempt.ToString(), fontSize: FontSize.Caption, color: Colors.TextMuted); }
+          if (line.Parent != null) { Text("handed on", fontSize: FontSize.Caption, color: Colors.TextMuted); }
+        }
+        Text(who, fontSize: FontSize.Label, color: Colors.TextSecondary);
+        if (line.Waits != "") { Text("Waits for " + line.Waits, fontSize: FontSize.Label, color: Colors.Warning.Strong, lineHeight: "1.45"); }
+        if (line.Ended != "") { Text(line.Ended, fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.45", maxW: "62ch"); }
+        Text("Started " + line.Started + ", " + line.Took + (line.Process == "" ? "" : ". A step of " + line.Process) + (line.ChargedTo == "" ? "" : ". Charged to " + line.ChargedTo), fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+      Stack(gap: 1, align: Align.End, shrink: 0) {
+        Badge(line.Stands, tone: ToneOf(line.Status));
+        Text(line.Cost + " of " + line.Limit, fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+    }
+  }
+}

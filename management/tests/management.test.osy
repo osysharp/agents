@@ -1,0 +1,398 @@
+// Osysharp.Agents.Management — on screen, driven as a person. The head of collections runs the archive's five agents
+// from the management screens for a morning: reads the roster, opens an agent, pauses one and lets another work
+// again, finds the work that waits, calls a piece off, hands another to a person, gives a standing rule and takes
+// it back, reads what was spent and who may do what. Then the same screens as an archivist, the bookkeeper and the
+// curator see them. `osy test --pixels` photographs each stage — wide and on a phone, light and dark (`Ui.Shot`).
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Management;
+using Osysharp.Workflow;
+using Archive;
+
+/// ⭐ THE WALK-THROUGH. One supervisor, one morning, every screen.
+[Test(Vaults)]
+void the_head_of_collections_runs_the_agents_for_a_morning() {
+  var morning = AMorningAtTheArchive();
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Maeve);
+
+  // 1. The roster: five agents, what is under way, what was spent — and each agent's own line.
+  Ui.Visit("/agents");
+  Assert.Visible("5 agents", within: "In all");
+  Assert.Visible("2 pieces of work are under way, and all of them wait. $0.0134 spent on work started today, $0.0134 this month.", within: "In all");
+  Assert.Visible("Waiting", within: "Agent Registrar");
+  Assert.Visible("Maeve Okonkwo answers for it.", within: "Agent Registrar");
+  Assert.Visible("1 waiting", within: "Agent Condition checker");
+  Assert.Visible("Idle", within: "Agent Rights clerk");
+  Assert.Visible("$0.0084 of $0.0120 today", within: "Agent Describer");
+  Assert.Visible("Not corrected in 2 pieces of work, 30 days", within: "Agent Describer");
+  Assert.Visible("Paused", within: "Agent Transcriber");
+  Assert.Visible("Paused: Its title cards are being checked against the reels.", within: "Agent Transcriber");
+  Assert.Visible("Corrected once in 1 piece of work, 30 days", within: "Agent Transcriber");
+  Assert.NoOverflow();
+  Ui.Shot("roster-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("roster-wide-dark");
+  Ui.Theme("light");
+
+  // 2. One agent: who it acts as, who answers for it, what it may do, what it hands on, what it may spend.
+  Ui.Click("Registrar", within: "Agent Registrar");
+  Assert.Visible("You take reels of film into the archive's collection.", within: "Where it stands");
+  Assert.Visible("Maeve Okonkwo", within: "Sponsor");
+  Assert.Visible("registrar@lanternstreet.example", within: "Acts as");
+  Assert.Visible("Condition checker", within: "Hands work to");
+  Assert.Visible("with at most $0.0060", within: "Hands on Clear rights");
+  Assert.Visible("Registrar works from what its developers wrote, and nothing more.", within: "What it is told");
+  Assert.Visible("$0.0500", within: "One piece of work, at most");
+  Assert.Visible("No limit of its own", within: "A day");
+  Assert.Visible("Accession of reel 0412", within: "Its work");
+  Assert.Visible("Condition checker proposes: Quarantine the reel", within: "Its work");
+  Assert.Clickable("Pause");
+  Assert.Clickable("Call off its work");
+  Assert.NoOverflow();
+  Ui.Shot("agent-registrar-wide-light");
+
+  // The condition checker: what it does alone, and what it proposes first.
+  Ui.Visit("/agents/agent/" + TheChecker);
+  Assert.Visible("Read the bench notes", within: "Alone");
+  Assert.Visible("only reads", within: "Alone");
+  Assert.Visible("Quarantine the reel", within: "Proposes first");
+  Assert.Visible("changes data", within: "Proposes first");
+
+  // The describer: its limit for a day, with what the meter has counted against it.
+  Ui.Visit("/agents/agent/" + TheDescriber);
+  Assert.Visible("$0.0084 of $0.0120", within: "A day");
+  Assert.Visible("Version 3", within: "Skill Describe reel");
+  Assert.Visible("2 pieces in the last 30 days, none of it corrected.", within: "How it has done");
+  Assert.Visible("Its money ran out: there was no room left in what the agent may spend in a day.", within: "Its work");
+  Assert.NoOverflow();
+  Ui.Shot("agent-describer-wide-light");
+
+  // 3. Pause it, with the reason. Nothing to press until there is one.
+  Ui.Click("Pause");
+  Assert.Disabled("Pause it");
+  Ui.Fill("Why is it paused?", "Its day's money is spent on two reels. I am raising it with the bookkeeper.");
+  Ui.Shot("agent-pausing-wide-light");
+  Ui.Click("Pause it");
+  Assert.Visible("Its day's money is spent on two reels. I am raising it with the bookkeeper. It takes no new work; work under way finishes.", within: "Where it stands");
+  Assert.Visible("Maeve Okonkwo paused it.", within: "History");
+  Assert.Clickable("Resume");
+  Ui.Shot("agent-paused-wide-light");
+  runas (Priya) {
+    var refused = Assert.Throws<AgentPaused>(() => Describe(ReelNumbered("0377")));
+    Assert.Equal("Describer is paused: Its day's money is spent on two reels. I am raising it with the bookkeeper.", refused.Message);
+  }
+
+  // …and let the transcriber work again.
+  Ui.Visit("/agents/agent/" + TheTranscriber);
+  Assert.Visible("Its title cards are being checked against the reels. It takes no new work; work under way finishes.", within: "Where it stands");
+  Assert.Visible("1 piece in the last 30 days, corrected once.", within: "How it has done");
+  Ui.Click("Resume");
+  Ui.Fill("What changed?", "Checked against the reels: they are right.");
+  Ui.Click("Let it work");
+  Assert.Visible("Transcriber takes work again.");
+  Assert.Visible("Maeve Okonkwo let it work again.", within: "History");
+  Assert.Visible("Checked against the reels: they are right.", within: "History");
+  Assert.Hidden("Resume");
+  runas (Maeve) {
+    Assert.False(AgentSeat.Single(s => s.Agent == TheTranscriber).Paused);
+    Assert.True(AgentSeat.Single(s => s.Agent == TheDescriber).Paused);
+    Assert.Equal(2, SeatChangesOf(TheTranscriber).Count);
+  }
+
+  // 4. The work: all of it, then only what waits.
+  Ui.Click("Work", within: "Screens");
+  Assert.Visible("4 pieces of work", within: "How many");
+  Assert.Visible("Describer, describe reel, for Priya Nair", within: "Work: Description of reel 0401");
+  Assert.Visible("Stopped", within: "Work: Description of reel 0401");
+  Assert.Visible("$0.0040 of $0.0200", within: "Work: Description of reel 0401");
+  Assert.Visible("Done", within: "Work: Title cards of reel 0377");
+  Assert.NoOverflow();
+  Ui.Shot("work-wide-light");
+  Ui.Click("Waiting", within: "Where it stands");
+  Assert.Visible("1 piece of work", within: "How many");
+  Assert.Visible("Waits for Condition checker, which waits for a decision from Jonas Reiter", within: "Work: Accession of reel 0412");
+  Assert.Hidden("Description of reel 0401");
+  Ui.Click("Describer", within: "Which agent");
+  Assert.Visible("Nothing matches", within: "The work");
+  Ui.Shot("work-nothing-matches-wide-light");
+  Ui.Click("Show everything");
+  Ui.Check("Pieces that other work handed on, too");
+  Assert.Visible("6 pieces of work", within: "How many");
+  Assert.Visible("handed on", within: "Work: Check condition (Accession of reel 0412)");
+  Assert.Visible("Condition checker, check condition, for Jonas Reiter", within: "Work: Check condition (Accession of reel 0412)");
+  Ui.Fill("For whom", "Jonas");
+  Ui.Click("Find");
+  Assert.Visible("3 pieces of work", within: "How many");
+
+  // 5. One piece of work: the inspector's whole reading of it — and, under it, what she may do to it.
+  Ui.Visit("/agents/work/" + morning.Accession);
+  Assert.Visible("Accession of reel 0412", within: "The work");
+  Assert.Visible("Condition checker, check condition", within: "Handed on");
+  Assert.Visible("Condition checker proposes: Quarantine the reel", within: "Piece of work");
+  Assert.Visible("Call it off", within: "In charge of this work");
+  Assert.Visible("Hand it to a person", within: "In charge of this work");
+  // …at the head of the page: before who asked, what it handed on and every step of its record.
+  Assert.Above("In charge of this work", "What was asked");
+  Assert.Hidden("Try it again");
+  Assert.NoOverflow();
+  Ui.Shot("work-detail-wide-light");
+
+  // 6. Everybody the agents wait on.
+  Ui.Click("Waiting on people", within: "Screens");
+  Assert.Visible("The agents wait on one person", within: "In all");
+  Assert.Visible("One request is open. The oldest has waited 30 minutes.", within: "In all");
+  Assert.Visible("1 request", within: "Waited on Jonas Reiter");
+  Assert.Visible("Asked of Jonas Reiter, 30 minutes ago.", within: "Request: Condition checker proposes: Quarantine the reel");
+  Assert.Visible("By Condition checker, working for Registrar, about", within: "Request: Condition checker proposes: Quarantine the reel");
+  Assert.NoOverflow();
+  Ui.Shot("waiting-wide-light");
+
+  // 7. Autonomy: nothing stands. She lets the condition checker quarantine alone, for anybody's work.
+  Ui.Click("Autonomy", within: "Screens");
+  Assert.Visible("No standing rules", within: "In all");
+  Assert.Visible("It changes data. Proposed first, on check condition.", within: "Could change: Condition checker Quarantine the reel");
+  Ui.Shot("autonomy-none-wide-light");
+  Ui.Click("Alone, for everybody");
+  Assert.Visible("Condition checker may quarantine the reel alone from now on, for anybody's work.");
+  Assert.Visible("One standing rule", within: "In all");
+  Assert.Visible("For the work it does for anybody, on check condition.", within: "Rule: Condition checker Quarantine the reel");
+  Assert.Visible("It has not been used yet.", within: "How often");
+  Assert.Visible("A rule already lets it, for anybody's work.", within: "Could change: Condition checker Quarantine the reel");
+  Assert.NoOverflow();
+  Ui.Shot("autonomy-rule-wide-light");
+  // …thinks better of it, and takes it back, with the reason.
+  Ui.Click("Take back");
+  Assert.Disabled("Take it back");
+  Ui.Fill("Why is it taken back?", "A quarantine moves a reel out of the vault. A person should see each one.");
+  Ui.Click("Take it back");
+  Assert.Visible("Taken back. Condition checker proposes it again from its next step.");
+  Assert.Visible("No standing rules", within: "In all");
+  Ui.Click("Show 1");
+  Assert.Visible("Taken back by Maeve Okonkwo on 5 May 2031: A quarantine moves a reel out of the vault. A person should see each one.", within: "Taken back");
+  runas (Maeve) { Assert.NotNull(AgentStandingRule.Single().RevokedAt); }
+
+  // 8. Spending: the whole, by agent, the limits — and what a limit stopped.
+  Ui.Click("Spending", within: "Screens");
+  Assert.TextIs("$0.0134", within: "spent on work started this month");
+  Assert.Visible("6 pieces of work, 10 model calls.", within: "How much work");
+  Assert.Visible("$0.0084", within: "By agent: Describer");
+  Assert.Visible("2 pieces", within: "By agent: Describer");
+  Assert.Visible("$0.0040", within: "By skill: Clear rights");
+  Assert.Visible("$0.0088", within: "By who it was for: Priya Nair");
+  Assert.Visible("$0.0046", within: "By who it was for: Jonas Reiter");
+  Assert.Visible("$0.0084 of $0.0120", within: "Limit: Describer, a day");
+  Assert.Visible("Its money ran out: there was no room left in what the agent may spend in a day.", within: "Stopped at a limit");
+  Assert.Visible("Its money ran out: it could spend $0.0060.", within: "Stopped at a limit");
+  Assert.NoOverflow();
+  Ui.Shot("spending-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("spending-wide-dark");
+  Ui.Theme("light");
+
+  // 9. Who may do what — and who each policy admits.
+  Ui.Click("Roles", within: "Screens");
+  Assert.Visible("You may", within: "Role SupervisesAgents");
+  Assert.Visible("You may", within: "Role PausesAgents");
+  Assert.Visible("Not you", within: "Role TeachesAgents");
+  Assert.Visible("Not you", within: "Role AuditsAgents");
+  Assert.Visible("Maeve Okonkwo", within: "Sponsor of Describer");
+  Ui.Click("Who?", within: "Role TeachesAgents");
+  Assert.Visible("It admits Calla Whitlock.", within: "Who TeachesAgents admits");
+  Ui.Click("Who?", within: "Role ReadsAllAgentWork");
+  Assert.Visible("It admits Desmond Achebe, Ingrid Solberg, Maeve Okonkwo.", within: "Who ReadsAllAgentWork admits");
+  Assert.NoOverflow();
+  Ui.Shot("roles-wide-light");
+
+  // 10. Back to the accession: she hands it to Priya, with a note. The registrar and its two pieces are called off.
+  Ui.Visit("/agents/work/" + morning.Accession);
+  Ui.Click("Hand it to a person");
+  Assert.Disabled("Hand it over");
+  Ui.Click("Priya Nair");
+  Ui.Fill("What are you handing over, and why?", "Jonas is away until Thursday and this reel cannot wait in the vault.");
+  Assert.NoOverflow();
+  Ui.Shot("work-handing-over-wide-light");
+  Ui.Click("Hand it over");
+  Assert.Visible("Handed over. They are asked to take it from here, in their inbox.");
+  Assert.Visible("It has been handed to Priya Nair, who has not answered yet.", within: "Handed over");
+  LetItGoOn();
+  runas (Maeve) {
+    Assert.Equal([
+      "Registrar · Accession reel: Cancelled",
+      "  ConditionChecker · Check condition: Cancelled",
+      "  RightsClerk · Clear rights: Stopped",
+    ], Trajectory.Tree(morning.Accession));
+    Assert.False(ReelNumbered("0412").Quarantined);
+  }
+  // It is in Priya's inbox, and Jonas' proposal is gone from his.
+  runas (Priya) {
+    var mine = Requests.Mine().Single();
+    Assert.Equal("Take over from Registrar: Accession of reel 0412", mine.Title);
+    Assert.Contains("Jonas is away until Thursday and this reel cannot wait in the vault.", mine.Context);
+    Assert.Contains("Registrar was waiting for Condition checker, which waits for a decision from Jonas Reiter, and has been called off.", mine.Context);
+  }
+  runas (Jonas) { Assert.Equal(0, Requests.Mine().Count); }
+  Ui.Visit("/agents/work/" + morning.Accession);
+  Assert.Visible("Cancelled", within: "The work");
+  Assert.Hidden("Call it off");
+  Ui.Shot("work-called-off-wide-light");
+  Ui.Click("Waiting on people", within: "Screens");
+  // No agent waits on anybody any more: what Priya was handed is hers, in her inbox.
+  Assert.Visible("Nobody is being waited on", within: "In all");
+  Assert.Hidden("Jonas Reiter");
+}
+
+/// The same screens on a phone, light and dark.
+[Test(Vaults)]
+void the_screens_on_a_phone() {
+  var morning = AMorningAtTheArchive();
+  Ui.Viewport(390, 844);
+  Ui.SignInAs(Maeve);
+  Ui.Visit("/agents");
+  Assert.Visible("5 agents", within: "In all");
+  Assert.Visible("$0.0084 of $0.0120 today", within: "Agent Describer");
+  Assert.NoOverflow();
+  Ui.Shot("roster-phone-light");
+  Ui.Theme("dark");
+  Ui.Shot("roster-phone-dark");
+  Ui.Theme("light");
+  Ui.Visit("/agents/agent/" + TheRegistrar);
+  Assert.Visible("Condition checker", within: "Hands work to");
+  Assert.NoOverflow();
+  Ui.Shot("agent-phone-light");
+  Ui.Visit("/agents/work");
+  Assert.Visible("4 pieces of work", within: "How many");
+  Assert.NoOverflow();
+  Ui.Shot("work-phone-light");
+  Ui.Visit("/agents/work/" + morning.Accession);
+  Assert.Visible("In charge of this work");
+  Assert.NoOverflow();
+  Ui.Shot("work-detail-phone-light");
+  Ui.Visit("/agents/waiting");
+  Assert.Visible("1 request", within: "Waited on Jonas Reiter");
+  Assert.NoOverflow();
+  Ui.Theme("dark");
+  Ui.Shot("waiting-phone-dark");
+  Ui.Theme("light");
+  Ui.Visit("/agents/autonomy");
+  Assert.Visible("No standing rules", within: "In all");
+  Assert.NoOverflow();
+  Ui.Shot("autonomy-phone-light");
+  Ui.Visit("/agents/spending");
+  Assert.TextIs("$0.0134", within: "spent on work started this month");
+  Assert.NoOverflow();
+  Ui.Shot("spending-phone-light");
+  Ui.Visit("/agents/roles");
+  Assert.Visible("You may", within: "Role SupervisesAgents");
+  Assert.NoOverflow();
+  Ui.Shot("roles-phone-light");
+}
+
+/// ⭐ WHAT EACH PERSON SEES. An archivist: the work she asked for, and what she may do to it — try it again the next
+/// day. The bookkeeper: every figure, no words, nothing to press. The curator: what the agents are told. And
+/// before anything has happened, every screen says so.
+[Test(Vaults)]
+void each_person_sees_what_is_theirs_and_an_archivist_tries_her_own_work_again() {
+  // Before anything: the screens say there is nothing, and what will be there.
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Maeve);
+  Ui.Visit("/agents");
+  Assert.Visible("Nothing is under way. $0.0000 spent on work started today, $0.0000 this month.", within: "In all");
+  Assert.Visible("Nothing under way", within: "Agent Registrar");
+  Ui.Visit("/agents/work");
+  Assert.Visible("No work yet", within: "The work");
+  Ui.Shot("work-empty-wide-light");
+  Ui.Visit("/agents/waiting");
+  Assert.Visible("Nobody is being waited on", within: "In all");
+  Ui.Shot("waiting-empty-wide-light");
+  Ui.Visit("/agents/spending");
+  Assert.Visible("Nothing was spent this month");
+  Ui.Shot("spending-empty-wide-light");
+  Ui.Visit("/agents/agent/Archive.Projectionist");
+  Assert.Visible("There is no agent called Projectionist");
+  Ui.Visit("/agents/shelves");
+  Assert.Visible("There is no such page");
+
+  var morning = AMorningAtTheArchive();
+
+  // Priya, an archivist: her three pieces of work, and nobody else's.
+  Ui.SignInAs(Priya);
+  Ui.Visit("/agents");
+  Assert.Visible("The figures count the work you asked for.", within: "In all");
+  Assert.Visible("Nothing is under way. $0.0088 spent on work started today, $0.0088 this month.", within: "In all");
+  Ui.Visit("/agents/work");
+  Assert.Visible("You see the work you asked for.", within: "In all");
+  Assert.Visible("3 pieces of work", within: "How many");
+  Assert.Hidden("Accession of reel 0412");
+  Ui.Visit("/agents/work/" + morning.Accession);
+  Assert.Visible("This piece of work is not yours to see");
+  Assert.Hidden("In charge of this work");
+  Ui.Shot("work-not-yours-wide-light");
+  // She may not pause an agent, and is not offered it.
+  Ui.Visit("/agents/agent/" + TheTranscriber);
+  Assert.Hidden("Resume");
+  Assert.Hidden("Change");
+  // The description that ran out of money: hers to try again — and refused today, in the agent's own words.
+  Ui.Visit("/agents/work/" + morning.OutOfMoney);
+  Assert.Visible("Try it again", within: "In charge of this work");
+  Ui.Click("Try it again");
+  Assert.Visible("It was started again from the beginning, on a record of its own.");
+  Assert.Visible("It was tried again: the attempt that followed has a record of its own.", within: "Tried again");
+  Assert.Hidden("Try it again");
+  runas (Priya) {
+    // Today the describer still has no room: the second attempt stopped where the first did, and says so.
+    var again = AgentTask.Single(t => t.RetryOf.Id == morning.OutOfMoney);
+    Assert.Equal(2, again.Attempt);
+    Assert.Equal(AgentTaskStatus.Stopped, again.Status);
+    Assert.Equal(Priya.Id, again.Requester!.Id);
+  }
+  // The next morning there is room again. She tries that attempt again, and it is done.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  Guid second = Guid.Empty;
+  runas (Priya) { second = AgentTask.Single(t => t.RetryOf.Id == morning.OutOfMoney).Id; }
+  Ui.Visit("/agents/work/" + second);
+  Ui.Click("Try it again");
+  Assert.Visible("It was started again from the beginning, on a record of its own.");
+  runas (Priya) {
+    var third = AgentTask.Single(t => t.RetryOf.Id == second);
+    Assert.Equal(3, third.Attempt);
+    Assert.Equal(AgentTaskStatus.Done, third.Status);
+    Assert.Equal("The building of the town bridge, 1936. Safety stock, reel two of three.", ReelNumbered("0401").Description);
+  }
+  Ui.Visit("/agents/work");
+  Assert.Visible("Done", within: "Work: Description of reel 0401 (attempt 3)");
+  Assert.Visible("Stopped", within: "Work: Description of reel 0401 (attempt 2)");
+  Ui.Shot("work-tried-again-wide-light");
+
+  // Desmond keeps the books: every figure, and not a word. Nothing is his to press.
+  Ui.SignInAs(Desmond);
+  Ui.Visit("/agents/spending");
+  Assert.Visible("$0.0046", within: "By who it was for: Jonas Reiter");
+  Assert.Hidden("You see the work you asked for.");
+  Ui.Shot("spending-bookkeeper-wide-light");
+  Ui.Visit("/agents/work");
+  Assert.Visible("Registrar, accession reel, for Jonas Reiter");
+  Assert.Hidden("Accession of reel 0412");
+  Assert.Hidden("Waits for Condition checker");
+  Ui.Shot("work-figures-only-wide-light");
+  Ui.Visit("/agents/agent/" + TheDescriber);
+  Assert.Hidden("Pause");
+  Assert.Hidden("Change");
+  Ui.Visit("/agents/roles");
+  Assert.Visible("You may", within: "Role ReadsAllAgentWork");
+  Assert.Visible("Not you", within: "Role SupervisesAgents");
+  Assert.Hidden("Who?");
+
+  // Calla teaches: the transcriber's instructions are hers to decide, from its page.
+  Ui.SignInAs(Calla);
+  Ui.Visit("/agents/agent/" + TheTranscriber);
+  Ui.Click("Open its instructions");
+  Assert.Visible("No instructions yet", within: "Where it stands");
+  Assert.Clickable("Propose an instruction");
+  Ui.Shot("agent-instructions-wide-light");
+}

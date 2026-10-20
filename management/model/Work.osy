@@ -1,0 +1,153 @@
+// What the Work screens read and send: the agents' work as whoever is looking may read it — filtered and counted
+// where it is stored — one piece of it in full, and Stop.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Llm;
+
+/// One piece of work, as a line of a list.
+public class WorkLine {
+  public Guid Task;
+  /// The agent and the job — "ConditionChecker", "Check condition" ("" when it was only asked something).
+  public string Agent = "";
+  public string AgentName = "";
+  public string Skill = "";
+  /// What it is about, as its receipt says. "": whoever is looking reads its figures and not its words.
+  public string About = "";
+  /// Who it is for: a person's name, or "the app" when a process started it for nobody.
+  public string For = "";
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  public string Stands = "";
+  /// What it waits for, while it waits; how it ended, when it did not finish.
+  public string Waits = "";
+  public string Ended = "";
+  public string Started = "";
+  /// How long it has been under way, or how long it took.
+  public string Took = "";
+  public string Cost = "";
+  public string Limit = "";
+  /// It is a piece of work another piece handed on: under which, by its id.
+  public Guid? Parent;
+  public int Attempt = 1;
+  public string ChargedTo = "";
+  /// The process it is a step of, by the workflow's name. "": it was not given in a process.
+  public string Process = "";
+}
+
+/// What the list is narrowed to. Every member is optional.
+public class WorkFilter {
+  /// An agent, by its class's full name.
+  public string Agent = "";
+  /// "working", "waiting", "done", "failed", "stopped", "calledoff" — or "open" for the first two together.
+  public string Status = "";
+  /// Words of the name of who the work is for.
+  public string Person = "";
+  /// "today", "week", "month" — by when the work started.
+  public string Since = "";
+  /// Words of what the work was charged to: "assignment", "case:8f1c".
+  public string ChargedTo = "";
+  /// Words of the name of the process the work is a step of.
+  public string Process = "";
+  /// Pieces that were handed on by other work are listed too. Otherwise only the work at the top of each tree.
+  public bool Pieces = false;
+  public int Take = 40;
+}
+
+/// One agent to filter by.
+public class AgentChoice {
+  public string Agent = "";
+  public string Name = "";
+}
+
+/// The list, with what it was narrowed from.
+public class WorkBoard {
+  public bool ReadsAll = false;
+  public List<WorkLine> Lines = [];
+  /// How many pieces match in all — the list shows the newest `Take` of them.
+  public int Matching = 0;
+  /// Under way now, over everything whoever is looking may read: being worked on, and waiting.
+  public int Working = 0;
+  public int Waiting = 0;
+  public List<AgentChoice> Agents = [];
+}
+
+string TookWords(AgentTask t, DateTime now) {
+  if (t.EndedAt == null) { return "for " + HowLong(t.StartedAt, now); }
+  var took = HowLong(t.StartedAt, t.EndedAt!.Value);
+  return took == "under a minute" ? "in under a minute" : "in " + took;
+}
+
+/// How a piece that did not finish ended, as a person reads it. Money that ran out is said as money, never as the
+/// row of the meter that refused.
+string EndedAs(AgentTask t) {
+  var outcome = t.Outcome ?? "";
+  if (!outcome.StartsWith("Its money ran out")) { return outcome; }
+  return outcome.Contains("task:" + t.Id.ToString()) ? "Its money ran out: it could spend " + Money(t.LimitMicros) + "."
+       : outcome.Contains("agent:") ? "Its money ran out: there was no room left in what the agent may spend in a day."
+       : "Its money ran out: the work above it had no more to spend.";
+}
+
+/// A receipt as a line. `Requester` is expected loaded.
+WorkLine WorkLineOf(AgentTask t, Principal? me, DateTime now) {
+  var ended = t.Status == AgentTaskStatus.Done || t.Status == AgentTaskStatus.Working || t.Status == AgentTaskStatus.Waiting;
+  return new WorkLine {
+    Task = t.Id, Agent = t.Agent, AgentName = AgentName(t.Agent), Skill = t.Skill == "" ? "" : InWords(t.Skill), About = t.About ?? "",
+    For = t.Requester == null ? "the app" : (me != null && t.Requester!.Id == me!.Id ? "you" : Named(t.Requester)),
+    Status = t.Status, Stands = StandsAs(t.Status), Waits = t.Status == AgentTaskStatus.Waiting ? (t.WaitingOn ?? "") : "",
+    Ended = ended ? "" : EndedAs(t), Started = DatedWithTime(t.StartedAt), Took = TookWords(t, now),
+    Cost = Money(t.SpentMicros), Limit = Money(t.LimitMicros), Parent = t.Parent == null ? null : t.Parent!.Id, Attempt = t.Attempt,
+    ChargedTo = ChargedWords(t.ChargedTo), Process = t.RunWorkflow ?? "",
+  };
+}
+
+/// ⭐ THE AGENTS' WORK, newest first, as whoever is looking may read it — narrowed where it is stored.
+[Server, Authorize(IsAuthenticated)]
+public WorkBoard WorkBoardOf(WorkFilter filter) {
+  var me = Session.CurrentUser;
+  var now = DateTime.UtcNow;
+  var board = new WorkBoard { ReadsAll = Security.Authorize(me, ReadsAllAgentWork) };
+  foreach (var a in App.Setting<AgentsSetup>().Agents) {
+    var name = a.GetType().FullName;
+    board.Agents.Add(new AgentChoice { Agent = name, Name = AgentName(name) });
+  }
+  board.Working = AgentTask.Count(t => t.Status == AgentTaskStatus.Working);
+  board.Waiting = AgentTask.Count(t => t.Status == AgentTaskStatus.Waiting);
+
+  var agent = filter.Agent;
+  var status = filter.Status;
+  var person = filter.Person.Trim();
+  var charged = filter.ChargedTo.Trim();
+  var process = filter.Process.Trim();
+  var pieces = filter.Pieces;
+  var from = filter.Since == "today" ? DayStart(now) : filter.Since == "week" ? now.AddDays(-7) : filter.Since == "month" ? MonthStart(now) : new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+  var query = AgentTask.Where(t => t.StartedAt >= from
+    && (agent == "" || t.Agent == agent)
+    && (pieces || t.Parent == null)
+    && (person == "" || t.Requester.DisplayName.Contains(person))
+    && (charged == "" || t.ChargedTo.Contains(charged))
+    && (process == "" || t.RunWorkflow.Contains(process))
+    && (status == ""
+        || (status == "open" && (t.Status == AgentTaskStatus.Working || t.Status == AgentTaskStatus.Waiting))
+        || (status == "working" && t.Status == AgentTaskStatus.Working)
+        || (status == "waiting" && t.Status == AgentTaskStatus.Waiting)
+        || (status == "done" && t.Status == AgentTaskStatus.Done)
+        || (status == "failed" && t.Status == AgentTaskStatus.Failed)
+        || (status == "stopped" && t.Status == AgentTaskStatus.Stopped)
+        || (status == "calledoff" && t.Status == AgentTaskStatus.Cancelled)));
+  board.Matching = query.Count();
+  var take = filter.Take < 1 ? 40 : Math.Min(filter.Take, 200);
+  foreach (var t in query.OrderByDescending(t => t.StartedAt).Take(take).Include(t => t.Requester).ToList()) {
+    board.Lines.Add(WorkLineOf(t, me, now));
+  }
+  return board;
+}
+
+/// Call a piece of work off from its page, with the reason. `StopAgentTask` says whose work somebody may stop.
+[Server, Authorize(IsAuthenticated)]
+public void StopWorkFromManagement(Guid task, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is called off: it is kept with the work."); }
+  var t = AgentTask.FirstOrDefault(x => x.Id == task);
+  if (t == null) { throw new AgentRefused("This piece of work is not yours to stop."); }
+  StopAgentTask(t!, why.Trim());
+}

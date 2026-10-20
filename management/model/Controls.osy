@@ -1,0 +1,137 @@
+// What a person in charge does to ONE piece of work: call it off, try it again, hand it to a person. Each is
+// `Osysharp.Agents`' (or `Osysharp.HumanRequests`') own function, which says who may; this file says what is
+// offered to whoever is looking, and why something is not.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Inspector;
+
+/// What a request that hands a piece of agent work to a person is about.
+public const string HandedOverSubject = "AgentWorkHandedOver";
+
+/// What whoever is looking may do to a piece of work.
+public class WorkControls {
+  public Guid Task;
+  public string AgentName = "";
+  public string About = "";
+  public bool UnderWay = false;
+  /// Somebody has asked for it to stop, and it has not reached its next step yet.
+  public bool StopAsked = false;
+  public string StopWhy = "";
+  public bool MayStop = false;
+  /// It may be tried again by whoever is looking — or why not, in a sentence ("" when trying again is not the
+  /// question at all: the work is under way, or finished).
+  public bool MayRetry = false;
+  public string RetryWhyNot = "";
+  /// The attempt that followed it, when it has been tried again; the attempt it follows, when it is one.
+  public Guid? TriedAgain;
+  public Guid? RetryOf;
+  /// Where each of those is shown, when the app says where a piece of work's page is (`AgentInspectorSetup.WorkPage`).
+  public string TriedAgainHref = "";
+  public string RetryOfHref = "";
+  /// It may be handed to a person, and to whom.
+  public bool MayHand = false;
+  public List<PersonChoice> People = [];
+  /// The open request that hands it to somebody, when it has been.
+  public Guid? HandedRequest;
+  public string HandedTo = "";
+}
+
+/// ⭐ WHAT WHOEVER IS LOOKING MAY DO TO A PIECE OF WORK. Null when it is not theirs to read.
+[Server, Authorize(IsAuthenticated)]
+public WorkControls? WorkControlsOf(Guid task) {
+  var t = AgentTask.Where(x => x.Id == task).Include(x => x.Requester).Include(x => x.StartedBy).FirstOrDefault();
+  if (t == null) { return null; }
+  var me = Session.CurrentUser;
+  var mine = me != null && ((t!.Requester != null && t!.Requester!.Id == me!.Id) || (t!.StartedBy != null && t!.StartedBy!.Id == me!.Id));
+  var inCharge = Security.Authorize(me, SupervisesAgents);
+  var underWay = t!.Status == AgentTaskStatus.Working || t!.Status == AgentTaskStatus.Waiting;
+  var controls = new WorkControls {
+    Task = t!.Id, AgentName = AgentName(t!.Agent), About = t!.About ?? "", UnderWay = underWay, StopAsked = underWay && t!.StopAsked,
+    StopWhy = t!.StopWhy ?? "", MayStop = underWay && !t!.StopAsked && (mine || inCharge), RetryOf = t!.RetryOf == null ? null : t!.RetryOf!.Id,
+  };
+  var next = AgentTask.FirstOrDefault(x => x.RetryOf == t);
+  controls.TriedAgain = next == null ? null : next!.Id;
+  controls.TriedAgainHref = next == null ? "" : WorkPageOf(next!.Id);
+  controls.RetryOfHref = t!.RetryOf == null ? "" : WorkPageOf(t!.RetryOf!.Id);
+
+  // Trying again: the same answers `RetryAgentWork` gives, said before the press.
+  var ended = !underWay && t!.Status != AgentTaskStatus.Done;
+  if (ended) {
+    var readsBrief = mine || Security.Authorize(me, AuditsAgents);
+    var forOthers = t!.Requester == null || (me != null && t!.Requester!.Id == me!.Id) || Security.Authorize(me, DirectsAgentsForOthers);
+    controls.RetryWhyNot = !Security.Authorize(me, UsesAgents) ? "Trying work again is for somebody who gives agents work."
+      : next != null ? "It has been tried again already."
+      : t!.Skill == "" ? controls.AgentName + " was asked something, not given a job. Ask it again."
+      : t!.Parent != null ? "It was handed on by another piece of work, which was told how it ended and went on. Try the work at the top again."
+      : t!.Run != null ? "It was a step of a process, which was told how it ended and has gone on from there."
+      : !readsBrief ? "Trying it again starts from what it was given, which you may not read. Whoever the work was for can try it again, and so can whoever audits the agents."
+      : !forOthers ? "It would run for " + Named(t!.Requester) + " again, and giving an agent work for somebody else is not yours to do."
+      : "";
+    controls.MayRetry = controls.RetryWhyNot == "";
+  }
+
+  // Handing it to a person: whoever may stop it, when they may put a request to somebody.
+  var handed = HumanRequest.Where(r => r.Status == RequestStatus.Open && r.SubjectType == HandedOverSubject && r.SubjectId == task).Include(r => r.To).FirstOrDefault();
+  if (handed != null) {
+    controls.HandedRequest = handed!.Id;
+    controls.HandedTo = Named(handed!.To);
+  }
+  controls.MayHand = handed == null && t!.Status != AgentTaskStatus.Done && (mine || inCharge) && Security.Authorize(me, AsksPeople);
+  if (controls.MayHand) {
+    foreach (var p in Principal.OrderBy(x => x.DisplayName).Take(200).ToList()) {
+      if (IsAnActor(p)) { continue; }
+      controls.People.Add(new PersonChoice { Id = p.Id, Name = me != null && p.Id == me!.Id ? Named(p) + " (you)" : Named(p) });
+    }
+  }
+  return controls;
+}
+
+/// Try a piece of work again from its page. Answers the new attempt's receipt. `RetryAgentWork` says who may.
+[Server, Authorize(IsAuthenticated)]
+public Guid RetryFromManagement(Guid task) {
+  var t = AgentTask.FirstOrDefault(x => x.Id == task);
+  if (t == null) { throw new AgentRefused("This piece of work is not yours to try again."); }
+  return RetryAgentWork(t!);
+}
+
+/// ⭐ HAND A PIECE OF WORK TO A PERSON: the agent's work is called off where it stands — when it is still under way
+/// — and the person is asked to take it from here, in their inbox, with the note and how the work stood. Answers
+/// the request.
+///
+/// For whoever may call the work off — the person it is for, whoever gave it, whoever supervises the agents — and
+/// may put a request to somebody (`AsksPeople`). What the agent had done stays done, and is on its record.
+[Server, Authorize(IsAuthenticated)]
+public Guid HandWorkToPerson(Guid task, Guid person, string note) {
+  if (note.Trim() == "") { throw new ValidationException("Say what you are handing over, and why: it is what they read first."); }
+  var t = AgentTask.Where(x => x.Id == task).Include(x => x.Requester).Include(x => x.StartedBy).FirstOrDefault();
+  if (t == null) { throw new AgentRefused("This piece of work is not yours to hand on."); }
+  var to = Principal.FirstOrDefault(p => p.Id == person);
+  if (to == null) { throw new ValidationException("Choose who takes it from here."); }
+  if (IsAnActor(to!)) { throw new ValidationException("That is an agent's own account. Hand it to a person."); }
+  var me = Session.CurrentUser;
+  var mine = me != null && ((t!.Requester != null && t!.Requester!.Id == me!.Id) || (t!.StartedBy != null && t!.StartedBy!.Id == me!.Id));
+  if (!mine && !Security.Authorize(me, SupervisesAgents)) { throw new AgentRefused("This piece of work is not yours to hand on."); }
+  if (t!.Status == AgentTaskStatus.Done) { throw new AgentRefused("It finished. There is nothing to take over."); }
+  if (HumanRequest.Any(r => r.Status == RequestStatus.Open && r.SubjectType == HandedOverSubject && r.SubjectId == task)) {
+    throw new AgentRefused("It has been handed to somebody already, and they have not answered yet.");
+  }
+  var name = AgentName(t!.Agent);
+  var label = (t!.About ?? "") != "" ? t!.About : name + "'s work";
+  var underWay = t!.Status == AgentTaskStatus.Working || t!.Status == AgentTaskStatus.Waiting;
+  var stood = underWay ? name + " was " + (t!.Status == AgentTaskStatus.Waiting ? "waiting for " + (t!.WaitingOn ?? "a person") : "working on it") + ", and has been called off."
+            : name + " had stopped: " + ((t!.Outcome ?? "") == "" ? StandsAs(t!.Status).ToLower() + "." : t!.Outcome);
+  if (underWay) { StopAgentTask(t!, "Handed to " + Named(to) + ": " + note.Trim()); }
+  var request = PutRequest(new NewRequest {
+    Kind = RequestKind.Question, To = to, Queue = App.Setting<AgentRequestsSetup>().Queue,
+    Title = "Take over from " + name + ": " + label,
+    Context = note.Trim() + "\n\n" + stood + " What it had done is on its record.",
+    Options = [RequestOption.Of("I have it"), RequestOption.Of("It is not mine", needsComment: true)],
+    About = new Subject { Type = HandedOverSubject, Id = t!.Id, Label = label },
+  });
+  return request.Id;
+}

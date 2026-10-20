@@ -1,0 +1,92 @@
+// What the "Waiting on people" screen reads: every open request an agent has put to a person — a proposal to
+// decide, a question to answer, work it gave up on — as whoever is looking may read it. The requests are
+// `Osysharp.HumanRequests`' own; answering, reminding, going on to somebody else and calling off are its to do, in
+// the inbox each line opens.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+
+/// One open request an agent waits on.
+public class WaitedLine {
+  public Guid Request;
+  /// What is asked — "ConditionChecker proposes: Quarantine the reel".
+  public string Title = "";
+  /// Of whom: the person it was put to, and who it went on to when it was late.
+  public string Who = "";
+  public string WentOnTo = "";
+  /// The agent that asks, as the request says it — through whom, when the work was handed on.
+  public string AskedBy = "";
+  /// The work that waits: what it is about, and its receipt.
+  public string About = "";
+  public Guid? Work;
+  public string Since = "";
+  public string For = "";
+  public string Due = "";
+  public bool Late = false;
+  public int Reminders = 0;
+}
+
+/// One person the agents wait on.
+public class WaitedPerson {
+  public string Name = "";
+  public int Count = 0;
+  public int Late = 0;
+  /// How long the oldest of theirs has waited.
+  public string Oldest = "";
+}
+
+/// Everybody the agents are waiting on.
+public class WaitingBoard {
+  public List<WaitedLine> Lines = [];
+  public List<WaitedPerson> People = [];
+  public int Late = 0;
+  public string Oldest = "";
+  /// Pieces of agent work that are stopped on a person or on work they handed on, over everything whoever is looking
+  /// may read.
+  public int WorkWaiting = 0;
+  /// Whoever is looking reads every request (`OverseesRequests`). Otherwise: those put to them, held by them or
+  /// asked for them.
+  public bool OverseesAll = false;
+}
+
+/// ⭐ EVERYBODY THE AGENTS ARE WAITING ON — every open request an agent put, oldest first, and the same counted by
+/// person.
+[Server, Authorize(IsAuthenticated)]
+public WaitingBoard WaitingBoardOf() {
+  var me = Session.CurrentUser;
+  var now = DateTime.UtcNow;
+  var board = new WaitingBoard { OverseesAll = Security.Authorize(me, OverseesRequests) };
+  board.WorkWaiting = AgentTask.Count(t => t.Status == AgentTaskStatus.Waiting && t.Parent == null);
+  var open = HumanRequest.Where(r => r.Status == RequestStatus.Open && r.AskedByKind == AskerKind.Agent)
+    .OrderBy(r => r.ArrivedAt).Take(300).Include(r => r.To).Include(r => r.EscalatedTo).Include(r => r.Queue).ToList();
+  DateTime? oldest = null;
+  foreach (var r in open) {
+    // Put to nobody by name — a proposal its skill sends to a queue: the queue is who is waited on.
+    var who = r.To != null ? Named(r.To) : r.OutsideName != "" ? r.OutsideName : r.Queue != null ? "the " + r.Queue!.Name + " queue" : "whoever works the queue";
+    var late = r.OverdueAt != null;
+    board.Lines.Add(new WaitedLine {
+      Request = r.Id, Title = r.Title, Who = who, WentOnTo = r.EscalatedTo == null ? "" : Named(r.EscalatedTo), AskedBy = r.AskedByName,
+      About = r.WaitingLabel, Work = r.WaitingType == WorkSubject ? r.WaitingId : null,
+      Since = DatedWithTime(r.ArrivedAt), For = HowLong(r.ArrivedAt, now),
+      Due = r.DueAt == null ? "" : (late ? "It was wanted by " : "Wanted by ") + DatedWithTime(r.DueAt!.Value) + ".",
+      Late = late, Reminders = r.Reminders,
+    });
+    if (late) { board.Late = board.Late + 1; }
+    if (oldest == null) { oldest = r.ArrivedAt; }
+    // Whoever holds it now is who is waited on: the person it went on to, once it has.
+    var holder = r.EscalatedTo != null ? Named(r.EscalatedTo) : who;
+    var person = board.People.FirstOrDefault(p => p.Name == holder);
+    if (person == null) {
+      person = new WaitedPerson { Name = holder, Oldest = HowLong(r.ArrivedAt, now) };
+      board.People.Add(person!);
+    }
+    person!.Count = person!.Count + 1;
+    if (late) { person!.Late = person!.Late + 1; }
+  }
+  board.Oldest = oldest == null ? "" : HowLong(oldest!.Value, now);
+  return board;
+}

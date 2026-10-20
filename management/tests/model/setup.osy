@@ -1,0 +1,25 @@
+// The archive's agents and its model. In a file of its own with no `namespace`, because an `app.X = …` statement's
+// value is resolved outside the file's namespace.
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Inspector;
+using Osysharp.Llm;
+using Osysharp.WorkQueues;
+using Archive;
+
+app.Llm = new LlmSetup {
+  Models = [
+    new LlmModel { Name = "Small", Client = new ScriptedModel { Name = "Small" }, Model = "scripted-small",
+                   Price = new LlmPrice { Input = 1, Output = 5 }, MaxOutputTokens = 1000 },
+  ],
+  Default = "Small",
+};
+
+app.Agents = new AgentsSetup {
+  Agents = [new Registrar(), new ConditionChecker(), new RightsClerk(), new Describer(), new Transcriber()],
+  TaskBudget = 0.05m,
+};
+app.AgentRequests = new AgentRequestsSetup { Queue = "Collections", DecideWithin = TimeSpan.FromHours(8) };
+app.Inbox = new InboxSetup { DefaultQueue = "Collections" };
+// A piece of work's own page is the management screens' — so every link the inspector draws lands there.
+app.AgentInspector = new AgentInspectorSetup { WorkPage = "/agents/work/{task}" };

@@ -1,0 +1,57 @@
+// Osysharp.Agents.Management — running a skill from an agent's page, and who the agent acts as before it ever worked.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Management;
+using Archive;
+
+/// ⭐ RUN ON DEMAND. Jonas opens the condition checker's page — it has never worked, and still says the account it acts
+/// as — runs "Check condition" on reel 0377 from the skill's own form, and opens the work it started, which is his.
+[Test(Vaults)]
+void a_skill_is_run_from_its_agents_page_with_a_form_of_what_it_takes() {
+  Guid reelId = Guid.Empty;
+  runas (Jonas) {
+    var reel = ReelNumbered("0377");
+    reelId = reel.Id;
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(BenchNotes), ReelArg(reel)),
+      Says.HandBack(new ConditionReport { Sound = true, Finding = "Tinted print, complete." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  }
+
+  Ui.Viewport(1280, 900);
+  Ui.SignInAs(Jonas);
+  Ui.Visit("/agents/agent/" + TheChecker);
+  Assert.Visible("condition-checker@lanternstreet.example", within: "Acts as");
+  Assert.Hidden("It has not worked yet.");
+  Ui.Click("Run", within: "Skill Check condition");
+  Assert.Visible("Run Check condition", within: "Running Check condition");
+  Ui.Fill("The reel to check.", reelId.ToString());
+  Ui.Click("Run it");
+  Assert.Visible("Check condition was run. Its receipt says how it went.");
+  Ui.Click("Open the work");
+  Assert.Visible("Tinted print, complete.");
+  runas (Jonas) {
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Equal(Jonas.Id, receipt.Requester!.Id);
+    Assert.Equal(TheChecker, receipt.Agent);
+  }
+}
+
+/// What a form cannot run is said on the form, and nothing is started: a reel left out, and somebody who gives the
+/// agents no work is not offered Run at all.
+[Test(Vaults)]
+void what_a_form_cannot_run_is_said_and_who_gives_no_work_is_not_offered_it() {
+  Ui.SignInAs(Jonas);
+  Ui.Visit("/agents/agent/" + TheChecker);
+  Ui.Click("Run", within: "Skill Check condition");
+  Ui.Click("Run it");
+  Assert.Visible("Say the reel to check.");
+  runas (Maeve) { Assert.Equal(0, AgentTask.Count()); }
+  Ui.SignInAs(Desmond);
+  Ui.Visit("/agents/agent/" + TheChecker);
+  Assert.Hidden("Run", within: "Skill Check condition");
+  runas (Desmond) { Assert.False(AgentProfileOf(TheChecker).MayRun); }
+}

@@ -1,0 +1,201 @@
+// What the Spending screen reads: what the agents' work cost, by agent, skill, person and what it was charged to,
+// against each limit — every figure summed where the receipts and the meter's own counts are stored. Nothing here
+// asks a model anything.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Llm;
+
+/// A sum of receipts under one key.
+class SpendSum {
+  public string Key = "";
+  public Guid? Person;
+  public int Pieces = 0;
+  public long Micros = 0;
+}
+
+/// One line of a breakdown.
+public class SpendLine {
+  public string Label = "";
+  /// For an agent: its class's full name, so the line opens its page.
+  public string Agent = "";
+  public int Pieces = 0;
+  public string Spent = "";
+  /// Its share of the largest line of its breakdown, for a bar: 0 to 100.
+  public int Share = 0;
+}
+
+/// One limit, and what has been counted against it.
+public class LimitLine {
+  /// What it is a limit on, in words — "ConditionChecker, a day", "Everybody, each a month".
+  public string On = "";
+  public string Limit = "";
+  public string Against = "";
+  public int Percent = 0;
+  public bool Reached = false;
+  /// How many calls it refused this period.
+  public int Refused = 0;
+  public string Agent = "";
+}
+
+/// One piece of work a limit stopped.
+public class StoppedLine {
+  public Guid Task;
+  public string AgentName = "";
+  public string About = "";
+  public string When = "";
+  public string Said = "";
+  public string Cost = "";
+}
+
+/// Everything the Spending screen shows, for one period.
+public class SpendingBoard {
+  /// "today", "week", "month" or "all".
+  public string Period = "month";
+  public string PeriodWords = "";
+  public bool ReadsAll = false;
+  public string Total = "";
+  public int Pieces = 0;
+  public int ModelCalls = 0;
+  public List<SpendLine> ByAgent = [];
+  public List<SpendLine> BySkill = [];
+  public List<SpendLine> ByPerson = [];
+  public List<SpendLine> ByCharge = [];
+  /// By the process the work was a step of — only the work that was given in one.
+  public List<SpendLine> ByProcess = [];
+  public List<LimitLine> Limits = [];
+  public List<StoppedLine> Stopped = [];
+}
+
+void Shares(List<SpendLine> lines, List<long> micros) {
+  long most = 0;
+  foreach (var m in micros) { if (m > most) { most = m; } }
+  var at = 0;
+  foreach (var line in lines) {
+    line.Share = most == 0 ? 0 : (int)(micros[at] * 100 / most);
+    at = at + 1;
+  }
+}
+
+string WindowWords(LlmBudgetWindow window) {
+  return window == LlmBudgetWindow.Day ? "a day" : window == LlmBudgetWindow.Month ? "a month" : "in all";
+}
+
+/// ⭐ WHAT THE AGENTS' WORK COST in a period — by the work that STARTED in it — as whoever is looking may read it.
+[Server, Authorize(IsAuthenticated)]
+public SpendingBoard SpendingBoardOf(string period = "month") {
+  var me = Session.CurrentUser;
+  var now = DateTime.UtcNow;
+  var board = new SpendingBoard { Period = period, ReadsAll = Security.Authorize(me, ReadsAllAgentWork) };
+  var from = period == "today" ? DayStart(now) : period == "week" ? now.AddDays(-7) : period == "all" ? new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc) : MonthStart(now);
+  board.PeriodWords = period == "today" ? "today" : period == "week" ? "in the last 7 days" : period == "all" ? "in all" : "this month";
+
+  // By agent — and the whole, which is the same sums added up.
+  var byAgent = AgentTask.Where(t => t.StartedAt >= from).GroupBy(t => t.Agent)
+    .Select(g => new SpendSum { Key = g.Key, Pieces = g.Count(), Micros = g.Sum(t => t.SpentMicros) }).ToList();
+  long total = 0;
+  List<long> agentMicros = [];
+  foreach (var s in byAgent.OrderByDescending(x => x.Micros).ToList()) {
+    board.ByAgent.Add(new SpendLine { Label = AgentName(s.Key), Agent = s.Key, Pieces = s.Pieces, Spent = Money(s.Micros) });
+    agentMicros.Add(s.Micros);
+    total = total + s.Micros;
+    board.Pieces = board.Pieces + s.Pieces;
+  }
+  Shares(board.ByAgent, agentMicros);
+  board.Total = Money(total);
+  board.ModelCalls = AgentTask.Where(t => t.StartedAt >= from).Sum(t => t.ModelCalls);
+
+  var bySkill = AgentTask.Where(t => t.StartedAt >= from).GroupBy(t => t.Skill)
+    .Select(g => new SpendSum { Key = g.Key, Pieces = g.Count(), Micros = g.Sum(t => t.SpentMicros) }).ToList();
+  List<long> skillMicros = [];
+  foreach (var s in bySkill.OrderByDescending(x => x.Micros).ToList()) {
+    board.BySkill.Add(new SpendLine { Label = s.Key == "" ? "Asked something" : InWords(s.Key), Pieces = s.Pieces, Spent = Money(s.Micros) });
+    skillMicros.Add(s.Micros);
+  }
+  Shares(board.BySkill, skillMicros);
+
+  // By who the work was for. Work a process started for nobody is "the app".
+  var byPerson = AgentTask.Where(t => t.StartedAt >= from).GroupBy(t => t.Requester.Id)
+    .Select(g => new SpendSum { Person = g.Key, Pieces = g.Count(), Micros = g.Sum(t => t.SpentMicros) }).ToList();
+  List<Guid> ids = [];
+  foreach (var s in byPerson) { if (s.Person != null) { ids.Add(s.Person!.Value); } }
+  var people = ids.Count == 0 ? [] : Principal.Where(p => ids.Contains(p.Id)).ToList();
+  List<long> personMicros = [];
+  foreach (var s in byPerson.OrderByDescending(x => x.Micros).ToList()) {
+    var who = s.Person == null ? null : people.FirstOrDefault(p => p.Id == s.Person);
+    board.ByPerson.Add(new SpendLine { Label = s.Person == null ? "The app" : (who == null ? "Somebody you may not read" : Named(who)), Pieces = s.Pieces, Spent = Money(s.Micros) });
+    personMicros.Add(s.Micros);
+  }
+  Shares(board.ByPerson, personMicros);
+
+  // By what the work was charged to — a case, an assignment, a process. A piece charged to two things counts
+  // under both.
+  var byCharge = AgentTask.Where(t => t.StartedAt >= from && t.ChargedTo != "").GroupBy(t => t.ChargedTo)
+    .Select(g => new SpendSum { Key = g.Key, Pieces = g.Count(), Micros = g.Sum(t => t.SpentMicros) }).ToList();
+  List<SpendSum> charges = [];
+  foreach (var s in byCharge) {
+    foreach (var scope in s.Key.Split("\n")) {
+      if (scope.Trim() == "") { continue; }
+      var there = charges.FirstOrDefault(c => c.Key == scope);
+      if (there == null) { charges.Add(new SpendSum { Key = scope, Pieces = s.Pieces, Micros = s.Micros }); }
+      else { there!.Pieces = there!.Pieces + s.Pieces; there!.Micros = there!.Micros + s.Micros; }
+    }
+  }
+  List<long> chargeMicros = [];
+  foreach (var s in charges.OrderByDescending(x => x.Micros).Take(20).ToList()) {
+    board.ByCharge.Add(new SpendLine { Label = ChargedWords(s.Key), Pieces = s.Pieces, Spent = Money(s.Micros) });
+    chargeMicros.Add(s.Micros);
+  }
+  Shares(board.ByCharge, chargeMicros);
+
+  // By the process the work was a step of.
+  var byProcess = AgentTask.Where(t => t.StartedAt >= from && t.RunWorkflow != "").GroupBy(t => t.RunWorkflow)
+    .Select(g => new SpendSum { Key = g.Key, Pieces = g.Count(), Micros = g.Sum(t => t.SpentMicros) }).ToList();
+  List<long> processMicros = [];
+  foreach (var s in byProcess.OrderByDescending(x => x.Micros).ToList()) {
+    board.ByProcess.Add(new SpendLine { Label = InWords(s.Key), Pieces = s.Pieces, Spent = Money(s.Micros) });
+    processMicros.Add(s.Micros);
+  }
+  Shares(board.ByProcess, processMicros);
+
+  // The limits: each agent's own for a day, then every budget the app has set — with the meter's count against it now.
+  foreach (var agent in App.Setting<AgentsSetup>().Agents) {
+    var daily = agent.Limits.Daily;
+    if (daily == null) { continue; }
+    var name = agent.GetType().FullName;
+    var limit = (long)Math.Round(daily!.Value * 1000000m);
+    var against = (long)Math.Round(SpentAgainst("agent:" + name, LlmBudgetWindow.Day) * 1000000m);
+    board.Limits.Add(new LimitLine {
+      On = AgentName(name) + ", a day", Limit = Money(limit), Against = Money(against), Agent = name,
+      Percent = limit == 0 ? 100 : (int)Math.Min(100, against * 100 / limit), Reached = against >= limit,
+    });
+  }
+  foreach (var b in LlmBudget.OrderBy(x => x.Scope).Take(100).ToList()) {
+    var period0 = PeriodOf(b.Window, now);
+    long spent = 0;
+    var refused = 0;
+    foreach (var s in LlmSpend.Where(x => x.Budget == b && x.Period == period0).Take(500).ToList()) {
+      // A budget for every subject of its kind keeps an allowance each: the one nearest its limit is the one to see.
+      if (s.SpentMicros > spent) { spent = s.SpentMicros; }
+      refused = refused + s.Refused;
+    }
+    var whose = b.Scope == "app" ? "The whole app" : b.Subject == "" ? "Each " + b.Scope : b.Scope + " " + (b.Subject.Length > 12 ? b.Subject.Substring(0, 12) : b.Subject);
+    board.Limits.Add(new LimitLine {
+      On = whose + ", " + WindowWords(b.Window), Limit = Money(b.LimitMicros), Against = Money(spent), Refused = refused,
+      Percent = b.LimitMicros == 0 ? 100 : (int)Math.Min(100, spent * 100 / b.LimitMicros), Reached = spent >= b.LimitMicros,
+    });
+  }
+
+  // What a limit stopped: work that was stopped before it finished. Its own words say which limit, for whoever
+  // reads them.
+  foreach (var t in AgentTask.Where(x => x.StartedAt >= from && x.Status == AgentTaskStatus.Stopped).OrderByDescending(x => x.StartedAt).Take(30).ToList()) {
+    var outcome = t.Outcome ?? "";
+    if (outcome != "" && !outcome.StartsWith("Its money ran out")) { continue; }
+    board.Stopped.Add(new StoppedLine {
+      Task = t.Id, AgentName = AgentName(t.Agent), About = t.About ?? "", When = DatedWithTime(t.StartedAt),
+      Said = outcome == "" ? "It was stopped before it finished: its money or its turns ran out." : EndedAs(t), Cost = Money(t.SpentMicros),
+    });
+  }
+  return board;
+}

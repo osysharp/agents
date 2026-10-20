@@ -1,0 +1,256 @@
+// The Work screens: all the agents' work, narrowed by agent, state, person, time and what it was charged to; one
+// piece of it, as the inspector draws it; and what a person in charge does to it — call it off, try it again, hand
+// it to a person — which this kit adds to the inspector wherever the app shows one.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Agents.Inspector;
+using Osysharp.Agents.Teaching;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Ui;
+
+/// ⭐ ALL THE AGENTS' WORK, newest first, as whoever is looking may read it. Narrow it by where it stands, by agent,
+/// by when it started, by who it is for, by the process it is a step of and by what it was charged to; each line
+/// opens the piece of work.
+///
+/// In a test: `Ui.Click("Waiting", within: "Where it stands")`, `Ui.Click("Describer", within: "Which agent")`,
+/// `Ui.Fill("For whom", "Jonas")`.
+[Composable]
+public component AgentWorkList(string at = "/agents", string agent = "") {
+  WorkBoard? board = null;
+  bool loaded = false;
+  string problem = "";
+  string status = "";
+  string only = agent;
+  string since = "";
+  string person = "";
+  string charged = "";
+  string process = "";
+  bool pieces = false;
+  int take = 40;
+
+  action Load() {
+    try {
+      board = WorkBoardOf(new WorkFilter { Agent = only, Status = status, Person = person, Since = since, ChargedTo = charged, Process = process, Pieces = pieces, Take = take });
+      problem = "";
+    } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+
+  action Stands(string s) { status = s; take = 40; Load(); }
+  action Of(string a) { only = a; take = 40; Load(); }
+  action Since(string s) { since = s; take = 40; Load(); }
+  action Search() { take = 40; Load(); }
+  action Pieces() { Load(); }
+  action More() { take = take + 40; Load(); }
+  action Clear() { status = ""; only = ""; since = ""; person = ""; charged = ""; process = ""; pieces = false; take = 40; Load(); }
+
+  render {
+    Stack(gap: 5, w: "100%", label: "Work") {
+      if (!loaded) { ListSkeleton("Loading the work"); }
+      if (loaded && board == null) { Alert("The work could not be shown: " + problem, tone: Tone.Danger); }
+      if (board != null) {
+        Stack(gap: 2, label: "In all") {
+          Text("Work", fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", lineHeight: "1.2");
+          Text(UnderWayWords(board.Working, board.Waiting) + (board.ReadsAll ? "" : " You see the work you asked for."),
+               fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+        }
+
+        Stack(gap: 3, label: "Narrow it") {
+          Box(w: "100%", overflowX: Overflow.Auto, label: "Where it stands") {
+            Tabs {
+              Tab("All", selected: status == "", onPress: () => Stands(""));
+              Tab("Under way", selected: status == "open", onPress: () => Stands("open"));
+              Tab("Waiting", selected: status == "waiting", onPress: () => Stands("waiting"));
+              Tab("Done", selected: status == "done", onPress: () => Stands("done"));
+              Tab("Could not finish", selected: status == "failed", onPress: () => Stands("failed"));
+              Tab("Stopped", selected: status == "stopped", onPress: () => Stands("stopped"));
+              Tab("Called off", selected: status == "calledoff", onPress: () => Stands("calledoff"));
+            }
+          }
+          Row(gap: 2, wrap: Wrapping.Wrap, align: Align.Center, label: "Which agent") {
+            Button("Every agent", onPress: () => Of(""), tone: only == "" ? Tone.Primary : Tone.Default, size: Size.Sm);
+            foreach (var a in board.Agents) {
+              Button(a.Name, onPress: () => Of(a.Agent), tone: only == a.Agent ? Tone.Primary : Tone.Default, size: Size.Sm);
+            }
+          }
+          Row(gap: 2, wrap: Wrapping.Wrap, align: Align.Center, label: "Started") {
+            Button("Any time", onPress: () => Since(""), tone: since == "" ? Tone.Primary : Tone.Default, size: Size.Sm);
+            Button("Today", onPress: () => Since("today"), tone: since == "today" ? Tone.Primary : Tone.Default, size: Size.Sm);
+            Button("Last 7 days", onPress: () => Since("week"), tone: since == "week" ? Tone.Primary : Tone.Default, size: Size.Sm);
+            Button("This month", onPress: () => Since("month"), tone: since == "month" ? Tone.Primary : Tone.Default, size: Size.Sm);
+          }
+          Row(gap: 3, wrap: Wrapping.Wrap, align: Align.End) {
+            Box(minW: "min(100%, 14rem)") { Field("For whom", value: person, placeholder: "A name", onEnter: Search); }
+            Box(minW: "min(100%, 14rem)") { Field("Process", value: process, placeholder: "A process's name", onEnter: Search); }
+            Box(minW: "min(100%, 14rem)") { Field("Charged to", value: charged, placeholder: "assignment, case…", onEnter: Search); }
+            Button("Find", onPress: Search);
+          }
+          Row { Checkbox("Pieces that other work handed on, too", value: pieces, onToggle: Pieces); }
+        }
+
+        Stack(gap: 2, label: "The work") {
+          Row(gap: 3, align: Align.Baseline, justify: Justify.Between, wrap: Wrapping.Wrap) {
+            Text(board.Matching == 0 ? "Nothing" : board.Matching == 1 ? "1 piece of work" : board.Matching.ToString() + " pieces of work", fontSize: FontSize.Label, color: Colors.TextMuted, label: "How many");
+            if (status != "" || only != "" || since != "" || person != "" || charged != "" || process != "" || pieces) { Button("Show everything", onPress: Clear, tone: Tone.Ghost, size: Size.Sm); }
+          }
+          if (board.Lines.Count == 0) {
+            EmptyState(status == "" && only == "" && since == "" && person == "" && charged == "" && process == "" ? "No work yet" : "Nothing matches",
+                       body: status == "" && only == "" && since == "" && person == "" && charged == "" && process == ""
+                             ? "Work is listed here as the agents are given it." : "Widen what you asked for, or show everything.");
+          }
+          if (board.Lines.Count > 0) {
+            Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg) {
+              foreach (var line in board.Lines) { WorkRow(line, at, line.Task == board.Lines[0].Task); }
+            }
+          }
+          if (board.Matching > board.Lines.Count) { Row { Button("Show more", onPress: More, tone: Tone.Ghost); } }
+        }
+      }
+    }
+  }
+}
+
+/// ⭐ ONE PIECE OF WORK: everything the inspector reads of it — what was asked, by whom and for whom, each step, the
+/// work it handed on, what it cost, whether its record checks — then what teaching adds, and, for whoever is in
+/// charge of it, calling it off, trying it again and handing it to a person.
+///
+/// In a test: `Ui.Click("Call it off")`, fill "Why is it called off?", `Ui.Click("Call it off", within: "Calling off")`.
+[Composable]
+public component AgentWorkDetail(Guid task, string at = "/agents", Func<Guid, string>? request = null) {
+  render {
+    Stack(gap: 6, w: "100%", maxW: "860px", label: "Piece of work") {
+      Row { TextLink("All work", to: WorkListHref(at)); }
+      WorkInspector(task);
+      WorkWaitingOnPeople(task, open: request);
+      WorkTeaching(task, beside: true);
+    }
+  }
+}
+
+/// What a person in charge does to a piece of work, added at the head of the inspector wherever the app draws one.
+[Contribution("In charge of this work")]
+component WorkControlsOnTheInspector(Guid task) : AgentWorkActions {
+  render { WorkInCharge(task); }
+}
+
+/// ⭐ IN CHARGE OF A PIECE OF WORK: call it off, try it again, hand it to a person — each offered only to whoever
+/// may, each with its reason, and each refusal said in the kit's own words. Draws nothing for somebody who may do
+/// none of them.
+[Composable]
+public component WorkInCharge(Guid task) {
+  WorkControls? controls = null;
+  bool loaded = false;
+  string mode = "";
+  string why = "";
+  Guid? to = null;
+  string refused = "";
+  string notice = "";
+  Guid? again = null;
+
+  action Load() {
+    try { controls = WorkControlsOf(task); } catch (Exception ex) { controls = null; }
+    loaded = true;
+  }
+  on mount { Load(); }
+
+  action AskStop() { mode = "stop"; why = ""; refused = ""; notice = ""; }
+  action AskHand() { mode = "hand"; why = ""; to = null; refused = ""; notice = ""; }
+  action Back() { mode = ""; refused = ""; }
+  action Choose(Guid person) { to = person; }
+  action Stop() {
+    refused = "";
+    try { StopWorkFromManagement(task, why); mode = ""; notice = "Called off. It stops at its next step and keeps what it has done and spent."; Load(); }
+    catch (Exception ex) { refused = ex.Message; }
+  }
+  action Retry() {
+    refused = "";
+    notice = "";
+    try { again = RetryFromManagement(task); notice = "It was started again from the beginning, on a record of its own."; Load(); }
+    catch (Exception ex) { refused = ex.Message; }
+  }
+  action Hand() {
+    refused = "";
+    try {
+      HandWorkToPerson(task, to!.Value, why);
+      mode = "";
+      notice = "Handed over. They are asked to take it from here, in their inbox.";
+      Load();
+    } catch (Exception ex) { refused = ex.Message; }
+  }
+
+  render {
+    if (controls != null && (controls.MayStop || controls.MayRetry || controls.MayHand || controls.StopAsked || controls.RetryWhyNot != "" || controls.TriedAgain != null || controls.RetryOf != null || controls.HandedRequest != null || notice != "")) {
+      Stack(gap: 3, label: "In charge of this work") {
+        Text("In charge of this work", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+        if (notice != "") { Alert(notice, tone: Tone.Success); }
+        if (controls.StopAsked) {
+          Alert("It has been called off, and stops at its next step." + (controls.StopWhy == "" ? "" : " " + controls.StopWhy), tone: Tone.Warning);
+        }
+        if (controls.HandedRequest != null) {
+          Text("It has been handed to " + controls.HandedTo + ", who has not answered yet.", fontSize: FontSize.Body, lineHeight: "1.5", maxW: "62ch", label: "Handed over");
+        }
+        if (controls.TriedAgain != null) {
+          Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap, label: "Tried again") {
+            Text("It was tried again: the attempt that followed has a record of its own.", fontSize: FontSize.Body, lineHeight: "1.5", maxW: "62ch");
+            if (controls.TriedAgainHref != "") { TextLink("Open that attempt", to: controls.TriedAgainHref); }
+          }
+        }
+        if (controls.RetryOf != null && controls.RetryOfHref != "") {
+          Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap, label: "The attempt before") {
+            Text("This is another attempt at work that did not finish.", fontSize: FontSize.Body);
+            TextLink("Open the attempt before", to: controls.RetryOfHref);
+          }
+        }
+        if (mode == "" && refused != "") { Alert(refused, tone: Tone.Danger); }
+        if (mode == "") {
+          Row(gap: 2, wrap: Wrapping.Wrap) {
+            if (controls.MayStop) { Button("Call it off", onPress: AskStop); }
+            if (controls.MayRetry) { Button("Try it again", onPress: Retry); }
+            if (controls.MayHand) { Button("Hand it to a person", onPress: AskHand); }
+          }
+          if (!controls.MayRetry && controls.RetryWhyNot != "" && controls.TriedAgain == null) {
+            Text(controls.RetryWhyNot, fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.5", maxW: "66ch", label: "Why not again");
+          }
+        }
+        if (mode == "stop") {
+          Stack(gap: 3, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Calling off") {
+            Text("Call off " + (controls.About == "" ? "this work" : controls.About), fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Text("It stops at its next step, and keeps what it has done and spent. Work it handed to other agents stops with it, and what it had put to people is withdrawn.",
+                 fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch");
+            TextAreaField("Why is it called off?", value: why, rows: 2, hint: "Kept with the work.");
+            if (refused != "") { Alert(refused, tone: Tone.Danger); }
+            Row(gap: 2, justify: Justify.End) {
+              Button("Back", onPress: Back, tone: Tone.Ghost);
+              Button("Call it off", onPress: Stop, tone: Tone.Danger, disabled: why.Trim() == "");
+            }
+          }
+        }
+        if (mode == "hand") {
+          Stack(gap: 3, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Handing over") {
+            Text("Hand it to a person", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Text(controls.UnderWay ? controls.AgentName + " is called off where it stands, and the person is asked to take it from here. What it had done stays done."
+                                   : "The person is asked to take it from here. What " + controls.AgentName + " had done stays done.",
+                 fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch");
+            Stack(gap: 2, label: "Who takes it") {
+              Text("Who takes it", fontSize: FontSize.Label, fontWeight: FontWeight.Medium);
+              Row(gap: 2, wrap: Wrapping.Wrap) {
+                foreach (var p in controls.People) {
+                  Button(p.Name, onPress: () => Choose(p.Id), tone: to == p.Id ? Tone.Primary : Tone.Default, size: Size.Sm);
+                }
+              }
+            }
+            TextAreaField("What are you handing over, and why?", value: why, rows: 3, hint: "The first thing they read.");
+            if (refused != "") { Alert(refused, tone: Tone.Danger); }
+            Row(gap: 2, justify: Justify.End) {
+              Button("Back", onPress: Back, tone: Tone.Ghost);
+              Button("Hand it over", onPress: Hand, tone: Tone.Primary, disabled: why.Trim() == "" || to == null);
+            }
+          }
+        }
+      }
+    }
+  }
+}

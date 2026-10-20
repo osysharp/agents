@@ -1,0 +1,103 @@
+// Osysharp.Agents.Management — what each screen reads, as values: the roster, an agent, the work, who is waited on,
+// the standing rules, what was spent — each figure checked against the records it is read from, and each as the
+// person looking may read it.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Management;
+using Osysharp.Workflow;
+using Archive;
+
+/// ⭐ THE MORNING, AS THE HEAD OF COLLECTIONS READS IT: every figure on the roster is the records' own.
+[Test(Vaults)]
+void the_roster_says_what_the_records_say() {
+  var morning = AMorningAtTheArchive();
+  runas (Maeve) {
+    // What happened, first — so the figures below are checked against it.
+    Assert.Equal([
+      "Registrar · Accession reel: Waiting",
+      "  ConditionChecker · Check condition: Waiting",
+      "  RightsClerk · Clear rights: Stopped",
+    ], Trajectory.Tree(morning.Accession));
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single(t => t.Id == morning.Described).Status);
+    Assert.Equal(AgentTaskStatus.Stopped, AgentTask.Single(t => t.Id == morning.OutOfMoney).Status);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single(t => t.Id == morning.Cards).Status);
+
+    var roster = RosterOf();
+    Assert.True(roster.ReadsAll);
+    Assert.Equal(["Registrar", "Condition checker", "Rights clerk", "Describer", "Transcriber"], roster.Agents.Select(a => a.Name).ToList());
+    Assert.Equal(0, roster.Working);
+    Assert.Equal(2, roster.Waiting);
+    Assert.Equal(1, roster.Paused);
+    Assert.Equal(0, roster.Unsponsored);
+    // The whole is the receipts added up.
+    long all = AgentTask.ToList().Sum(t => t.SpentMicros);
+    Assert.Equal(Money(all), roster.Today);
+    Assert.Equal(Money(all), roster.Month);
+
+    var registrar = roster.Agents.Single(a => a.Name == "Registrar");
+    Assert.Equal("Waiting", registrar.State);
+    Assert.Equal(1, registrar.Waiting);
+    Assert.Equal("Maeve Okonkwo", registrar.Sponsor);
+    Assert.Equal("", registrar.DailyLimit);
+
+    // The describer: what the meter has counted against its day, of what it may — and the piece that did not fit.
+    var describer = roster.Agents.Single(a => a.Name == "Describer");
+    Assert.Equal("Idle", describer.State);
+    Assert.Equal("$0.0120", describer.DailyLimit);
+    Assert.Equal(Money((long)(SpentAgainst("agent:" + TheDescriber, LlmBudgetWindow.Day) * 1000000m)), describer.AgainstLimit);
+    Assert.Equal(2, describer.Work30);
+    Assert.StartsWith("Its money ran out", AgentTask.Single(t => t.Id == morning.OutOfMoney).Outcome);
+
+    var transcriber = roster.Agents.Single(a => a.Name == "Transcriber");
+    Assert.Equal("Paused", transcriber.State);
+    Assert.Equal("Its title cards are being checked against the reels.", transcriber.PausedWhy);
+    Assert.Equal(1, transcriber.Work30);
+    Assert.Equal(1, transcriber.Corrections30);
+  }
+}
+
+[TestFixture]
+void VaultsWithConservators() {
+  Vaults();
+  var conservation = new Queue { Name = "Conservation", Position = 2 };
+  new QueueMember { Queue = conservation, Member = Person.Single(p => p.Email == "calla@lanternstreet.example") };
+}
+
+/// ⭐ WHERE A PROPOSAL WENT. The archive has conservators, so the checker's quarantine is put to their queue and not to
+/// the archivist who asked. The screens say so: the agent's page beside the tool, "who is waited on" by the queue's
+/// name, and the piece of work's own page.
+[Test(VaultsWithConservators)]
+void a_proposal_its_skill_sends_to_a_queue_is_shown_where_it_went() {
+  Guid task = Guid.Empty;
+  runas (Jonas) {
+    var reel = Reel.Single(r => r.Number == "0412");
+    var script = AgentScript.Of(
+      Says.Tool("Nitrate that smells sharp is decomposing.", Actions.Of(QuarantineReel), ReelAnd(reel, "why", "Decomposing nitrate.")),
+      Says.HandBack(new ConditionReport()));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var outcome = Check(reel);
+    task = outcome.Task;
+    Assert.True(outcome.Waiting);
+    Background.Settle();
+    // Not in the inbox of the archivist who asked.
+    Assert.Equal(0, Requests.Mine().Count);
+  }
+  runas (Maeve) {
+    // The agent's page: the tool it proposes, and where what it proposes is put.
+    var profile = AgentProfileOf(TheChecker)!;
+    Assert.Equal(["Quarantine the reel → the Conservation queue"], profile.Proposes.Select(t => t.Label + " → " + t.PutTo).ToList());
+    // Who is waited on: the queue, by its name — as a line and as the one "person" counted.
+    var board = WaitingBoardOf();
+    Assert.Equal(["Condition checker proposes: Quarantine the reel → the Conservation queue"], board.Lines.Select(l => l.Title + " → " + l.Who).ToList());
+    Assert.Equal(["the Conservation queue: 1"], board.People.Select(p => p.Name + ": " + p.Count.ToString()).ToList());
+    // The piece of work's own page.
+    var work = InspectAgentWork(task)!;
+    Assert.StartsWith("Waiting for the Conservation queue since ", work.Proposals[0].Decided);
+    Assert.StartsWith("Waiting on a decision from the Conservation queue", work.Waiting);
+  }
+}

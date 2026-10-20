@@ -1,0 +1,495 @@
+// Four screens: everybody the agents are waiting on; the standing rules that let agents do more alone; what the
+// work cost against each limit; and who may do what.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Ui;
+
+// ── waiting on people ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ EVERYBODY THE AGENTS ARE WAITING ON: each person with how many requests they hold and how long the oldest has
+/// waited, then every request — what is asked, by which agent, about what, since when, and whether it is late. A
+/// request opens in the inbox (`request`), where it is answered, reminded, passed on or called off.
+///
+/// In a test: `Assert.Visible("2 requests", within: "Waited on Jonas Reiter")`, `Ui.Click("ConditionChecker proposes: Quarantine the reel")`.
+[Composable]
+public component PeopleAgentsWaitOn(string at = "/agents", Func<Guid, string>? request = null) {
+  WaitingBoard? board = null;
+  bool loaded = false;
+  string problem = "";
+
+  action Load() {
+    try { board = WaitingBoardOf(); problem = ""; } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+
+  render {
+    Stack(gap: 6, w: "100%", maxW: "860px", label: "People waited on") {
+      if (!loaded) { ListSkeleton("Loading who is waited on"); }
+      if (loaded && board == null) { Alert("Who is waited on could not be shown: " + problem, tone: Tone.Danger); }
+      if (board != null) {
+        Stack(gap: 2, label: "In all") {
+          Text(board.Lines.Count == 0 ? "Nobody is being waited on" : board.People.Count == 1 ? "The agents wait on one person" : "The agents wait on " + board.People.Count.ToString() + " people",
+               fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", lineHeight: "1.2");
+          if (board.Lines.Count > 0) {
+            Text((board.Lines.Count == 1 ? "One request is open" : board.Lines.Count.ToString() + " requests are open") + ". The oldest has waited " + board.Oldest + "."
+                 + (board.Late == 0 ? "" : board.Late == 1 ? " One is late." : " " + board.Late.ToString() + " are late."),
+                 fontSize: FontSize.Body, color: board.Late > 0 ? Colors.Danger.Text : Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+          }
+          if (board.Lines.Count == 0) {
+            Text(board.WorkWaiting == 0 ? "No agent has put anything to a person that is still open."
+                                        : "No request is open that you may read. " + (board.WorkWaiting == 1 ? "One piece of work waits all the same" : board.WorkWaiting.ToString() + " pieces of work wait all the same") + ": see Work, narrowed to Waiting.",
+                 fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+          }
+          if (!board.OverseesAll && board.Lines.Count > 0) { Text("You see the requests put to you, held by you or asked for you.", fontSize: FontSize.Label, color: Colors.TextMuted); }
+        }
+
+        if (board.People.Count > 0) {
+          Row(gap: 3, wrap: Wrapping.Wrap, align: Align.Stretch, label: "By person") {
+            foreach (var p in board.People) {
+              Stack(gap: 1, px: 4, py: 3, minW: "12rem", bg: Colors.Surface, borderW: 1, border: p.Late > 0 ? Colors.Danger.Muted : Colors.Border, rounded: Radius.Lg, label: "Waited on " + p.Name) {
+                Text(p.Name, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold);
+                Text(p.Count == 1 ? "1 request" : p.Count.ToString() + " requests", fontSize: FontSize.Label, color: Colors.TextSecondary);
+                Text("The oldest for " + p.Oldest, fontSize: FontSize.Caption, color: Colors.TextMuted);
+                if (p.Late > 0) { Text(p.Late == 1 ? "1 late" : p.Late.ToString() + " late", fontSize: FontSize.Caption, fontWeight: FontWeight.Medium, color: Colors.Danger.Text); }
+              }
+            }
+          }
+          Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Requests") {
+            foreach (var line in board.Lines) { WaitedRow(line, at, request, line.Request == board.Lines[0].Request); }
+          }
+          Text("Answering, reminding, passing a request on and calling it off are done on the request itself.", fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.5", maxW: "66ch");
+        }
+      }
+    }
+  }
+}
+
+[Composable]
+component WaitedRow(WaitedLine line, string at, Func<Guid, string>? request, bool first) {
+  render {
+    Row(gap: 3, px: 4, py: 3, align: Align.Start, borderTW: first ? 0 : 1, border: Colors.Border, label: "Request: " + line.Title) {
+      Box(pt: 1) { Lamp(lit: true, live: !line.Late, tone: line.Late ? Tone.Danger : Tone.Default, waiting: !line.Late); }
+      Stack(gap: 1, grow: 1, minW: "0") {
+        if (request != null) { TextLink(line.Title, to: request(line.Request)); }
+        if (request == null) { Text(line.Title, fontSize: FontSize.Body, fontWeight: FontWeight.Medium); }
+        Text("Asked of " + line.Who + (line.WentOnTo == "" ? "" : ", and gone on to " + line.WentOnTo) + ", " + line.For + " ago.", fontSize: FontSize.Label, color: Colors.TextSecondary);
+        Row(gap: 1, align: Align.Baseline, wrap: Wrapping.Wrap) {
+          Text("By " + line.AskedBy + (line.About == "" ? "." : ", about"), fontSize: FontSize.Label, color: Colors.TextMuted);
+          if (line.About != "" && line.Work != null) {
+            Link(href: WorkHref(at, line.Work!.Value), label: line.About) { Text(line.About, fontSize: FontSize.Label, fontWeight: FontWeight.Medium, color: Colors.Primary.Text); }
+          }
+          if (line.About != "" && line.Work == null) { Text(line.About + ".", fontSize: FontSize.Label, color: Colors.TextMuted); }
+        }
+        Text("Since " + line.Since + "." + (line.Due == "" ? "" : " " + line.Due) + (line.Reminders == 0 ? "" : line.Reminders == 1 ? " Reminded once." : " Reminded " + line.Reminders.ToString() + " times."),
+             fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+      if (line.Late) { Badge("Late", tone: Tone.Danger); }
+    }
+  }
+}
+
+// ── standing rules ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ WHAT AGENTS DO ALONE BECAUSE A PERSON SAID SO: every standing rule with who gave it, for whose work, how often
+/// it has let a tool run and when it last did — and Take back, for whoever gave it or supervises. Under it, what a
+/// rule could still change, with "From now on, alone" for whoever the app admits.
+///
+/// In a test: `Ui.Click("Take back")`, fill "Why is it taken back?", `Ui.Click("Take it back")`.
+[Composable]
+public component AgentStandingRules(string at = "/agents") {
+  RulesBoard? board = null;
+  bool loaded = false;
+  string problem = "";
+  string notice = "";
+  bool showPast = false;
+
+  action Load() {
+    try { board = RulesBoardOf(); problem = ""; } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+  action Changed(string said) { notice = said; Load(); }
+  action TogglePast() { showPast = !showPast; }
+
+  render {
+    Stack(gap: 6, w: "100%", maxW: "860px", label: "Autonomy") {
+      if (!loaded) { ListSkeleton("Loading the rules"); }
+      if (loaded && board == null) { Alert("The rules could not be shown: " + problem, tone: Tone.Danger); }
+      if (board != null) {
+        Stack(gap: 2, label: "In all") {
+          Text(board.Standing.Count == 0 ? "No standing rules" : board.Standing.Count == 1 ? "One standing rule" : board.Standing.Count.ToString() + " standing rules",
+               fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", lineHeight: "1.2");
+          Text("A standing rule is a person saying \"from now on, do this alone\" about something an agent would otherwise propose first. It widens nothing past what the agent's declaration allows, and whoever gave it can take it back.",
+               fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+        }
+        if (notice != "") { Alert(notice, tone: Tone.Success); }
+
+        if (board.Standing.Count == 0) {
+          EmptyState("Every agent does only what its declaration says", body: "A rule is given on a proposal (\"approve, and from now on alone\") or below.");
+        }
+        if (board.Standing.Count > 0) {
+          Stack(gap: 3, label: "Standing") {
+            foreach (var rule in board.Standing) { RuleCard(rule, at, Changed); }
+          }
+        }
+
+        if (board.TakenBack.Count > 0) {
+          Stack(gap: 3, label: "Taken back") {
+            Row(gap: 3, align: Align.Center) {
+              Text("Taken back", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+              Button(showPast ? "Hide" : "Show " + board.TakenBack.Count.ToString(), onPress: TogglePast, tone: Tone.Ghost, size: Size.Sm);
+            }
+            if (showPast) { foreach (var rule in board.TakenBack) { RuleCard(rule, at, Changed); } }
+          }
+        }
+
+        Stack(gap: 3, label: "What a rule can change") {
+          Stack(gap: 1) {
+            Text("What a rule can change", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Text(board.MayWiden ? (board.MayWidenForAll ? "You may give a rule for the work an agent does for you, or for the work it does for anybody."
+                                                         : "You may give a rule for the work an agent does for you.")
+                                : "Giving a rule is for whoever the app trusts with it. You read what could be changed.",
+                 fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+          }
+          if (board.CouldWiden.Count == 0) { Text("No agent proposes anything first, so there is nothing for a rule to change.", fontSize: FontSize.Body, color: Colors.TextSecondary); }
+          if (board.CouldWiden.Count > 0) {
+            Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg) {
+              foreach (var w in board.CouldWiden) { WidenRow(w, at, board.MayWiden, board.MayWidenForAll, w.Agent + w.Action + w.Skill == board.CouldWiden[0].Agent + board.CouldWiden[0].Action + board.CouldWiden[0].Skill, Changed); }
+            }
+          }
+          if (board.Fixed > 0) {
+            Text((board.Fixed == 1 ? "One tool is" : board.Fixed.ToString() + " tools are") + " proposed every time or never run, because an agent's declaration says so. No rule changes that: it is changed where the agent is written.",
+                 fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.5", maxW: "66ch");
+          }
+        }
+      }
+    }
+  }
+}
+
+[Composable]
+component RuleCard(RuleLine rule, string at, Action<string> changed) {
+  bool asking = false;
+  string why = "";
+  string refused = "";
+
+  action Ask() { asking = true; why = ""; refused = ""; }
+  action Back() { asking = false; refused = ""; }
+  action TakeBack() {
+    refused = "";
+    try { TakeBackRule(rule.Id, why); asking = false; changed("Taken back. " + rule.AgentName + " proposes it again from its next step."); }
+    catch (Exception ex) { refused = ex.Message; }
+  }
+
+  render {
+    Stack(gap: 2, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Rule: " + rule.AgentName + " " + rule.Tool) {
+      Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+        TextLink(rule.AgentName, to: AgentHref(at, rule.Agent));
+        Text("may " + LowerFirstWord(rule.Tool) + " alone", fontSize: FontSize.Subhead, fontWeight: FontWeight.Medium, color: rule.TakenBack ? Colors.TextSecondary : Colors.OnSurface);
+      }
+      Text((rule.For == "" ? "For the work it does for anybody" : "For the work it does for " + rule.For) + (rule.Skill == "" ? "." : ", on " + rule.Skill.ToLower() + "."),
+           fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5");
+      Stack(gap: 1) {
+        Text("Given by " + rule.GivenBy + " on " + rule.When + (rule.FromProposal ? ", on a proposal." : "."), fontSize: FontSize.Label, color: Colors.TextMuted);
+        Text(rule.Used == 0 ? "It has not been used yet." : (rule.Used == 1 ? "Used once" : "Used " + rule.Used.ToString() + " times") + ", last on " + rule.LastUsed + ".",
+             fontSize: FontSize.Label, color: Colors.TextMuted, label: "How often");
+        if (rule.TakenBack) {
+          Text("Taken back by " + rule.TakenBackBy + " on " + rule.TakenBackWhen + (rule.TakenBackWhy == "" ? "." : ": " + rule.TakenBackWhy), fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.45", maxW: "66ch");
+        }
+      }
+      if (rule.MayTakeBack && !asking) { Row { Button("Take back", onPress: Ask, size: Size.Sm); } }
+      if (asking) {
+        Stack(gap: 3, pt: 2, label: "Taking back") {
+          TextAreaField("Why is it taken back?", value: why, rows: 2, hint: "Kept with the rule.");
+          if (refused != "") { Alert(refused, tone: Tone.Danger); }
+          Row(gap: 2, justify: Justify.End) {
+            Button("Back", onPress: Back, tone: Tone.Ghost);
+            Button("Take it back", onPress: TakeBack, tone: Tone.Danger, disabled: why.Trim() == "");
+          }
+        }
+      }
+    }
+  }
+}
+
+string LowerFirstWord(string words) { return words.Length == 0 ? words : words.Substring(0, 1).ToLower() + words.Substring(1); }
+
+[Composable]
+component WidenRow(WidenLine line, string at, bool mayWiden, bool forAll, bool first, Action<string> changed) {
+  string refused = "";
+  action ForMe() {
+    refused = "";
+    try { AllowAloneFromManagement(line.Agent, line.Action, line.Skill, false); changed(line.AgentName + " may " + LowerFirstWord(line.Tool) + " alone from now on, for the work it does for you."); }
+    catch (Exception ex) { refused = ex.Message; }
+  }
+  action ForAll() {
+    refused = "";
+    try { AllowAloneFromManagement(line.Agent, line.Action, line.Skill, true); changed(line.AgentName + " may " + LowerFirstWord(line.Tool) + " alone from now on, for anybody's work."); }
+    catch (Exception ex) { refused = ex.Message; }
+  }
+  render {
+    Stack(gap: 2, px: 4, py: 3, borderTW: first ? 0 : 1, border: Colors.Border, label: "Could change: " + line.AgentName + " " + line.Tool) {
+      Row(gap: 3, align: Align.Center, justify: Justify.Between, wrap: Wrapping.Wrap) {
+        Stack(gap: 1, minW: "0", grow: 1) {
+          Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+            Text(line.AgentName, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold);
+            Text(line.Tool, fontSize: FontSize.Body);
+          }
+          Text("It " + line.Does + ". Proposed first, on " + line.SkillWords.ToLower() + "."
+               + (line.CoveredForAll ? " A rule already lets it, for anybody's work." : line.CoveredForMe ? " A rule already lets it, for your work." : ""),
+               fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.45");
+        }
+        if (mayWiden && !line.CoveredForAll) {
+          Row(gap: 2, wrap: Wrapping.Wrap) {
+            if (!line.CoveredForMe) { Button("Alone, for my work", onPress: ForMe, size: Size.Sm); }
+            if (forAll) { Button("Alone, for everybody", onPress: ForAll, size: Size.Sm); }
+          }
+        }
+      }
+      if (refused != "") { Alert(refused, tone: Tone.Danger); }
+    }
+  }
+}
+
+// ── spending ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ WHAT THE AGENTS' WORK COST: in all, and by agent, skill, person and what it was charged to; every limit with
+/// what the meter has counted against it; and the work a limit stopped. Summed from the receipts and the meter as
+/// whoever is looking may read them — no model is asked anything.
+///
+/// In a test: `Ui.Click("Today")`, `Assert.TextIs("$0.0120", within: "spent on work started this month")`.
+[Composable]
+public component AgentSpending(string at = "/agents") {
+  SpendingBoard? board = null;
+  bool loaded = false;
+  string problem = "";
+  string period = "month";
+
+  action Load() {
+    try { board = SpendingBoardOf(period); problem = ""; } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+  action Show(string p) { period = p; Load(); }
+
+  render {
+    Stack(gap: 6, w: "100%", maxW: "860px", label: "Spending") {
+      if (!loaded) { ListSkeleton("Loading what was spent"); }
+      if (loaded && board == null) { Alert("What was spent could not be shown: " + problem, tone: Tone.Danger); }
+      if (board != null) {
+        Stack(gap: 3, label: "In all") {
+          Box(w: "100%", overflowX: Overflow.Auto, label: "Period") {
+            Tabs {
+              Tab("Today", selected: period == "today", onPress: () => Show("today"));
+              Tab("Last 7 days", selected: period == "week", onPress: () => Show("week"));
+              Tab("This month", selected: period == "month", onPress: () => Show("month"));
+              Tab("All time", selected: period == "all", onPress: () => Show("all"));
+            }
+          }
+          Metric("spent on work started " + board.PeriodWords, text: board.Total);
+          Text((board.Pieces == 0 ? "No work" : board.Pieces == 1 ? "1 piece of work" : board.Pieces.ToString() + " pieces of work") + ", "
+               + (board.ModelCalls == 1 ? "1 model call" : board.ModelCalls.ToString() + " model calls") + "." + (board.ReadsAll ? "" : " You see the work you asked for."),
+               fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", label: "How much work");
+        }
+
+        if (board.Pieces == 0) {
+          EmptyState("Nothing was spent " + board.PeriodWords, body: "What each piece of work costs is counted as its models answer.");
+        }
+        if (board.Pieces > 0) {
+          Breakdown("By agent", board.ByAgent, at);
+          Breakdown("By skill", board.BySkill, at);
+          Breakdown("By who it was for", board.ByPerson, at);
+          if (board.ByProcess.Count > 0) { Breakdown("By process", board.ByProcess, at); }
+          if (board.ByCharge.Count > 0) { Breakdown("By what it was charged to", board.ByCharge, at); }
+        }
+
+        Stack(gap: 3, label: "Limits") {
+          Stack(gap: 1) {
+            Text("Limits", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Text("Room is held against a limit before a model is called, so nothing is spent past one. Counted now, whatever period is shown above.", fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+          }
+          if (board.Limits.Count == 0) { Text("No agent has a limit for a day, and the app has set no budget. Each piece of work is still held to its own.", fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch"); }
+          if (board.Limits.Count > 0) {
+            Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg) {
+              foreach (var l in board.Limits) {
+                Row(gap: 3, px: 4, py: 3, align: Align.Center, wrap: Wrapping.Wrap, borderTW: l.On == board.Limits[0].On ? 0 : 1, border: Colors.Border, label: "Limit: " + l.On) {
+                  Stack(gap: 1, grow: 1, minW: "min(100%, 14rem)") {
+                    Text(l.On, fontSize: FontSize.Body, fontWeight: FontWeight.Medium);
+                    if (l.Reached) { Text("Reached. Calls that would pass it are refused.", fontSize: FontSize.Caption, color: Colors.Danger.Text); }
+                    if (l.Refused > 0) { Text(l.Refused == 1 ? "It refused 1 call this period." : "It refused " + l.Refused.ToString() + " calls this period.", fontSize: FontSize.Caption, color: Colors.Danger.Text); }
+                  }
+                  Stack(gap: 1, align: Align.End, shrink: 0) {
+                    Text(l.Against + " of " + l.Limit, fontSize: FontSize.Label, color: l.Reached ? Colors.Danger.Text : Colors.OnSurface);
+                    Box(w: "11rem") { ProgressBar(percent: l.Percent, tone: l.Reached ? Tone.Danger : Tone.Primary, label: "Against the limit"); }
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (board.Stopped.Count > 0) {
+          Stack(gap: 3, label: "Stopped at a limit") {
+            Text("Stopped at a limit", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg) {
+              foreach (var s in board.Stopped) {
+                Row(gap: 3, px: 4, py: 3, align: Align.Start, borderTW: s.Task == board.Stopped[0].Task ? 0 : 1, border: Colors.Border, label: "Stopped: " + s.AgentName) {
+                  Stack(gap: 1, grow: 1, minW: "0") {
+                    TextLink(s.About == "" ? s.AgentName + "'s work" : s.About, to: WorkHref(at, s.Task));
+                    Text(s.Said, fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.45", maxW: "62ch");
+                    Text(s.AgentName + ", started " + s.When, fontSize: FontSize.Caption, color: Colors.TextMuted);
+                  }
+                  Text(s.Cost, fontSize: FontSize.Label, color: Colors.TextMuted);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// One breakdown: a line a key, the largest first, each with a bar for its share of the largest.
+[Composable]
+component Breakdown(string title, List<SpendLine> lines, string at) {
+  render {
+    Stack(gap: 3, w: "100%", maxW: "38rem", label: title) {
+      Text(title, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+      Stack(gap: 3) {
+        foreach (var l in lines) {
+          Stack(gap: 1, label: title + ": " + l.Label) {
+            Row(gap: 3, align: Align.Baseline, justify: Justify.Between) {
+              if (l.Agent != "") { TextLink(l.Label, to: AgentHref(at, l.Agent)); }
+              if (l.Agent == "") { Text(l.Label, fontSize: FontSize.Body, minW: "0"); }
+              Text(l.Spent, fontSize: FontSize.Body, fontWeight: FontWeight.Medium, shrink: 0);
+            }
+            ProgressBar(percent: l.Share, tone: Tone.Primary, label: l.Label + " share");
+            Text(l.Pieces == 1 ? "1 piece of work" : l.Pieces.ToString() + " pieces of work", fontSize: FontSize.Caption, color: Colors.TextMuted);
+          }
+        }
+      }
+    }
+  }
+}
+
+// ── roles ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ MORE ROLES, FROM THE KITS BESIDE — a kit or an app that has a policy about agents of its own adds its line to
+/// the Roles screen: `[Contribution("Process roles")] component ProcessRoles() : AgentRolesBeside { live var follows =
+/// FollowsProcesses; render { RoleRow("FollowsProcesses", "Osysharp.Processes", "Open the list of process runs, and a
+/// run.", "Nobody", follows); } }`.
+/// need: add a role to the agents' roles screen, list my kit's policy beside the agents' policies
+/// e.g. `AgentRolesBeside();`
+[Slot] public abstract component AgentRolesBeside();
+
+/// One policy on the Roles screen: its name, the kit that declares it, what it admits somebody to, who it admits
+/// until the app says otherwise, and whether it admits whoever is looking.
+[Composable]
+public component RoleRow(string policy, string kit, string admits, string untilSaid, bool you, bool mayAskWho = false) {
+  List<string> who = [];
+  bool asked = false;
+  string refused = "";
+  action AskWho() {
+    refused = "";
+    try { who = PeopleAdmittedTo(policy); asked = true; } catch (Exception ex) { refused = ex.Message; }
+  }
+  action Hide() { asked = false; }
+  render {
+    Stack(gap: 1, px: 4, py: 3, borderTW: 1, border: Colors.Border, label: "Role " + policy) {
+      Row(gap: 3, align: Align.Start, justify: Justify.Between, wrap: Wrapping.Wrap) {
+        Stack(gap: 1, grow: 1, minW: "min(100%, 18rem)") {
+          Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+            Text(policy, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold);
+            Text(kit, fontSize: FontSize.Caption, color: Colors.TextMuted);
+          }
+          Text(admits, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.45", maxW: "62ch");
+          Text("Until the app says otherwise: " + LowerFirstWord(untilSaid) + ".", fontSize: FontSize.Caption, color: Colors.TextMuted);
+        }
+        Stack(gap: 1, align: Align.End, shrink: 0) {
+          Badge(you ? "You may" : "Not you", tone: you ? Tone.Success : Tone.Default);
+          if (mayAskWho && !asked) { Button("Who?", onPress: AskWho, tone: Tone.Ghost, size: Size.Sm); }
+          if (asked) { Button("Hide", onPress: Hide, tone: Tone.Ghost, size: Size.Sm); }
+        }
+      }
+      if (refused != "") { Alert(refused, tone: Tone.Danger); }
+      if (asked) {
+        Text(who.Count == 0 ? "It admits nobody." : "It admits " + string.Join(", ", who) + ".", fontSize: FontSize.Label, lineHeight: "1.5", maxW: "66ch", label: "Who " + policy + " admits");
+      }
+    }
+  }
+}
+
+/// ⭐ WHO MAY DO WHAT: every policy about the app's agents — being in charge, the two that are never implied, and the
+/// kits beside — with what each admits, who it admits until the app says otherwise, and whether it admits whoever is
+/// looking; then each agent with who answers for it. Whoever supervises or audits can ask who a policy admits.
+/// It changes nothing: who holds a role is said in the app's source.
+///
+/// In a test: `Assert.Visible("You may", within: "Role PausesAgents")`, `Ui.Click("Who?", within: "Role TeachesAgents")`.
+[Composable]
+public component AgentRoles(string at = "/agents") {
+  RolesBoard? board = null;
+  bool loaded = false;
+  string problem = "";
+
+  action Load() {
+    try { board = RolesBoardOf(); problem = ""; } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+
+  render {
+    Stack(gap: 6, w: "100%", maxW: "860px", label: "Roles") {
+      if (!loaded) { ListSkeleton("Loading the roles"); }
+      if (loaded && board == null) { Alert("The roles could not be shown: " + problem, tone: Tone.Danger); }
+      if (board != null) {
+        Stack(gap: 2, label: "In all") {
+          Text("Who may do what", fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", lineHeight: "1.2");
+          Text("Each line is a policy the app answers in its own source. This page shows what each admits somebody to, and whether it admits you, " + board.You + ". It changes nothing.",
+               fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+        }
+        RoleGroup("In charge of the agents", "Supervising brings sponsoring, pausing, reading every receipt and deciding other people's proposals with it, until the app gives one of those to somebody else. The rest is answered by name.", board.InCharge, board.MayAskWho);
+        RoleGroup("Never implied", "Reading what work said, and erasing it, are answered by name or not at all.", board.Apart, board.MayAskWho);
+        Stack(gap: 2, label: "The kits beside") {
+          Stack(gap: 1) {
+            Text("The kits beside", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Text("Money and requests have policies of their own, in the kits that own them.", fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+          }
+          Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden) {
+            foreach (var r in board.Beside) { RoleRow(r.Policy, r.Kit, r.Admits, r.UntilSaid, r.You, board.MayAskWho); }
+            AgentRolesBeside();
+          }
+        }
+        Stack(gap: 2, label: "Who answers for each agent") {
+          Text("Who answers for each agent", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          Stack(gap: 1) {
+            foreach (var s in board.Sponsors) {
+              Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap, label: "Sponsor of " + s.Name) {
+                TextLink(s.Name, to: AgentHref(at, s.Agent));
+                Text(s.Sponsor == "" ? "Nobody yet, so it does not run." : s.Sponsor, fontSize: FontSize.Body, color: s.Sponsor == "" ? Colors.Danger.Text : Colors.TextSecondary);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+[Composable]
+component RoleGroup(string title, string means, List<RoleLine> roles, bool mayAskWho) {
+  render {
+    Stack(gap: 2, label: title) {
+      Stack(gap: 1) {
+        Text(title, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+        Text(means, fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+      }
+      Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, overflow: Overflow.Hidden) {
+        foreach (var r in roles) { RoleRow(r.Policy, r.Kit, r.Admits, r.UntilSaid, r.You, mayAskWho); }
+      }
+    }
+  }
+}

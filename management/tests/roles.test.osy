@@ -1,0 +1,220 @@
+// Osysharp.Agents.Management — who the screens' functions answer, and what each person is given: the bookkeeper every
+// figure and no words; an archivist her own work; calling off and handing over for whoever the work is for or
+// supervises; and who holds a role, told only to those in charge.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Management;
+using Osysharp.Workflow;
+using Archive;
+
+/// ⭐ WHO HOLDS A ROLE is a map of whom to ask, or to imitate: it is told to whoever supervises or audits the agents,
+/// and to nobody else — and never lists an agent's own account.
+[Test(Vaults)]
+void who_holds_a_role_is_told_only_to_those_in_charge() {
+  runas (Priya) {
+    var refused = Assert.Throws<AgentRefused>(() => WhoHolds("AuditsAgents"));
+    Assert.Equal("Who holds a role is told to whoever supervises or audits the agents.", refused.Message);
+    Assert.False(RolesBoardOf().MayAskWho);
+  }
+  runas (Desmond) { Assert.Throws<AgentRefused>(() => WhoHolds("SupervisesAgents")); }
+  runas (Calla) { Assert.Throws<AgentRefused>(() => WhoHolds("TeachesAgents")); }
+  runas (Maeve) {
+    Assert.True(RolesBoardOf().MayAskWho);
+    Assert.Equal(["Maeve Okonkwo"], WhoHolds("SupervisesAgents"));
+    Assert.Equal(["Maeve Okonkwo"], WhoHolds("PausesAgents"));
+    Assert.Equal(["Calla Whitlock"], WhoHolds("TeachesAgents"));
+    Assert.Equal(["Ingrid Solberg"], WhoHolds("AuditsAgents"));
+    Assert.Equal(["Jonas Reiter", "Maeve Okonkwo", "Priya Nair"], WhoHolds("WidensAgentAutonomy"));
+    // Everybody who gives the agents work.
+    Assert.Equal(["Jonas Reiter", "Maeve Okonkwo", "Priya Nair"], WhoHolds("UsesAgents"));
+    Assert.Equal(0, WhoHolds("NoSuchPolicy").Count);
+  }
+  runas (Ingrid) { Assert.Equal(["Desmond Achebe", "Ingrid Solberg", "Maeve Okonkwo"], WhoHolds("ReadsAllAgentWork")); }
+  // What the table says of each person is what the policies say.
+  runas (Calla) {
+    var mine = RolesBoardOf();
+    Assert.True(mine.InCharge.Single(r => r.Policy == "TeachesAgents").You);
+    Assert.False(mine.InCharge.Single(r => r.Policy == "SupervisesAgents").You);
+    Assert.False(mine.InCharge.Single(r => r.Policy == "PausesAgents").You);
+    Assert.Equal("Maeve Okonkwo", mine.Sponsors.Single(s => s.Name == "Registrar").Sponsor);
+  }
+}
+
+/// ⭐ EVERY FIGURE, AND NO WORDS. The bookkeeper's screens count all the work — the same sums the head of collections
+/// sees — and say nothing of what any of it was about. An archivist's count her own.
+[Test(Vaults)]
+void the_bookkeeper_reads_every_figure_and_an_archivist_her_own() {
+  var morning = AMorningAtTheArchive();
+  var whole = "";
+  runas (Maeve) {
+    var spent = SpendingBoardOf("month");
+    whole = spent.Total;
+    Assert.Equal("$0.0134", whole);
+    Assert.Equal(6, spent.Pieces);
+    Assert.Equal(["Describer", "Rights clerk", "Condition checker", "Transcriber", "Registrar"], spent.ByAgent.Select(l => l.Label).ToList());
+    Assert.Equal(100, spent.ByAgent[0].Share);
+    Assert.Equal("$0.0088", spent.ByPerson.Single(l => l.Label == "Priya Nair").Spent);
+    Assert.Equal("$0.0046", spent.ByPerson.Single(l => l.Label == "Jonas Reiter").Spent);
+    Assert.Equal("Describer, a day", spent.Limits.Single().On);
+    Assert.Equal("$0.0084", spent.Limits.Single().Against);
+    Assert.Equal(2, spent.Stopped.Count);
+    Assert.Equal("Accession of reel 0412", WorkBoardOf(new WorkFilter { Status = "waiting" }).Lines.Single().About);
+  }
+  runas (Desmond) {
+    var spent = SpendingBoardOf("month");
+    Assert.True(spent.ReadsAll);
+    Assert.Equal(whole, spent.Total);
+    Assert.Equal("$0.0046", spent.ByPerson.Single(l => l.Label == "Jonas Reiter").Spent);
+    // The work that a limit stopped is listed with what it cost — and not with what it was about, or how it ended.
+    Assert.Equal(2, spent.Stopped.Count);
+    Assert.True(spent.Stopped.All(s => s.About == ""));
+    Assert.True(spent.Stopped.All(s => s.Said == "It was stopped before it finished: its money or its turns ran out."));
+    var work = WorkBoardOf(new WorkFilter { Pieces = true });
+    Assert.True(work.ReadsAll);
+    Assert.Equal(6, work.Matching);
+    Assert.True(work.Lines.All(l => l.About == "" && l.Waits == "" && l.Ended == ""));
+    Assert.Equal("$0.0040", work.Lines.Single(l => l.AgentName == "Rights clerk").Cost);
+    Assert.Equal("Jonas Reiter", work.Lines.Single(l => l.AgentName == "Registrar").For);
+    // Nothing is his to do to any of it.
+    var controls = WorkControlsOf(morning.Accession)!;
+    Assert.False(controls.MayStop);
+    Assert.False(controls.MayHand);
+    Assert.False(controls.MayRetry);
+    Assert.Equal("", controls.About);
+    Assert.False(AgentProfileOf(TheDescriber).MayPause);
+  }
+  runas (Priya) {
+    var spent = SpendingBoardOf("month");
+    Assert.False(spent.ReadsAll);
+    Assert.Equal("$0.0088", spent.Total);
+    Assert.Equal(3, WorkBoardOf(new WorkFilter()).Matching);
+    Assert.Null(WorkControlsOf(morning.Accession));
+    Assert.Equal("$0.0088", RosterOf().Today);
+  }
+  // The curator teaches the agents: she reads every piece of work, with what it said — and presses nothing on it.
+  runas (Calla) {
+    Assert.Equal(4, WorkBoardOf(new WorkFilter()).Matching);
+    Assert.Equal("Accession of reel 0412", AgentTask.Single(t => t.Id == morning.Accession).About);
+    var controls = WorkControlsOf(morning.Accession);
+    Assert.True(controls == null || (!controls!.MayStop && !controls!.MayHand && !controls!.MayRetry));
+  }
+}
+
+/// ⭐ CALLING OFF AND HANDING OVER are for whoever the work is for, whoever gave it, and whoever supervises — and
+/// handing over needs somebody to hand it to.
+[Test(Vaults)]
+void calling_off_and_handing_over_are_for_whoever_the_work_is_for_or_supervises() {
+  var morning = AMorningAtTheArchive();
+  // Another archivist: the accession is not hers to see, so not hers to stop or hand on.
+  runas (Priya) {
+    Assert.Throws<AgentRefused>(() => StopWorkFromManagement(morning.Accession, "No."));
+    Assert.Throws<AgentRefused>(() => HandWorkToPerson(morning.Accession, Priya.Id, "I will take it."));
+  }
+  // The bookkeeper reads its receipt, and that is all.
+  runas (Desmond) {
+    Assert.Denied(() => { StopWorkFromManagement(morning.Accession, "Too dear."); UnitOfWork.Commit(); });
+    UnitOfWork.Discard();
+    var refused = Assert.Throws<AgentRefused>(() => HandWorkToPerson(morning.Accession, Desmond.Id, "Too dear."));
+    Assert.Equal("This piece of work is not yours to hand on.", refused.Message);
+  }
+  runas (Jonas) {
+    Assert.Equal(AgentTaskStatus.Waiting, AgentTask.Single(t => t.Id == morning.Accession).Status);
+    // His own. It is handed to a person — never to an agent's own account — and with a note.
+    Assert.Throws<ValidationException>(() => HandWorkToPerson(morning.Accession, Maeve.Id, " "));
+    var agent = Assert.Throws<ValidationException>(() => HandWorkToPerson(morning.Accession, Actor.Of<Describer>().Id, "Describe it instead."));
+    Assert.Equal("That is an agent's own account. Hand it to a person.", agent.Message);
+    var controls = WorkControlsOf(morning.Accession)!;
+    Assert.True(controls.MayStop);
+    Assert.True(controls.MayHand);
+    Assert.Equal(["Calla Whitlock", "Desmond Achebe", "Ingrid Solberg", "Jonas Reiter (you)", "Maeve Okonkwo", "Priya Nair"], controls.People.Select(p => p.Name).ToList());
+    HandWorkToPerson(morning.Accession, Maeve.Id, "It needs the head's eye: the reel may be decomposing.");
+    UnitOfWork.Commit();
+    // Once: it is with her until she answers.
+    var twice = Assert.Throws<AgentRefused>(() => HandWorkToPerson(morning.Accession, Priya.Id, "Or Priya."));
+    Assert.Equal("It has been handed to somebody already, and they have not answered yet.", twice.Message);
+  }
+  LetItGoOn();
+  runas (Jonas) {
+    var receipt = AgentTask.Single(t => t.Id == morning.Accession);
+    Assert.Equal(AgentTaskStatus.Cancelled, receipt.Status);
+    Assert.StartsWith("Handed to Maeve Okonkwo: It needs the head's eye", receipt.StopWhy);
+    Assert.Equal(0, Trajectory.StillGoing(morning.Accession).Count);
+    var after = WorkControlsOf(morning.Accession)!;
+    Assert.False(after.MayStop);
+    Assert.Equal("Maeve Okonkwo", after.HandedTo);
+    // His own, called off: his to try again.
+    Assert.True(after.MayRetry);
+  }
+  runas (Maeve) {
+    var mine = Requests.Mine().Single();
+    Assert.Equal("Take over from Registrar: Accession of reel 0412", mine.Title);
+    Assert.Equal(Jonas.Id, mine.AskedBy!.Id);
+    AnswerRequest(mine, RequestAnswer.Choose(mine.Title == "" ? "" : JsonSerializer.Deserialize<List<RequestOption>>(mine.OptionsJson)[0].Key));
+  }
+  Background.Settle();
+  runas (Jonas) { Assert.Equal("", WorkControlsOf(morning.Accession)!.HandedTo); }
+}
+
+/// A standing rule is given from the screens by whoever the app admits — for their own work, or, by whoever
+/// supervises, for anybody's — and taken back by whoever gave it.
+[Test(Vaults)]
+void a_rule_is_given_and_taken_back_by_whoever_the_app_admits() {
+  var quarantine = Actions.Of(QuarantineReel).Name;
+  var skill = "Archive.CheckCondition";
+  runas (Desmond) { Assert.Denied(() => AllowAloneFromManagement(TheChecker, quarantine, skill, false)); }
+  runas (Priya) {
+    // An archivist says it for her own work, and not for everybody's.
+    var refused = Assert.Throws<AgentRefused>(() => AllowAloneFromManagement(TheChecker, quarantine, skill, true));
+    Assert.StartsWith("A rule for the work an agent does for anybody is for whoever supervises the agents.", refused.Message);
+    AllowAloneFromManagement(TheChecker, quarantine, skill, false);
+    UnitOfWork.Commit();
+    var board = RulesBoardOf();
+    Assert.True(board.MayWiden);
+    Assert.False(board.MayWidenForAll);
+    var rule = board.Standing.Single();
+    Assert.Equal("Condition checker", rule.AgentName);
+    Assert.Equal("Quarantine the reel", rule.Tool);
+    Assert.Equal("Priya Nair", rule.For);
+    Assert.Equal(0, rule.Used);
+    Assert.True(rule.MayTakeBack);
+    Assert.True(board.CouldWiden.Single().CoveredForMe);
+  }
+  // Jonas neither sees her rule nor takes it back.
+  runas (Jonas) {
+    Assert.Equal(0, RulesBoardOf().Standing.Count);
+    Assert.False(RulesBoardOf().CouldWiden.Single().CoveredForMe);
+  }
+  runas (Maeve) {
+    var rule = RulesBoardOf().Standing.Single();
+    Assert.True(rule.MayTakeBack);
+    Assert.Throws<ValidationException>(() => TakeBackRule(rule.Id, ""));
+    TakeBackRule(rule.Id, "Quarantines are the head's to see.");
+    UnitOfWork.Commit();
+    var board = RulesBoardOf();
+    Assert.Equal(0, board.Standing.Count);
+    Assert.Equal("Maeve Okonkwo", board.TakenBack.Single().TakenBackBy);
+  }
+}
+
+[TestFixture]
+void VaultsWhereAnAgentHoldsARole() {
+  Vaults();
+  // The archive's mistake: the transcriber's own account has been given the auditor's role.
+  new RoleGrant { Member = Actor.Of<Transcriber>(), Role = ArchiveRole.Auditor };
+}
+
+/// An agent's own account is never listed as holding a role — though the app's policy admits it. Who audits the
+/// agents is a list of people.
+[Test(VaultsWhereAnAgentHoldsARole)]
+void an_agents_own_account_is_not_listed_as_holding_a_role() {
+  runas (Maeve) {
+    // Positive control: the policy does admit the account.
+    Assert.True(Security.Authorize(Actor.Of<Transcriber>(), AuditsAgents));
+    Assert.Equal(["Ingrid Solberg"], WhoHolds("AuditsAgents"));
+  }
+}

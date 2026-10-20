@@ -1,0 +1,119 @@
+// What the Roles screen reads: every policy that says who may do what with the app's agents — in the Agents kit and
+// in the kits beside it — with what each admits, who it admits until the app says otherwise, and whether it admits
+// whoever is looking. The screen changes nothing: who holds a role is the app's own to say, in its source.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Llm;
+
+/// One policy, as a line of the table.
+public class RoleLine {
+  /// The policy, as an app writes it, and the kit that declares it.
+  public string Policy = "";
+  public string Kit = "";
+  /// What it admits somebody to, and who it admits until the app says otherwise.
+  public string Admits = "";
+  public string UntilSaid = "";
+  /// It admits whoever is looking.
+  public bool You = false;
+}
+
+/// One agent and who answers for it.
+public class SponsorLine {
+  public string Agent = "";
+  public string Name = "";
+  public string Sponsor = "";
+}
+
+/// Everything the Roles screen shows.
+public class RolesBoard {
+  public string You = "";
+  public List<RoleLine> InCharge = [];
+  public List<RoleLine> Apart = [];
+  public List<RoleLine> Beside = [];
+  public List<SponsorLine> Sponsors = [];
+  /// Whoever is looking may ask who a role admits.
+  public bool MayAskWho = false;
+}
+
+RoleLine RoleOf(string policy, string kit, string admits, string untilSaid, bool you) {
+  return new RoleLine { Policy = policy, Kit = kit, Admits = admits, UntilSaid = untilSaid, You = you };
+}
+
+/// ⭐ WHO MAY DO WHAT — every policy about the app's agents, and whether it admits whoever is looking.
+[Server, Authorize(IsAuthenticated)]
+public RolesBoard RolesBoardOf() {
+  var me = Session.CurrentUser;
+  var board = new RolesBoard { You = Named(me) };
+  board.MayAskWho = Security.Authorize(me, SupervisesAgents) || Security.Authorize(me, AuditsAgents);
+  const string supervises = "Whoever supervises";
+  board.InCharge = [
+    RoleOf("UsesAgents", "Osysharp.Agents", "Give agents work, and read the work they asked for.", "Nobody", Security.Authorize(me, UsesAgents)),
+    RoleOf("SupervisesAgents", "Osysharp.Agents", "Call off any work, answer any question an agent asked, take back any standing rule, correct any work, and read every piece of work. Naming sponsors, pausing, reading every receipt and deciding other people's proposals come with it until the app gives one to somebody else.", "Nobody", Security.Authorize(me, SupervisesAgents)),
+    RoleOf("SponsorsAgents", "Osysharp.Agents", "Name the person who answers for an agent.", supervises, Security.Authorize(me, SponsorsAgents)),
+    RoleOf("PausesAgents", "Osysharp.Agents", "Pause an agent, and let it work again.", supervises, Security.Authorize(me, PausesAgents)),
+    RoleOf("ReadsAllAgentWork", "Osysharp.Agents", "Read the receipt of every piece of work: which agent, for whom, where it stands and what it cost. Not what it said.", "Whoever supervises or audits", Security.Authorize(me, ReadsAllAgentWork)),
+    RoleOf("DecidesAgentProposals", "Osysharp.Agents", "Decide a proposal that was put to somebody else. A yes runs as whoever said it.", supervises, Security.Authorize(me, DecidesAgentProposals)),
+    RoleOf("WidensAgentAutonomy", "Osysharp.Agents", "Say \"from now on, alone\" for the work an agent does for them, and take it back.", "Nobody", Security.Authorize(me, WidensAgentAutonomy)),
+    RoleOf("TeachesAgents", "Osysharp.Agents", "Make an instruction active, retire one, and put an agent back to an earlier set — and read every piece of work with what it said, to judge and correct it.", "Nobody", Security.Authorize(me, TeachesAgents)),
+    RoleOf("DirectsAgentsForOthers", "Osysharp.Agents", "Give an agent work for somebody else, which then runs with what that person may do.", "Nobody", Security.Authorize(me, DirectsAgentsForOthers)),
+  ];
+  board.Apart = [
+    RoleOf("AuditsAgents", "Osysharp.Agents", "Read every piece of work with what it said: the prompts, what each tool was given and what it answered.", "Nobody", Security.Authorize(me, AuditsAgents)),
+    RoleOf("ErasesAgentRecords", "Osysharp.Agents", "Erase what a piece of work said, and whose it was.", "Nobody", Security.Authorize(me, ErasesAgentRecords)),
+  ];
+  board.Beside = [
+    RoleOf("ReadsModelUsage", "Osysharp.Llm", "Read the meter: every model call with its model, tokens and cost.", "Nobody", Security.Authorize(me, ReadsModelUsage)),
+    RoleOf("ManagesModelSpend", "Osysharp.Llm", "Set prices and budgets.", "Nobody", Security.Authorize(me, ManagesModelSpend)),
+    RoleOf("AsksPeople", "Osysharp.HumanRequests", "Put a request to a person, which is how a piece of work is handed to somebody.", "Nobody", Security.Authorize(me, AsksPeople)),
+    RoleOf("OverseesRequests", "Osysharp.HumanRequests", "Read every request an agent put to a person, call one off and give it more time.", "Nobody", Security.Authorize(me, OverseesRequests)),
+  ];
+  var seats = AgentSeat.Include(s => s.Sponsor).ToList();
+  foreach (var agent in App.Setting<AgentsSetup>().Agents) {
+    var name = agent.GetType().FullName;
+    var seat = seats.FirstOrDefault(s => s.Agent == name);
+    board.Sponsors.Add(new SponsorLine { Agent = name, Name = AgentName(name), Sponsor = seat == null ? "" : Named(seat!.Sponsor) });
+  }
+  return board;
+}
+
+bool Admitted(Principal p, string policy) {
+  return policy == "UsesAgents" ? Security.Authorize(p, UsesAgents)
+       : policy == "SupervisesAgents" ? Security.Authorize(p, SupervisesAgents)
+       : policy == "SponsorsAgents" ? Security.Authorize(p, SponsorsAgents)
+       : policy == "PausesAgents" ? Security.Authorize(p, PausesAgents)
+       : policy == "ReadsAllAgentWork" ? Security.Authorize(p, ReadsAllAgentWork)
+       : policy == "DecidesAgentProposals" ? Security.Authorize(p, DecidesAgentProposals)
+       : policy == "WidensAgentAutonomy" ? Security.Authorize(p, WidensAgentAutonomy)
+       : policy == "TeachesAgents" ? Security.Authorize(p, TeachesAgents)
+       : policy == "DirectsAgentsForOthers" ? Security.Authorize(p, DirectsAgentsForOthers)
+       : policy == "AuditsAgents" ? Security.Authorize(p, AuditsAgents)
+       : policy == "ErasesAgentRecords" ? Security.Authorize(p, ErasesAgentRecords)
+       : policy == "ReadsModelUsage" ? Security.Authorize(p, ReadsModelUsage)
+       : policy == "ManagesModelSpend" ? Security.Authorize(p, ManagesModelSpend)
+       : policy == "AsksPeople" ? Security.Authorize(p, AsksPeople)
+       : policy == "OverseesRequests" ? Security.Authorize(p, OverseesRequests)
+       : false;
+}
+
+/// The people one policy admits, by name — asked for one policy at a time, when somebody wants to know. For whoever
+/// supervises or audits the agents; an agent's own account is never listed. At most the first 200 people are asked.
+[Server, Authorize(IsAuthenticated)]
+public List<string> PeopleAdmittedTo(string policy) {
+  var me = Session.CurrentUser;
+  // SECURITY-INVARIANT(agents-management-who-holds-a-role-is-told-to-those-in-charge): which people a policy admits is
+  // read here for whoever supervises or audits the agents, and for nobody else — a list of who may approve, erase or
+  // read everything is a map of whom to ask, or to imitate. Guarded by tests/roles.test.osy
+  // `who_holds_a_role_is_told_only_to_those_in_charge`.
+  if (!Security.Authorize(me, SupervisesAgents) && !Security.Authorize(me, AuditsAgents)) {
+    throw new AgentRefused("Who holds a role is told to whoever supervises or audits the agents.");
+  }
+  List<string> names = [];
+  foreach (var p in Principal.OrderBy(x => x.DisplayName).Take(200).ToList()) {
+    if (IsAnActor(p)) { continue; }
+    if (Admitted(p, policy)) { names.Add(Named(p)); }
+  }
+  return names;
+}

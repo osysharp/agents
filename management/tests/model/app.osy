@@ -1,0 +1,273 @@
+// The Lantern Street Film Archive: its people, its reels, what can be done to a reel, and the five agents that help
+// take one into the collection.
+namespace Archive;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Management;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+
+[Role] enum ArchiveRole { Authenticator, Archivist, Head, Curator, Bookkeeper, Auditor, Handling }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsArchivist  => RoleGrant.Any(g => g.Member == user && g.Role == ArchiveRole.Archivist);
+policy IsHead       => RoleGrant.Any(g => g.Member == user && g.Role == ArchiveRole.Head);
+policy IsCurator    => RoleGrant.Any(g => g.Member == user && g.Role == ArchiveRole.Curator);
+policy IsBookkeeper => RoleGrant.Any(g => g.Member == user && g.Role == ArchiveRole.Bookkeeper);
+policy IsAuditor    => RoleGrant.Any(g => g.Member == user && g.Role == ArchiveRole.Auditor);
+policy IsHandling   => RoleGrant.Any(g => g.Member == user && g.Role == ArchiveRole.Handling);
+policy IsStaff      => IsArchivist || IsHead || IsCurator || IsBookkeeper || IsAuditor;
+
+// The inbox: the staff work it, and the head of collections leads it.
+policy WorksInbox       => IsStaff || IsHandling;
+policy LeadsInbox       => IsHead;
+policy AdministersInbox => IsHead;
+policy ManagesOrganizations  => IsHead;
+policy CollaboratesOnRecords => IsStaff;
+// Requests: the archivists and the head put them; the head oversees them.
+policy AsksPeople       => IsArchivist || IsHead;
+policy OverseesRequests => IsHead;
+
+// ⭐ The agents. ONE LINE puts the head of collections in charge of them: supervising brings naming sponsors, pausing,
+// reading every receipt and deciding other people's proposals with it…
+policy UsesAgents       => IsArchivist || IsHead;
+policy SupervisesAgents => IsHead;
+// …and everything else is answered by name. The curator teaches the agents, not the head. The head and the
+// archivists may say "from now on, alone", each for their own work. Only the head gives an agent work for somebody
+// else. And the bookkeeper reads what every piece of work cost, and not a word of it.
+policy TeachesAgents          => IsCurator;
+policy WidensAgentAutonomy    => IsHead || IsArchivist;
+policy DirectsAgentsForOthers => IsHead;
+policy ReadsAllAgentWork      => SupervisesAgents || AuditsAgents || IsBookkeeper;
+// Never implied: the auditor reads what the work said.
+policy AuditsAgents => IsAuditor;
+// Money: the head and the bookkeeper read the meter; the head sets budgets.
+policy ReadsModelUsage   => IsHead || IsBookkeeper;
+policy ManagesModelSpend => IsHead;
+
+/// Somebody at the archive — and the agents' own accounts.
+entity Person : Principal {
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+  }
+}
+
+partial entity ServiceHours { security { allow read when IsStaff; allow create, update, delete when IsHead; } }
+partial entity ServiceWindow { security { allow read when IsStaff; allow create, update, delete when IsHead; } }
+partial entity ServiceException { security { allow read when IsStaff; allow create, update, delete when IsHead; } }
+partial entity WorkItem { security { allow read when IsStaff || IsHandling; } }
+
+/// One reel of film that has arrived at the archive.
+entity Reel {
+  /// Its number in the arrivals book: "0412".
+  [Required, Unique, MaxLength(20)] string Number;
+  [Required, MaxLength(200)] string Title;
+  int Year = 0;
+  /// What the bench found when it was unwound.
+  [MaxLength(1000)] string BenchNotes = "";
+  /// Kept apart from the collection, and why.
+  bool Quarantined = false;
+  [MaxLength(300)] string QuarantinedWhy = "";
+  /// What the catalogue says of it, and what its title cards say.
+  [MaxLength(1000)] string Description = "";
+  [MaxLength(2000)] string TitleCards = "";
+  [ModifiedBy] Guid? ChangedBy;
+  security {
+    allow read when IsStaff || IsHandling;
+    allow create when IsArchivist || IsHead;
+    allow update when IsArchivist || IsHead || IsHandling;
+  }
+}
+
+// ── what can be done to a reel ──────────────────────────────────────────────────────────────────────────────────────
+
+/// What the bench wrote when the reel was unwound.
+[Action("Read the bench notes", Query)]
+public string BenchNotes(Reel reel) { return reel.BenchNotes; }
+
+/// Keep a reel apart from the collection.
+[Action("Quarantine the reel")]
+public string QuarantineReel(Reel reel, string why) {
+  reel.Quarantined = true;
+  reel.QuarantinedWhy = why;
+  return $"Reel {reel.Number} is in quarantine: {why}.";
+}
+
+/// The rights register's pages for a reel — a long read.
+[Action("Read the rights register", Query)]
+public string RightsRegister(Reel reel) {
+  var text = $"Register of rights, reel {reel.Number}. ";
+  for (var i = 1; i <= 30; i++) { text = text + $"Entry {i}: the distributor's licence was renewed for a further term and no claim was recorded. "; }
+  return text;
+}
+
+/// Write the catalogue's description of a reel.
+[Action("Write the description")]
+public string WriteDescription(Reel reel, string text) {
+  reel.Description = text;
+  return $"Reel {reel.Number} is described.";
+}
+
+/// Write down what a reel's title cards say.
+[Action("Write down the title cards")]
+public string WriteTitleCards(Reel reel, string text) {
+  reel.TitleCards = text;
+  return $"The title cards of reel {reel.Number} are written down.";
+}
+
+// ── what the agents hand back ───────────────────────────────────────────────────────────────────────────────────────
+
+public class ConditionReport { public bool Sound; public string Finding = ""; }
+public class RightsFinding { public bool Clear; public string Finding = ""; }
+public class Accession {
+  /// Whether the reel is taken into the collection.
+  public bool Take;
+  public string Condition = "";
+  public string Rights = "";
+}
+public class Blurb { public string Text = ""; }
+public class Cards { public string Text = ""; }
+
+/// A skill that takes a reel is handed one by its id.
+public Reel ReelHanded(string inputJson) {
+  var id = HandOn.IdIn(inputJson);
+  return Reel.Single(r => r.Id == id);
+}
+
+/// A reel's number, where a person reads a proposal about one.
+public string ReelNamed(string argument, string value) {
+  if (argument != "reel") { return value; }
+  var reel = Reel.FirstOrDefault(r => r.Id == Guid.Parse(value));
+  return reel == null ? value : "Reel " + reel!.Number + ", " + reel!.Title;
+}
+
+// ── the skills ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+public class CheckCondition : Skill<Reel, ConditionReport> {
+  public override string Description => "Say what state a reel is in, and keep it apart when it would harm the others.";
+  public override List<ActionInfo> Tools => [Actions.Of(BenchNotes), Actions.Of(QuarantineReel)];
+  public override string Brief(Reel r) => $"Reel {r.Number}, {r.Title}. Its id is {r.Id}.";
+  public override string Names(string action, string argument, string value) => ReelNamed(argument, value);
+  // An archive that has conservators sends a quarantine to them — to their queue — rather than to whoever asked.
+  public override ProposalRoute? DecidedBy(string action) {
+    return Queue.Any(q => q.Name == "Conservation") ? ProposalRoute.ToQueue("Conservation") : null;
+  }
+  public override string HandedSchema() => HandOn.ById("The reel to check.");
+  public override Reel Handed(string inputJson) => ReelHanded(inputJson);
+}
+
+public class ClearRights : Skill<Reel, RightsFinding> {
+  public override string Description => "Read the rights register and say whether the archive may show a reel.";
+  public override List<ActionInfo> Tools => [Actions.Of(RightsRegister)];
+  public override string Brief(Reel r) => $"Reel {r.Number}, {r.Title}. Its id is {r.Id}.";
+  public override string HandedSchema() => HandOn.ById("The reel whose rights to clear.");
+  public override Reel Handed(string inputJson) => ReelHanded(inputJson);
+}
+
+public class AccessionReel : Skill<Reel, Accession> {
+  public override string Description => "Take one reel into the collection: have its condition checked and its rights cleared, and say whether to take it.";
+  public override string Brief(Reel r) => $"Reel {r.Number}, {r.Title} ({r.Year}). Its id is {r.Id}.";
+}
+
+public class DescribeReel : Skill<Reel, Blurb> {
+  public override string Description => "Write the catalogue's description of a reel.";
+  public override string Instructions => "Read the bench notes first. Two sentences: what the film is, and what state the print is in.";
+  public override List<ActionInfo> Tools => [Actions.Of(BenchNotes), Actions.Of(WriteDescription)];
+  public override string Brief(Reel r) => $"Reel {r.Number}, {r.Title} ({r.Year}). Its id is {r.Id}.";
+  public override string Version => "3";
+}
+
+public class CopyTitleCards : Skill<Reel, Cards> {
+  public override string Description => "Write down what a silent reel's title cards say.";
+  public override List<ActionInfo> Tools => [Actions.Of(WriteTitleCards)];
+  public override string Brief(Reel r) => $"Reel {r.Number}, {r.Title}. Its id is {r.Id}.";
+}
+
+// ── the agents ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Looks at the state of a reel. It says nothing of what it may do alone: a quarantine is proposed to a person.
+[Actor(Roles = [ArchiveRole.Handling])]
+public class ConditionChecker : Agent {
+  public static Person Principal => new Person { Email = "condition-checker@lanternstreet.example", DisplayName = "Condition checker" };
+  public override string Purpose => "You say what state a reel of film is in.";
+  public override List<SkillBase> Skills => [new CheckCondition()];
+}
+
+/// Reads the rights register.
+[Actor(Roles = [ArchiveRole.Handling])]
+public class RightsClerk : Agent {
+  public static Person Principal => new Person { Email = "rights-clerk@lanternstreet.example", DisplayName = "Rights clerk" };
+  public override string Purpose => "You find out whether the archive may show a film.";
+  public override List<SkillBase> Skills => [new ClearRights()];
+}
+
+/// ⭐ In charge of an accession: it hands the condition and the rights on, at once, and decides from what comes back.
+/// Clearing the rights gets a small allowance of its own.
+[Actor(Roles = [ArchiveRole.Handling])]
+public class Registrar : Agent {
+  public static Person Principal => new Person { Email = "registrar@lanternstreet.example", DisplayName = "Registrar" };
+  public override string Purpose => "You take reels of film into the archive's collection.";
+  public override List<SkillBase> Skills => [new AccessionReel()];
+  public override Permits May => Permits.ChangesAlone();
+  public override Delegation Delegates => new Delegation {
+    To = [
+      Specialist.Of<ConditionChecker>(new CheckCondition()),
+      Specialist.Of<RightsClerk>(new ClearRights(), budget: 0.006m),
+    ],
+    MaxDepth = 1,
+  };
+}
+
+/// Writes the catalogue. It may spend little in a day.
+[Actor(Roles = [ArchiveRole.Handling])]
+public class Describer : Agent {
+  public static Person Principal => new Person { Email = "describer@lanternstreet.example", DisplayName = "Describer" };
+  public override string Purpose => "You write the catalogue's description of each reel.";
+  public override List<SkillBase> Skills => [new DescribeReel()];
+  public override Permits May => Permits.ChangesAlone();
+  public override AgentLimits Limits => new AgentLimits { PerTask = 0.02m, Daily = 0.012m };
+}
+
+/// Copies title cards.
+[Actor(Roles = [ArchiveRole.Handling])]
+public class Transcriber : Agent {
+  public static Person Principal => new Person { Email = "transcriber@lanternstreet.example", DisplayName = "Transcriber" };
+  public override string Purpose => "You write down what the title cards of silent films say.";
+  public override List<SkillBase> Skills => [new CopyTitleCards()];
+  public override Permits May => Permits.ChangesAlone();
+}
+
+// ── giving them work ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// Have a reel taken into the collection, for whoever asks.
+public AgentOutcome<Accession> TakeIn(Reel reel) {
+  return await Agents.Of<Registrar>().Do(new AccessionReel(), reel, about: "Accession of reel " + reel.Number);
+}
+
+/// Have a reel's condition checked, for whoever asks.
+public AgentOutcome<ConditionReport> Check(Reel reel) {
+  return await Agents.Of<ConditionChecker>().Do(new CheckCondition(), reel, about: "Condition of reel " + reel.Number);
+}
+
+/// Have a reel described, for whoever asks.
+public AgentOutcome<Blurb> Describe(Reel reel) {
+  return await Agents.Of<Describer>().Do(new DescribeReel(), reel, about: "Description of reel " + reel.Number);
+}
+
+/// Have a reel's title cards written down, for whoever asks.
+public AgentOutcome<Cards> CopyCards(Reel reel) {
+  return await Agents.Of<Transcriber>().Do(new CopyTitleCards(), reel, about: "Title cards of reel " + reel.Number);
+}
+
+// ── what a test tries by hand ───────────────────────────────────────────────────────────────────────────────────────
+
+/// Ask who a policy admits, as whoever is signed in.
+public List<string> WhoHolds(string policy) { return PeopleAdmittedTo(policy); }

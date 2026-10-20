@@ -1,0 +1,157 @@
+// The archive the tests run in. Maeve is the head of collections: she is in charge of the agents and answers for
+// each of them. Jonas and Priya are archivists, who give the agents work. Calla is the curator, who teaches them.
+// Desmond keeps the books: he reads what the work cost. Ingrid audits: she reads what it said.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Management;
+using Osysharp.Workflow;
+using Archive;
+
+[TestFixture]
+void Vaults() {
+  var maeve   = new Person { Email = "maeve@lanternstreet.example",   DisplayName = "Maeve Okonkwo" };
+  var jonas   = new Person { Email = "jonas@lanternstreet.example",   DisplayName = "Jonas Reiter" };
+  var priya   = new Person { Email = "priya@lanternstreet.example",   DisplayName = "Priya Nair" };
+  var calla   = new Person { Email = "calla@lanternstreet.example",   DisplayName = "Calla Whitlock" };
+  var desmond = new Person { Email = "desmond@lanternstreet.example", DisplayName = "Desmond Achebe" };
+  var ingrid  = new Person { Email = "ingrid@lanternstreet.example",  DisplayName = "Ingrid Solberg" };
+  new RoleGrant { Member = maeve,   Role = ArchiveRole.Head };
+  new RoleGrant { Member = jonas,   Role = ArchiveRole.Archivist };
+  new RoleGrant { Member = priya,   Role = ArchiveRole.Archivist };
+  new RoleGrant { Member = calla,   Role = ArchiveRole.Curator };
+  new RoleGrant { Member = desmond, Role = ArchiveRole.Bookkeeper };
+  new RoleGrant { Member = ingrid,  Role = ArchiveRole.Auditor };
+
+  new OrganizationTier { Name = "Standard", Rank = 1, IsDefault = true };
+  var queue = new Queue { Name = "Collections", Position = 1 };
+  foreach (var p in new List<Person> { maeve, jonas, priya, calla, desmond, ingrid }) { new QueueMember { Queue = queue, Member = p }; }
+
+  new Reel { Number = "0377", Title = "The Ferry at Dusk", Year = 1924, BenchNotes = "Tinted print, complete. Perforations sound." };
+  new Reel { Number = "0398", Title = "Harvest on the Marsh", Year = 1931, BenchNotes = "Safety stock, two splices, light scratching." };
+  new Reel { Number = "0401", Title = "A Town Gets Its Bridge", Year = 1936, BenchNotes = "Safety stock. Reel two of three." };
+  new Reel { Number = "0412", Title = "Lamplighters", Year = 1919, BenchNotes = "Nitrate. A sharp smell on opening the can; the first turns are sticky." };
+
+  // The head of collections answers for every agent.
+  new AgentSeat { Agent = TheRegistrar, Sponsor = maeve };
+  new AgentSeat { Agent = TheChecker, Sponsor = maeve };
+  new AgentSeat { Agent = TheClerk, Sponsor = maeve };
+  new AgentSeat { Agent = TheDescriber, Sponsor = maeve };
+  new AgentSeat { Agent = TheTranscriber, Sponsor = maeve };
+}
+
+principal Maeve   => Person.Single(p => p.Email == "maeve@lanternstreet.example");
+principal Jonas   => Person.Single(p => p.Email == "jonas@lanternstreet.example");
+principal Priya   => Person.Single(p => p.Email == "priya@lanternstreet.example");
+principal Calla   => Person.Single(p => p.Email == "calla@lanternstreet.example");
+principal Desmond => Person.Single(p => p.Email == "desmond@lanternstreet.example");
+principal Ingrid  => Person.Single(p => p.Email == "ingrid@lanternstreet.example");
+
+const string TheRegistrar   = "Archive.Registrar";
+const string TheChecker     = "Archive.ConditionChecker";
+const string TheClerk       = "Archive.RightsClerk";
+const string TheDescriber   = "Archive.Describer";
+const string TheTranscriber = "Archive.Transcriber";
+
+Reel ReelNumbered(string number) { return Reel.Single(r => r.Number == number); }
+string ReelArg(Reel r) { return "{\"reel\":\"" + r.Id.ToString() + "\"}"; }
+string ReelAnd(Reel r, string name, string value) { return "{\"reel\":\"" + r.Id.ToString() + "\",\"" + name + "\":\"" + value + "\"}"; }
+
+/// ⭐ WHAT EACH MODEL SAYS, for everything the archive's agents are given in these tests. Stateless: which agent and
+/// which turn are read from each request.
+AgentCast TheCast() {
+  var lamplighters = ReelNumbered("0412");
+  var harvest = ReelNumbered("0398");
+  var bridge = ReelNumbered("0401");
+  var ferry = ReelNumbered("0377");
+  return AgentCast.Of()
+    // The registrar hands the condition and the rights on in ONE turn, and decides from what comes back.
+    .Plays<Registrar>(AgentScript.Of(
+      Says.Together(
+        Says.HandTo<ConditionChecker>(new CheckCondition(), Says.Row(lamplighters.Id)),
+        Says.HandTo<RightsClerk>(new ClearRights(), Says.Row(lamplighters.Id))),
+      Says.HandBack(new Accession { Take = true, Condition = "Nitrate, starting to decompose: kept apart.", Rights = "Not cleared: the reading ran out of its allowance." })))
+    // The condition checker reads the bench notes and wants the reel kept apart — which it may only propose.
+    .Plays<ConditionChecker>(AgentScript.Of(
+      Says.Tool(Actions.Of(BenchNotes), ReelArg(lamplighters)),
+      Says.Tool("Nitrate that smells sharp and sticks is decomposing, and it harms the reels stored beside it.", Actions.Of(QuarantineReel), ReelAnd(lamplighters, "why", "Decomposing nitrate")),
+      Says.HandBack(new ConditionReport { Sound = false, Finding = "Nitrate, starting to decompose: kept apart." })))
+    // The register is a long read: one answer of 1000 tokens in and 600 out costs 4000 of the clerk's 6000.
+    .Plays<RightsClerk>(AgentScript.Of(
+      Says.Tool(Actions.Of(RightsRegister), ReelArg(lamplighters), 1000, 600),
+      Says.HandBack(new RightsFinding { Clear = true })))
+    // The describer: a long first answer each time, so two descriptions do not fit in its day.
+    .PlaysAbout<Describer>("Reel 0398", AgentScript.Of(
+      Says.Tool(Actions.Of(BenchNotes), ReelArg(harvest), 1000, 600),
+      Says.Tool(Actions.Of(WriteDescription), ReelAnd(harvest, "text", "A harvest on the salt marsh, shot over one week in 1931. Safety stock, two splices, light scratching.")),
+      Says.HandBack(new Blurb { Text = "A harvest on the salt marsh, shot over one week in 1931. Safety stock, two splices, light scratching." })))
+    .PlaysAbout<Describer>("Reel 0401", AgentScript.Of(
+      Says.Tool(Actions.Of(BenchNotes), ReelArg(bridge), 1000, 600),
+      Says.Tool(Actions.Of(WriteDescription), ReelAnd(bridge, "text", "The building of the town bridge, 1936. Safety stock, reel two of three.")),
+      Says.HandBack(new Blurb { Text = "The building of the town bridge, 1936. Safety stock, reel two of three." })))
+    .Plays<Transcriber>(AgentScript.Of(
+      Says.Tool(Actions.Of(WriteTitleCards), ReelAnd(ferry, "text", "THE LAST FERRY LEAVES AT DUSK. She did not come.")),
+      Says.HandBack(new Cards { Text = "THE LAST FERRY LEAVES AT DUSK. She did not come." })));
+}
+
+void TheModelsAnswer() {
+  var cast = TheCast();
+  ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+}
+
+/// Let whatever waits look again: a request that was answered is carried to its proposal, the piece that waited goes
+/// on, and the piece above it follows.
+void LetItGoOn() {
+  for (var i = 0; i < 5; i++) {
+    Background.Settle();
+    foreach (var wait in AgentWait.Where(w => w.Status == AgentWaitStatus.Waiting).ToList()) { Workflow.Settle(wait); }
+  }
+}
+
+/// What the archive's work comes to on the morning of 5 May 2031.
+public class Morning {
+  /// The accession of reel 0412 (waiting on Jonas), the two descriptions (done; out of money) and the title cards.
+  public Guid Accession;
+  public Guid Described;
+  public Guid OutOfMoney;
+  public Guid Cards;
+}
+
+/// ⭐ A MORNING AT THE ARCHIVE. Jonas has reel 0412 taken in: the registrar hands its condition and its rights on; the
+/// condition checker proposes a quarantine, which waits for Jonas in his inbox; the rights clerk runs out of its
+/// allowance. Priya has two reels described: the first is done, and the second does not fit in what the describer
+/// may spend in a day. She has the title cards of 0377 written down, and corrects them. Then Maeve pauses the
+/// transcriber.
+Morning AMorningAtTheArchive() {
+  TestClock.Set(new DateTime(2031, 5, 5, 8, 0, 0, DateTimeKind.Utc));
+  var morning = new Morning();
+  runas (Jonas) {
+    TheModelsAnswer();
+    morning.Accession = TakeIn(ReelNumbered("0412")).Task;
+    Background.Settle();
+    Workflow.Settle(Requests.Mine().Single());
+  }
+  TestClock.Advance(TimeSpan.FromMinutes(20));
+  runas (Priya) {
+    morning.Described = Describe(ReelNumbered("0398")).Task;
+    morning.OutOfMoney = Describe(ReelNumbered("0401")).Task;
+    morning.Cards = CopyCards(ReelNumbered("0377")).Task;
+    CorrectAgentWork(AgentTask.Single(t => t.Id == morning.Cards), new Correction {
+      Wrong = "It wrote the cards in capitals, as they are on the film.", Right = "Sentence case, as the catalogue prints them.",
+      Because = "The catalogue is read aloud at screenings.",
+    });
+    UnitOfWork.Commit();
+  }
+  TestClock.Advance(TimeSpan.FromMinutes(10));
+  runas (Maeve) {
+    PauseAgent(TheTranscriber, "Its title cards are being checked against the reels.");
+    UnitOfWork.Commit();
+  }
+  return morning;
+}

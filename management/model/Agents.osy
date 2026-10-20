@@ -1,0 +1,436 @@
+// What the Agents screens read and send: every agent of the app as whoever is looking may read it, one agent in
+// full, and the three things a person in charge does to an agent — pause it, let it work again, name who answers
+// for it — each carried to `Osysharp.Agents`' own function for it.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Llm;
+
+/// What a count of receipts by agent answers.
+class AgentCount {
+  public string Agent = "";
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  public int Count = 0;
+  public long Micros = 0;
+}
+
+/// One agent, as a line of the roster.
+public class RosterLine {
+  /// The agent, by its class's full name, and as a person reads it.
+  public string Agent = "";
+  public string Name = "";
+  public string Purpose = "";
+  /// Who answers for it. "": nobody yet, and it does not run.
+  public string Sponsor = "";
+  public bool Paused = false;
+  public string PausedWhy = "";
+  /// "Working", "Waiting" (everything it has under way waits), "Idle", "Paused", "No sponsor".
+  public string State = "";
+  /// Its work under way now: being worked on, and stopped on a person or on work it handed on.
+  public int Working = 0;
+  public int Waiting = 0;
+  /// What the work it started today, and this month, has spent — and the most it may spend in a day, when it has a
+  /// limit, with what the meter has counted against that limit today.
+  public string Today = "";
+  public string Month = "";
+  public string DailyLimit = "";
+  public string AgainstLimit = "";
+  public int LimitPercent = 0;
+  public bool AtLimit = false;
+  /// The last thirty days: pieces of work started, and corrections people made of them.
+  public int Work30 = 0;
+  public int Corrections30 = 0;
+}
+
+/// Every agent of the app, for the roster.
+public class Roster {
+  /// Whoever is looking reads every piece of work, so every figure is the whole of it. Otherwise the figures count
+  /// the work they asked for.
+  public bool ReadsAll = false;
+  public List<RosterLine> Agents = [];
+  public int Working = 0;
+  public int Waiting = 0;
+  public int Paused = 0;
+  public int Unsponsored = 0;
+  public string Today = "";
+  public string Month = "";
+}
+
+DateTime DayStart(DateTime now) { return new DateTime(now.Year, now.Month, now.Day, 0, 0, 0, DateTimeKind.Utc); }
+DateTime MonthStart(DateTime now) { return new DateTime(now.Year, now.Month, 1, 0, 0, 0, DateTimeKind.Utc); }
+
+/// The agent's declaration, by its class's full name. Null: not one of the app's agents.
+Agent? Declared(string agent) {
+  foreach (var a in App.Setting<AgentsSetup>().Agents) { if (a.GetType().FullName == agent) { return a; } }
+  return null;
+}
+
+string StateOf(AgentSeat? seat, int working, int waiting) {
+  if (seat == null || seat!.Sponsor == null) { return "No sponsor"; }
+  if (seat!.Paused) { return "Paused"; }
+  return working > 0 ? "Working" : waiting > 0 ? "Waiting" : "Idle";
+}
+
+/// ⭐ EVERY AGENT OF THE APP, for the roster: who answers for it, whether it is working, what it has under way,
+/// what it has spent and how often people corrected it — counted over the work whoever is looking may read.
+[Server, Authorize(IsAuthenticated)]
+public Roster RosterOf() {
+  var me = Session.CurrentUser;
+  var roster = new Roster { ReadsAll = Security.Authorize(me, ReadsAllAgentWork) };
+  var now = DateTime.UtcNow;
+  var today = DayStart(now);
+  var month = MonthStart(now);
+  var thirty = now.AddDays(-30);
+  var seats = AgentSeat.Include(s => s.Sponsor).ToList();
+  // Counted where the receipts are stored: a line a group, never a row a piece of work.
+  var underWay = AgentTask.Where(t => t.Status == AgentTaskStatus.Working || t.Status == AgentTaskStatus.Waiting)
+    .GroupBy(t => new() { Agent = t.Agent, Status = t.Status })
+    .Select(g => new AgentCount { Agent = g.Key.Agent, Status = g.Key.Status, Count = g.Count() }).ToList();
+  var spentToday = AgentTask.Where(t => t.StartedAt >= today)
+    .GroupBy(t => t.Agent).Select(g => new AgentCount { Agent = g.Key, Micros = g.Sum(t => t.SpentMicros) }).ToList();
+  var spentMonth = AgentTask.Where(t => t.StartedAt >= month)
+    .GroupBy(t => t.Agent).Select(g => new AgentCount { Agent = g.Key, Micros = g.Sum(t => t.SpentMicros) }).ToList();
+  var started = AgentTask.Where(t => t.StartedAt >= thirty)
+    .GroupBy(t => t.Agent).Select(g => new AgentCount { Agent = g.Key, Count = g.Count() }).ToList();
+  var corrected = AgentCorrection.Where(c => c.At >= thirty && c.WithdrawnAt == null)
+    .GroupBy(c => c.Agent).Select(g => new AgentCount { Agent = g.Key, Count = g.Count() }).ToList();
+
+  long allToday = 0;
+  long allMonth = 0;
+  foreach (var agent in App.Setting<AgentsSetup>().Agents) {
+    var name = agent.GetType().FullName;
+    var seat = seats.FirstOrDefault(s => s.Agent == name);
+    var line = new RosterLine { Agent = name, Name = AgentName(name), Purpose = agent.Purpose };
+    foreach (var c in underWay) {
+      if (c.Agent != name) { continue; }
+      if (c.Status == AgentTaskStatus.Working) { line.Working = c.Count; } else { line.Waiting = c.Count; }
+    }
+    long day = 0;
+    long thisMonth = 0;
+    foreach (var c in spentToday) { if (c.Agent == name) { day = c.Micros; } }
+    foreach (var c in spentMonth) { if (c.Agent == name) { thisMonth = c.Micros; } }
+    foreach (var c in started) { if (c.Agent == name) { line.Work30 = c.Count; } }
+    foreach (var c in corrected) { if (c.Agent == name) { line.Corrections30 = c.Count; } }
+    line.Today = Money(day);
+    line.Month = Money(thisMonth);
+    allToday = allToday + day;
+    allMonth = allMonth + thisMonth;
+    var daily = agent.Limits.Daily;
+    if (daily != null) {
+      // What the limit is held against: the meter's own count for the agent today, every call of every piece of work.
+      var limit = (long)Math.Round(daily!.Value * 1000000m);
+      var against = (long)Math.Round(SpentAgainst("agent:" + name, LlmBudgetWindow.Day) * 1000000m);
+      line.DailyLimit = Money(limit);
+      line.AgainstLimit = Money(against);
+      line.LimitPercent = limit == 0 ? 100 : (int)Math.Min(100, against * 100 / limit);
+      line.AtLimit = against >= limit;
+    }
+    line.Sponsor = seat == null ? "" : Named(seat!.Sponsor);
+    line.Paused = seat != null && seat!.Paused;
+    line.PausedWhy = seat == null ? "" : seat!.PausedWhy;
+    line.State = StateOf(seat, line.Working, line.Waiting);
+    roster.Working = roster.Working + line.Working;
+    roster.Waiting = roster.Waiting + line.Waiting;
+    if (line.Paused) { roster.Paused = roster.Paused + 1; }
+    if (line.Sponsor == "") { roster.Unsponsored = roster.Unsponsored + 1; }
+    roster.Agents.Add(line);
+  }
+  roster.Today = Money(allToday);
+  roster.Month = Money(allMonth);
+  return roster;
+}
+
+// ── one agent ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// One tool of an agent, under what its declaration says of it.
+public class ToolWords {
+  /// The tool as a person reads it — "Quarantine the reel" — and what running it does: "only reads", "changes
+  /// data", "sends something", "spends".
+  public string Label = "";
+  public string Does = "";
+  /// The skill it is a tool of, when the agent holds several.
+  public string Skill = "";
+  /// Where its proposals are put, when the skill sends them somewhere other than the person the work is for — "the
+  /// Finance queue". "": to the person the work is for.
+  public string PutTo = "";
+}
+
+/// One skill an agent holds.
+public class SkillWords {
+  public string Skill = "";
+  public string Label = "";
+  public string Description = "";
+  public string Version = "";
+  /// What one piece of it may spend, when the skill says. "": the agent's, or the app's.
+  public string Budget = "";
+  public int Tools = 0;
+}
+
+/// One piece of work an agent may hand on.
+public class HandsOnWords {
+  /// Who does it — "RightsClerk", or "" for one of its own skills done apart — and the job.
+  public string To = "";
+  public string ToAgent = "";
+  public string Job = "";
+  /// Its share of the money, when the declaration names one.
+  public string Share = "";
+}
+
+/// One change to the agent's place: who paused it, let it work again or named its sponsor.
+public class SeatLine {
+  public string Said = "";
+  public string When = "";
+  public string Why = "";
+}
+
+/// Somebody who can be named as an agent's sponsor.
+public class PersonChoice {
+  public Guid Id;
+  public string Name = "";
+}
+
+/// Everything an agent's own page shows.
+public class AgentProfile {
+  public string Agent = "";
+  public string Name = "";
+  /// False: the class is not one of the app's agents — the page says so, and shows nothing else.
+  public bool Listed = false;
+  public string Purpose = "";
+  /// The account it acts as — its own, which the platform keeps for its class.
+  public string ActsAs = "";
+  public string ActsAsEmail = "";
+  public string Sponsor = "";
+  public Guid? SponsorId;
+  public bool Paused = false;
+  public string PausedWhy = "";
+  public string State = "";
+
+  /// What it may do with its tools, by what its declaration says: alone, proposed to a person first, proposed every
+  /// time, never. And how many standing rules people have given it.
+  public List<ToolWords> Alone = [];
+  public List<ToolWords> Proposes = [];
+  public List<ToolWords> ProposesEveryTime = [];
+  public List<ToolWords> Never = [];
+  public int StandingRules = 0;
+  public List<SkillWords> Skills = [];
+  public List<HandsOnWords> HandsOn = [];
+  public int HandsOnDepth = 0;
+  /// Who it turns to: a model it consults, and whether it may ask a person.
+  public string Consults = "";
+  public bool AsksPeople = false;
+
+  /// What it is told: its instruction set — 0 before anybody taught it anything — how many instructions are active,
+  /// and how many wait to be read.
+  public int InstructionSet = 0;
+  public int ActiveInstructions = 0;
+  public int ProposedInstructions = 0;
+
+  /// What it may spend, and what it has: one piece of work, a day (with the meter's count against it), and what the
+  /// work it started today and this month has spent.
+  public string PerTask = "";
+  public string DailyLimit = "";
+  public string AgainstLimit = "";
+  public int LimitPercent = 0;
+  public bool AtLimit = false;
+  public string Today = "";
+  public string Month = "";
+
+  public int Working = 0;
+  public int Waiting = 0;
+  public int Work30 = 0;
+  public int Corrections30 = 0;
+  public List<WorkLine> Recent = [];
+  /// The open requests behind its waiting work — its own, and those of the work it handed on.
+  public List<Guid> WaitsOn = [];
+  public List<SeatLine> History = [];
+
+  /// What whoever is looking may do here.
+  public bool ReadsAll = false;
+  public bool MayPause = false;
+  public bool MaySponsor = false;
+  public bool MayStop = false;
+  /// Whether whoever is looking may run one of its skills from here — they give agents work.
+  public bool MayRun = false;
+  public List<PersonChoice> People = [];
+}
+
+string DoesWords(SkillToolInfo tool) {
+  if (tool.ReadsOnly) { return "only reads"; }
+  List<string> does = [];
+  if (tool.Changes) { does.Add("changes data"); }
+  if (tool.Sends) { does.Add("sends something"); }
+  if (tool.Spends) { does.Add("spends"); }
+  return does.Count == 0 ? "reaches outside the app" : string.Join(", ", does);
+}
+
+/// ⭐ ONE AGENT, for its own page — as whoever is looking may read it.
+[Server, Authorize(IsAuthenticated)]
+public AgentProfile AgentProfileOf(string agent) {
+  var me = Session.CurrentUser;
+  var profile = new AgentProfile { Agent = agent, Name = AgentName(agent) };
+  var declared = Declared(agent);
+  if (declared == null) { return profile; }
+  profile.Listed = true;
+  profile.Purpose = declared!.Purpose;
+  profile.ReadsAll = Security.Authorize(me, ReadsAllAgentWork);
+  profile.MayPause = Security.Authorize(me, PausesAgents);
+  profile.MaySponsor = Security.Authorize(me, SponsorsAgents);
+  profile.MayStop = Security.Authorize(me, SupervisesAgents);
+  profile.MayRun = Security.Authorize(me, UsesAgents);
+
+  var seat = AgentSeat.Where(s => s.Agent == agent).Include(s => s.Sponsor).FirstOrDefault();
+  profile.Sponsor = seat == null ? "" : Named(seat!.Sponsor);
+  profile.SponsorId = seat == null || seat!.Sponsor == null ? null : seat!.Sponsor!.Id;
+  profile.Paused = seat != null && seat!.Paused;
+  profile.PausedWhy = seat == null ? "" : seat!.PausedWhy;
+
+  // What it may do, tool by tool — the catalogue's own answer, which is the declaration's.
+  var skills = Skills.Of(agent);
+  foreach (var s in skills) {
+    profile.Skills.Add(new SkillWords { Skill = s.Skill, Label = s.Label, Description = s.Description, Version = s.Version, Tools = s.Tools.Count });
+    foreach (var t in s.Tools) {
+      var words = new ToolWords { Label = t.Label, Does = DoesWords(t), Skill = skills.Count > 1 ? s.Label : "",
+        PutTo = t.DecidedByQueue != "" ? "the " + t.DecidedByQueue + " queue" : t.DecidedByOnePerson ? "one person the skill names" : "" };
+      if (t.Leave == Leave.Alone) { profile.Alone.Add(words); }
+      else if (t.Leave == Leave.Propose) { profile.Proposes.Add(words); }
+      else if (t.Leave == Leave.ProposeEveryTime) { profile.ProposesEveryTime.Add(words); }
+      else { profile.Never.Add(words); }
+    }
+  }
+  var at = 0;
+  foreach (var s in declared!.Skills) {
+    if (at < profile.Skills.Count && s.Budget != null) { profile.Skills[at].Budget = Money((long)Math.Round(s.Budget!.Value * 1000000m)); }
+    at = at + 1;
+  }
+  foreach (var d in Delegations.Of(agent)) {
+    profile.HandsOn.Add(new HandsOnWords {
+      To = d.Helper ? "" : AgentName(d.To), ToAgent = d.Helper ? "" : d.To, Job = d.Label,
+      Share = d.Budget == null ? "" : Money((long)Math.Round(d.Budget!.Value * 1000000m)),
+    });
+  }
+  profile.HandsOnDepth = Delegations.DepthOf(agent);
+  profile.Consults = declared!.Consults;
+  profile.AsksPeople = declared!.People.MayChoose || declared!.People.WhenStuck;
+  profile.StandingRules = AgentStandingRule.Count(r => r.Agent == agent && r.RevokedAt == null);
+
+  profile.InstructionSet = InstructionSetOf(agent);
+  foreach (var i in InstructionsOfAgent(agent)) {
+    if (i.State == InstructionState.Active) { profile.ActiveInstructions = profile.ActiveInstructions + 1; }
+    if (i.State == InstructionState.Proposed) { profile.ProposedInstructions = profile.ProposedInstructions + 1; }
+  }
+
+  var now = DateTime.UtcNow;
+  var today = DayStart(now);
+  var month = MonthStart(now);
+  var thirty = now.AddDays(-30);
+  var perTask = declared!.Limits.PerTask ?? App.Setting<AgentsSetup>().TaskBudget;
+  profile.PerTask = Money((long)Math.Round(perTask * 1000000m));
+  var daily = declared!.Limits.Daily;
+  if (daily != null) {
+    var limit = (long)Math.Round(daily!.Value * 1000000m);
+    var against = (long)Math.Round(SpentAgainst("agent:" + agent, LlmBudgetWindow.Day) * 1000000m);
+    profile.DailyLimit = Money(limit);
+    profile.AgainstLimit = Money(against);
+    profile.LimitPercent = limit == 0 ? 100 : (int)Math.Min(100, against * 100 / limit);
+    profile.AtLimit = against >= limit;
+  }
+  profile.Today = Money(AgentTask.Where(t => t.Agent == agent && t.StartedAt >= today).Sum(t => t.SpentMicros));
+  profile.Month = Money(AgentTask.Where(t => t.Agent == agent && t.StartedAt >= month).Sum(t => t.SpentMicros));
+  profile.Working = AgentTask.Count(t => t.Agent == agent && t.Status == AgentTaskStatus.Working);
+  profile.Waiting = AgentTask.Count(t => t.Agent == agent && t.Status == AgentTaskStatus.Waiting);
+  profile.Work30 = AgentTask.Count(t => t.Agent == agent && t.StartedAt >= thirty);
+  profile.Corrections30 = AgentCorrection.Count(c => c.Agent == agent && c.At >= thirty && c.WithdrawnAt == null);
+  profile.State = StateOf(seat, profile.Working, profile.Waiting);
+
+  var recent = AgentTask.Where(t => t.Agent == agent).OrderByDescending(t => t.StartedAt).Take(8)
+    .Include(t => t.Requester).Include(t => t.Actor).ToList();
+  foreach (var t in recent) { profile.Recent.Add(WorkLineOf(t, me, now)); }
+  foreach (var waiting in AgentTask.Where(t => t.Agent == agent && t.Status == AgentTaskStatus.Waiting).OrderBy(t => t.StartedAt).Take(50).ToList()) {
+    foreach (var r in RequestsBehindWork(waiting.Id)) { if (!profile.WaitsOn.Contains(r)) { profile.WaitsOn.Add(r); } }
+  }
+  // The account it acts as, from its class — whether or not it has worked yet.
+  var account = Actor.Of(declared!.GetType());
+  profile.ActsAs = Named(account);
+  profile.ActsAsEmail = account.Email;
+
+  foreach (var c in AgentSeatChange.Where(x => x.Agent == agent).OrderByDescending(x => x.At).Take(20).Include(x => x.By).Include(x => x.Sponsor).ToList()) {
+    var who = c.By == null ? "The app" : Named(c.By);
+    var did = c.What == AgentSeatChangeKind.Paused ? "paused it"
+            : c.What == AgentSeatChangeKind.Resumed ? "let it work again"
+            : "named " + (c.Sponsor == null ? "a sponsor" : Named(c.Sponsor)) + " as the person who answers for it";
+    profile.History.Add(new SeatLine { Said = who + " " + did, When = DatedWithTime(c.At), Why = c.Why });
+  }
+
+  if (profile.MaySponsor) {
+    // Whoever may be named: the people of the app, never an agent's own account.
+    foreach (var p in Principal.OrderBy(x => x.DisplayName).Take(200).ToList()) {
+      if (IsAnActor(p)) { continue; }
+      profile.People.Add(new PersonChoice { Id = p.Id, Name = Named(p) });
+    }
+  }
+  return profile;
+}
+
+/// Whether an account is a declared actor's own — an agent's, or any other `[Actor]` of the app.
+bool IsAnActor(Principal account) {
+  try {
+    var actor = Actor.From(account);
+    return actor != null;
+  } catch (Exception e) {
+    return false;
+  }
+}
+
+// ── what a person in charge does to an agent ────────────────────────────────────────────────────────────────────────
+
+/// Pause an agent from its page, with the reason. `PauseAgent` says who may.
+[Server, Authorize(IsAuthenticated)]
+public void PauseFromManagement(string agent, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is paused: whoever gives it work next is told."); }
+  PauseAgent(agent, why.Trim());
+}
+
+/// Let a paused agent work again, from its page. `ResumeAgent` says who may.
+[Server, Authorize(IsAuthenticated)]
+public void ResumeFromManagement(string agent, string why = "") { ResumeAgent(agent, why.Trim()); }
+
+/// What the agent's page asks for to run one of its skills: a field for each thing the skill takes (`InputFieldsOf`).
+[Server, Authorize(UsesAgents)]
+public List<SkillInputField> RunFormOf(string agent, string skill) { return InputFieldsOf(SkillOf(agent, skill)); }
+
+/// ⭐ RUN ONE OF AN AGENT'S SKILLS FROM ITS PAGE, with what the form was given — `keys` and `values` side by side.
+/// It is work for whoever runs it (`RunSkill`). Answers the receipt, which the page opens.
+[Server, Authorize(UsesAgents)]
+public Guid RunFromManagement(string agent, string skill, List<string> keys, List<string> values) {
+  var held = SkillOf(agent, skill);
+  var given = new Dictionary<string, string>();
+  for (var i = 0; i < keys.Count && i < values.Count; i++) { given[keys[i]] = values[i]; }
+  return RunSkill(agent, skill, InputJsonOf(InputFieldsOf(held), given));
+}
+
+SkillBase SkillOf(string agent, string skill) {
+  var declared = Declared(agent);
+  if (declared == null) { throw new AgentNotListed($"{AgentName(agent)} is not one of this app's agents."); }
+  foreach (var s in declared!.Skills) { if (s.GetType().FullName == skill) { return s; } }
+  throw new SkillNotHeld($"{AgentName(agent)} does not hold that skill.");
+}
+
+/// Name the person who answers for an agent, from its page. `SponsorAgent` says who may.
+[Server, Authorize(IsAuthenticated)]
+public void SponsorFromManagement(string agent, Guid person) {
+  var sponsor = Principal.FirstOrDefault(p => p.Id == person);
+  if (sponsor == null) { throw new ValidationException("Choose who answers for it."); }
+  SponsorAgent(agent, sponsor!);
+}
+
+/// Call off every piece of an agent's work that is under way — each stops at its next step, a waiting one at once.
+/// Answers how many were called off. `StopAgentTask` says whose work somebody may stop.
+[Server, Authorize(IsAuthenticated)]
+public int StopAllWorkOf(string agent, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why its work is called off: it is kept with each piece."); }
+  var going = AgentTask.Where(t => t.Agent == agent && (t.Status == AgentTaskStatus.Working || t.Status == AgentTaskStatus.Waiting)).Take(200).ToList();
+  foreach (var t in going) { StopAgentTask(t, why.Trim()); }
+  return going.Count;
+}

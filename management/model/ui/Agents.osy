@@ -1,0 +1,462 @@
+// The Agents screens: every agent of the app on one page, and one agent in full — with Pause, Resume, who answers
+// for it, and calling off its work.
+namespace Osysharp.Agents.Management;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.HumanRequests;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Ui;
+
+Tone ToneOfState(string state) {
+  return state == "Working" ? Tone.Primary : state == "Waiting" || state == "Paused" ? Tone.Warning : state == "No sponsor" ? Tone.Danger : Tone.Default;
+}
+
+/// ⭐ EVERY AGENT OF THE APP: who answers for it, whether it is working, what it has under way, what it has spent
+/// against what it may, and how often people corrected it. Each opens its own page.
+///
+/// In a test: `Assert.Visible("Paused", within: "Agent Describer")`, `Ui.Click("Describer")`.
+[Composable]
+public component AgentRoster(string at = "/agents") {
+  Roster? roster = null;
+  bool loaded = false;
+  string problem = "";
+
+  action Load() {
+    try { roster = RosterOf(); problem = ""; } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+
+  render {
+    Stack(gap: 6, w: "100%", label: "Agents") {
+      if (!loaded) { ListSkeleton("Loading the agents"); }
+      if (loaded && roster == null) { Alert("The agents could not be shown: " + problem, tone: Tone.Danger); }
+      if (roster != null) {
+        Stack(gap: 2, label: "In all") {
+          Text(roster.Agents.Count == 1 ? "One agent" : roster.Agents.Count.ToString() + " agents", fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", lineHeight: "1.2");
+          Text(UnderWayWords(roster.Working, roster.Waiting) + " " + roster.Today + " spent on work started today, " + roster.Month + " this month.",
+               fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+          if (!roster.ReadsAll) { Text("The figures count the work you asked for.", fontSize: FontSize.Label, color: Colors.TextMuted); }
+        }
+        if (roster.Unsponsored > 0) {
+          Alert(roster.Unsponsored == 1 ? "One agent has nobody who answers for it, so it does not run. Open it to name somebody."
+                                        : roster.Unsponsored.ToString() + " agents have nobody who answers for them, so they do not run. Open each to name somebody.",
+                tone: Tone.Warning);
+        }
+        if (roster.Agents.Count == 0) {
+          EmptyState("This app has no agents", body: "An agent is a class the app lists where it is configured: app.Agents = new AgentsSetup { Agents = [ … ] }.");
+        }
+        if (roster.Agents.Count > 0) {
+          Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Roster") {
+            foreach (var line in roster.Agents) { RosterRow(line, at, line.Agent == roster.Agents[0].Agent); }
+          }
+        }
+      }
+    }
+  }
+}
+
+string UnderWayWords(int working, int waiting) {
+  if (working + waiting == 0) { return "Nothing is under way."; }
+  var all = working + waiting;
+  return (all == 1 ? "One piece of work is under way" : all.ToString() + " pieces of work are under way")
+       + (waiting == 0 ? "." : waiting == all ? (all == 1 ? ", and it waits." : ", and all of them wait.") : ", " + waiting.ToString() + " of them waiting.");
+}
+
+/// One agent on the roster.
+[Composable]
+component RosterRow(RosterLine line, string at, bool first) {
+  live var underWay = line.Working + line.Waiting == 0 ? "Nothing under way"
+                    : (line.Working == 0 ? "" : line.Working.ToString() + " working") + (line.Working > 0 && line.Waiting > 0 ? ", " : "") + (line.Waiting == 0 ? "" : line.Waiting.ToString() + " waiting");
+  live var corrected = line.Work30 == 0 ? "No work in the last 30 days"
+                     : (line.Corrections30 == 0 ? "Not corrected" : line.Corrections30 == 1 ? "Corrected once" : "Corrected " + line.Corrections30.ToString() + " times")
+                       + " in " + (line.Work30 == 1 ? "1 piece of work" : line.Work30.ToString() + " pieces of work") + ", 30 days";
+  render {
+    Row(gap: 4, px: 5, py: 4, align: Align.Start, wrap: Wrapping.Wrap, borderTW: first ? 0 : 1, border: Colors.Border, label: "Agent " + line.Name) {
+      Stack(gap: 1, grow: 1, minW: "min(100%, 18rem)", basis: "18rem") {
+        Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+          Link(href: AgentHref(at, line.Agent), label: line.Name) { Text(line.Name, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold, color: Colors.OnSurface); }
+          Badge(line.State, tone: ToneOfState(line.State));
+        }
+        if (line.Purpose != "") { Text(line.Purpose, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.45", maxW: "56ch"); }
+        Text(line.Sponsor == "" ? "Nobody answers for it yet." : line.Sponsor + " answers for it.", fontSize: FontSize.Label, color: line.Sponsor == "" ? Colors.Danger.Text : Colors.TextMuted);
+        if (line.Paused && line.PausedWhy != "") { Text("Paused: " + line.PausedWhy, fontSize: FontSize.Label, color: Colors.Warning.Strong, lineHeight: "1.45", maxW: "56ch"); }
+      }
+      Stack(gap: 1, w: "min(100%, 17rem)", shrink: 0, label: "In figures") {
+        Text(underWay, fontSize: FontSize.Label, fontWeight: FontWeight.Medium);
+        if (line.DailyLimit != "") {
+          Text(line.AgainstLimit + " of " + line.DailyLimit + " today", fontSize: FontSize.Label, color: line.AtLimit ? Colors.Danger.Text : Colors.OnSurface);
+          Box(w: "11rem") { ProgressBar(percent: line.LimitPercent, tone: line.AtLimit ? Tone.Danger : Tone.Primary, label: "Today against its limit"); }
+        }
+        if (line.DailyLimit == "") { Text(line.Today + " today", fontSize: FontSize.Label); }
+        Text(line.Month + " this month", fontSize: FontSize.Caption, color: Colors.TextMuted);
+        Text(corrected, fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+    }
+  }
+}
+
+/// ⭐ ONE AGENT, IN FULL: who it acts as and who answers for it, what it does alone and what it proposes, its skills
+/// and the agents it hands work to, what it is told, what it may spend and has, its work, and every time somebody
+/// paused it or let it work again. Whoever the app admits pauses it, resumes it, names its sponsor and calls its
+/// work off, each with the reason.
+///
+/// In a test: `Ui.Click("Pause")`, fill "Why is it paused?", `Ui.Click("Pause it")`.
+[Composable]
+public component AgentProfilePage(string agent, string at = "/agents", Func<Guid, string>? request = null) {
+  AgentProfile? profile = null;
+  bool loaded = false;
+  string problem = "";
+  string mode = "";
+  string why = "";
+  string notice = "";
+  string refused = "";
+  // Running a skill from here: which one, what its form asks for, what was typed (key by key), and the work it started.
+  string running = "";
+  string runningLabel = "";
+  List<SkillInputField> asks = [];
+  List<string> keys = [];
+  List<string> typedIn = [];
+  Guid? started = null;
+
+  action Load() {
+    try { profile = AgentProfileOf(agent); problem = ""; } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+
+  action Ask(string what) { mode = what; why = ""; refused = ""; notice = ""; }
+  action AskPause() { Ask("pause"); }
+  action AskResume() { Ask("resume"); }
+  action AskStop() { Ask("stop"); }
+  action AskSponsor() { Ask("sponsor"); }
+  action Back() { mode = ""; refused = ""; running = ""; }
+  action AskRun(string skill, string label) {
+    Ask("run");
+    started = null;
+    running = skill;
+    runningLabel = label;
+    keys = [];
+    typedIn = [];
+    try { asks = RunFormOf(agent, skill); } catch (Exception ex) { refused = ex.Message; asks = []; }
+  }
+  action Typed(string key, string value) {
+    var at = keys.IndexOf(key);
+    if (at < 0) { keys.Add(key); typedIn.Add(value); }
+    else { typedIn[at] = value; }
+  }
+  action Run() {
+    refused = "";
+    try {
+      started = RunFromManagement(agent, running, keys, typedIn);
+      mode = "";
+      running = "";
+      notice = runningLabel + " was run. Its receipt says how it went.";
+      Load();
+    } catch (Exception ex) { refused = ex.Message; }
+  }
+  action Pause() {
+    refused = "";
+    // The page's own banner says it is paused, and why: no second notice.
+    try { PauseFromManagement(agent, why); mode = ""; notice = ""; Load(); }
+    catch (Exception ex) { refused = ex.Message; }
+  }
+  action Resume() {
+    refused = "";
+    try { ResumeFromManagement(agent, why); mode = ""; notice = AgentName(agent) + " takes work again."; Load(); }
+    catch (Exception ex) { refused = ex.Message; }
+  }
+  action Stop() {
+    refused = "";
+    try {
+      var n = StopAllWorkOf(agent, why);
+      mode = "";
+      notice = n == 0 ? "Nothing was under way." : n == 1 ? "One piece of work is called off. It stops at its next step." : n.ToString() + " pieces of work are called off. Each stops at its next step.";
+      Load();
+    } catch (Exception ex) { refused = ex.Message; }
+  }
+  action Sponsor(Guid person) {
+    refused = "";
+    try { SponsorFromManagement(agent, person); mode = ""; notice = "The person who answers for " + AgentName(agent) + " is named."; Load(); }
+    catch (Exception ex) { refused = ex.Message; }
+  }
+
+  render {
+    Stack(gap: 7, w: "100%", maxW: "860px", label: "Agent") {
+      if (!loaded) { ListSkeleton("Loading the agent"); }
+      if (loaded && profile == null) { Alert("The agent could not be shown: " + problem, tone: Tone.Danger); }
+      if (profile != null && !profile.Listed) {
+        EmptyState("There is no agent called " + profile.Name, body: "It is not one of the agents this app lists.");
+      }
+      if (profile != null && profile.Listed) {
+        // Who it is, where it stands, and what can be done to it.
+        Stack(gap: 3, label: "Where it stands") {
+          Row(gap: 4, align: Align.Start, justify: Justify.Between, wrap: Wrapping.Wrap) {
+            Stack(gap: 2, minW: "0", grow: 1) {
+              Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+                Text(profile.Name, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", lineHeight: "1.2");
+                Badge(profile.State, tone: ToneOfState(profile.State));
+              }
+              if (profile.Purpose != "") { Text(profile.Purpose, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch"); }
+            }
+            if (mode == "") {
+              Row(gap: 2, wrap: Wrapping.Wrap) {
+                if (profile.MayStop && profile.Working + profile.Waiting > 0) { Button("Call off its work", onPress: AskStop, tone: Tone.Ghost); }
+                if (profile.MayPause && !profile.Paused) { Button("Pause", onPress: AskPause); }
+                if (profile.MayPause && profile.Paused) { Button("Resume", onPress: AskResume, tone: Tone.Primary); }
+              }
+            }
+          }
+          if (profile.Paused) {
+            Alert(profile.PausedWhy == "" ? "It takes no new work. Work under way finishes." : profile.PausedWhy + " It takes no new work; work under way finishes.", title: "Paused", tone: Tone.Warning);
+          }
+          if (profile.Sponsor == "") {
+            Alert("Nobody answers for " + profile.Name + ", so it does not run. " + (profile.MaySponsor ? "Name somebody below." : "Whoever is in charge of the agents names somebody."), title: "No sponsor", tone: Tone.Danger);
+          }
+          if (notice != "") {
+            Alert(notice, tone: Tone.Success);
+            if (started != null) { Row { TextLink("Open the work", to: WorkHref(at, started!.Value)); } }
+          }
+          if (mode == "pause") {
+            Stack(gap: 3, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Pausing") {
+              Text("Pause " + profile.Name, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+              Text("It takes no new work until somebody lets it. Work under way finishes; call that off separately if it should stop too.", fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch");
+              TextAreaField("Why is it paused?", value: why, rows: 2, hint: "Whoever gives it work next is told this.");
+              if (refused != "") { Alert(refused, tone: Tone.Danger); }
+              Row(gap: 2, justify: Justify.End) {
+                Button("Back", onPress: Back, tone: Tone.Ghost);
+                Button("Pause it", onPress: Pause, tone: Tone.Primary, disabled: why.Trim() == "");
+              }
+            }
+          }
+          if (mode == "resume") {
+            Stack(gap: 3, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Resuming") {
+              Text("Let " + profile.Name + " work again", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+              TextAreaField("What changed?", value: why, rows: 2, hint: "Kept with the change. You may leave it empty.");
+              if (refused != "") { Alert(refused, tone: Tone.Danger); }
+              Row(gap: 2, justify: Justify.End) {
+                Button("Back", onPress: Back, tone: Tone.Ghost);
+                Button("Let it work", onPress: Resume, tone: Tone.Primary);
+              }
+            }
+          }
+          if (mode == "stop") {
+            Stack(gap: 3, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Calling off") {
+              Text("Call off everything " + profile.Name + " has under way", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+              Text("Each piece stops at its next step and keeps what it has done and spent. Work it handed to other agents stops with it.", fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch");
+              TextAreaField("Why is it called off?", value: why, rows: 2, hint: "Kept with each piece of work.");
+              if (refused != "") { Alert(refused, tone: Tone.Danger); }
+              Row(gap: 2, justify: Justify.End) {
+                Button("Back", onPress: Back, tone: Tone.Ghost);
+                Button("Call it off", onPress: Stop, tone: Tone.Danger, disabled: why.Trim() == "");
+              }
+            }
+          }
+        }
+
+        // Who it is, as an account, and who answers for it.
+        Stack(gap: 3, label: "Who answers for it") {
+          Text("Who answers for it", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          Row(gap: 6, wrap: Wrapping.Wrap, align: Align.Start) {
+            Stack(gap: 1, minW: "12rem", label: "Sponsor") {
+              Text("Sponsor", fontSize: FontSize.Caption, color: Colors.TextMuted);
+              Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+                Text(profile.Sponsor == "" ? "Nobody" : profile.Sponsor, fontSize: FontSize.Body, fontWeight: FontWeight.Medium);
+                if (profile.MaySponsor && mode == "") { Button(profile.Sponsor == "" ? "Name somebody" : "Change", onPress: AskSponsor, size: Size.Sm); }
+              }
+            }
+            Stack(gap: 1, minW: "12rem", label: "Acts as") {
+              Text("Acts as", fontSize: FontSize.Caption, color: Colors.TextMuted);
+              Text(profile.ActsAs == "" ? "Its own account" : profile.ActsAs, fontSize: FontSize.Body, fontWeight: FontWeight.Medium);
+              if (profile.ActsAsEmail != "") { Text(profile.ActsAsEmail, fontSize: FontSize.Caption, color: Colors.TextMuted); }
+            }
+          }
+          Text("Its tools run as that account and, when it works for a person, never past what that person may do themselves.", fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.5", maxW: "66ch");
+          if (mode == "sponsor") {
+            Stack(gap: 3, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Naming a sponsor") {
+              Text("Who answers for " + profile.Name + "?", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+              Text("The sponsor is put what it proposes when it works for nobody, and is told when it gives up.", fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch");
+              Row(gap: 2, wrap: Wrapping.Wrap) {
+                foreach (var p in profile.People) {
+                  Button(p.Name, onPress: () => Sponsor(p.Id), tone: profile.SponsorId == p.Id ? Tone.Primary : Tone.Default, size: Size.Sm);
+                }
+              }
+              if (refused != "") { Alert(refused, tone: Tone.Danger); }
+              Row(gap: 2, justify: Justify.End) { Button("Back", onPress: Back, tone: Tone.Ghost); }
+            }
+          }
+        }
+
+        // What it may do: the declaration, tool by tool.
+        Stack(gap: 3, label: "What it may do") {
+          Text("What it may do", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          if (profile.Alone.Count + profile.Proposes.Count + profile.ProposesEveryTime.Count + profile.Never.Count == 0) {
+            Text(profile.HandsOn.Count > 0 ? profile.Name + " runs no tools of its own. It hands work to other agents, and decides from what comes back."
+                                           : profile.Name + " runs no tools: it answers from what it is given.", fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch");
+          }
+          ToolGroup("Alone", "It runs these by itself, as its own account.", profile.Alone);
+          ToolGroup("Proposes first", "A person sees exactly what would be done, and says yes or no. Somebody the app trusts with it may say \"from now on, alone\".", profile.Proposes);
+          ToolGroup("Proposes every time", "Nobody's \"from now on\" covers these.", profile.ProposesEveryTime);
+          ToolGroup("Never", "It does not, whoever approves.", profile.Never);
+          if (profile.StandingRules > 0) {
+            Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+              Text(profile.StandingRules == 1 ? "One standing rule lets it do more alone." : profile.StandingRules.ToString() + " standing rules let it do more alone.", fontSize: FontSize.Body);
+              TextLink("See the rules", to: RulesHref(at));
+            }
+          }
+          if (profile.Consults != "" || profile.AsksPeople) {
+            Text((profile.Consults == "" ? "" : "When it is unsure it consults " + profile.Consults + ". ") + (profile.AsksPeople ? "It may ask a person, and the work waits for the answer." : ""),
+                 fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch");
+          }
+        }
+
+        Stack(gap: 3, label: "Skills") {
+          Text(profile.Skills.Count == 1 ? "Its skill" : "Its skills", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          if (profile.Skills.Count == 0) { Text("It holds no skill, so it can only be asked something.", fontSize: FontSize.Body, color: Colors.TextSecondary); }
+          foreach (var s in profile.Skills) {
+            Stack(gap: 1, label: "Skill " + s.Label) {
+              Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+                Text(s.Label, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold);
+                Badge("Version " + s.Version);
+                if (s.Budget != "") { Text("At most " + s.Budget + " a piece", fontSize: FontSize.Caption, color: Colors.TextMuted); }
+              }
+              if (s.Description != "") { Text(s.Description, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.45", maxW: "62ch"); }
+              if (profile.MayRun && mode == "") { Row { Button("Run", onPress: () => AskRun(s.Skill, s.Label), size: Size.Sm); } }
+            }
+          }
+          if (mode == "run") {
+            Stack(gap: 3, px: 5, py: 4, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg, label: "Running " + runningLabel) {
+              Text("Run " + runningLabel, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+              Text(profile.Name + " does it for you, as any work you give it: what it proposes comes to you.", fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch");
+              foreach (var f in asks) { RunField(f, Typed); }
+              if (refused != "") { Alert(refused, tone: Tone.Danger); }
+              Row(gap: 2, justify: Justify.End) {
+                Button("Back", onPress: Back, tone: Tone.Ghost);
+                Button("Run it", onPress: Run, tone: Tone.Primary);
+              }
+            }
+          }
+        }
+
+        if (profile.HandsOn.Count > 0) {
+          Stack(gap: 3, label: "Hands work to") {
+            Text("Hands work to", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Stack(gap: 2) {
+              foreach (var h in profile.HandsOn) {
+                Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap, label: "Hands on " + h.Job) {
+                  if (h.ToAgent != "") { TextLink(h.To, to: AgentHref(at, h.ToAgent)); }
+                  if (h.ToAgent == "") { Text("Itself, apart", fontSize: FontSize.Body, fontWeight: FontWeight.Medium); }
+                  Text(h.Job, fontSize: FontSize.Body, color: Colors.TextSecondary);
+                  if (h.Share != "") { Text("with at most " + h.Share, fontSize: FontSize.Caption, color: Colors.TextMuted); }
+                }
+              }
+            }
+            Text("A piece it hands on is done for the same person, never does alone what " + profile.Name + " must propose, and spends out of what " + profile.Name + " has left.",
+                 fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.5", maxW: "66ch");
+          }
+        }
+
+        Stack(gap: 2, label: "What it is told") {
+          Text("What it is told", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          Text(profile.InstructionSet == 0 && profile.ActiveInstructions == 0
+                 ? profile.Name + " works from what its developers wrote, and nothing more."
+                 : "It is on instruction set " + profile.InstructionSet.ToString() + ", with " + (profile.ActiveInstructions == 1 ? "one instruction" : profile.ActiveInstructions.ToString() + " instructions") + " active.",
+               fontSize: FontSize.Body, lineHeight: "1.5", maxW: "62ch");
+          if (profile.ProposedInstructions > 0) {
+            Text(profile.ProposedInstructions == 1 ? "One instruction waits to be read." : profile.ProposedInstructions.ToString() + " instructions wait to be read.", fontSize: FontSize.Body, color: Colors.Warning.Strong);
+          }
+          Row { TextLink("Open its instructions", to: InstructionsHref(at, profile.Agent)); }
+        }
+
+        Stack(gap: 3, label: "Money") {
+          Text("Money", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          Row(gap: 6, wrap: Wrapping.Wrap, align: Align.Start) {
+            FactOf("One piece of work, at most", profile.PerTask);
+            Stack(gap: 1, minW: "12rem", label: "A day") {
+              Text("A day", fontSize: FontSize.Caption, color: Colors.TextMuted);
+              if (profile.DailyLimit == "") { Text("No limit of its own", fontSize: FontSize.Body, fontWeight: FontWeight.Medium); }
+              if (profile.DailyLimit != "") {
+                Text(profile.AgainstLimit + " of " + profile.DailyLimit, fontSize: FontSize.Body, fontWeight: FontWeight.Medium, color: profile.AtLimit ? Colors.Danger.Text : Colors.OnSurface);
+                Box(w: "11rem", pt: 1) { ProgressBar(percent: profile.LimitPercent, tone: profile.AtLimit ? Tone.Danger : Tone.Primary, label: "Today against its limit"); }
+                if (profile.AtLimit) { Text("It has reached what it may spend today. Work that needs a model stops until tomorrow.", fontSize: FontSize.Caption, color: Colors.Danger.Text, lineHeight: "1.45", maxW: "30ch"); }
+              }
+            }
+            FactOf("Work started today", profile.Today);
+            FactOf("Work started this month", profile.Month);
+          }
+          if (!profile.ReadsAll) { Text("The sums count the work you asked for.", fontSize: FontSize.Label, color: Colors.TextMuted); }
+        }
+
+        Stack(gap: 3, label: "Its work") {
+          Row(gap: 3, align: Align.Baseline, wrap: Wrapping.Wrap) {
+            Text("Its work", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Text(profile.Work30 == 0 ? "None in the last 30 days."
+                   : (profile.Work30 == 1 ? "1 piece" : profile.Work30.ToString() + " pieces") + " in the last 30 days, "
+                     + (profile.Corrections30 == 0 ? "none of it corrected." : profile.Corrections30 == 1 ? "corrected once." : "corrected " + profile.Corrections30.ToString() + " times."),
+                 fontSize: FontSize.Label, color: Colors.TextSecondary, label: "How it has done");
+          }
+          if (profile.Recent.Count == 0) { EmptyState("It has not worked yet", body: "Its work is listed here as it is given."); }
+          if (profile.Recent.Count > 0) {
+            Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg) {
+              foreach (var w in profile.Recent) { WorkRow(w, at, w.Task == profile.Recent[0].Task, false); }
+            }
+            Row { TextLink("All its work", to: at + "/workof/" + profile.Agent); }
+          }
+          if (profile.WaitsOn.Count > 0) { WaitingOnPeople(requests: profile.WaitsOn, open: request); }
+        }
+
+        if (profile.History.Count > 0) {
+          Stack(gap: 2, label: "History") {
+            Text("Paused, resumed, sponsored", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Stack(gap: 2) {
+              foreach (var h in profile.History) {
+                Stack(gap: 0, label: "Change") {
+                  Text(h.Said + ".", fontSize: FontSize.Body);
+                  Text(h.When + (h.Why == "" ? "" : ". " + h.Why), fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.45", maxW: "66ch");
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// One group of an agent's tools, under what its declaration says of them.
+[Composable]
+component ToolGroup(string title, string means, List<ToolWords> tools) {
+  render {
+    if (tools.Count > 0) {
+      Stack(gap: 1, label: title) {
+        Text(title, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold);
+        Text(means, fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.45", maxW: "66ch");
+        Stack(gap: 1, pt: 1) {
+          foreach (var t in tools) {
+            Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+              Text(t.Label, fontSize: FontSize.Body);
+              Text(t.Does + (t.Skill == "" ? "" : ", in " + t.Skill.ToLower()) + (t.PutTo == "" ? "" : " · put to " + t.PutTo), fontSize: FontSize.Caption, color: Colors.TextMuted);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// One thing a skill takes, as the Run form asks for it: a line of text, a number, or a yes or no. It keeps what is
+/// typed and tells the form (`typed`) each time that changes.
+[Composable]
+public component RunField(SkillInputField field, Action<string, string> typed) {
+  string text = "";
+  bool yes = false;
+  live var label = field.Required ? field.Label : field.Label + " (if any)";
+
+  on change { typed(field.Name, field.Kind == "yes-no" ? (yes ? "yes" : "no") : text); }
+
+  render {
+    if (field.Kind == "yes-no") { Checkbox(field.Label, value: yes); }
+    if (field.Kind != "yes-no") { Field(label, value: text, hint: field.Kind == "number" ? "A number." : ""); }
+  }
+}

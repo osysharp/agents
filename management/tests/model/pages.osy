@@ -1,0 +1,106 @@
+// The archive's screens: the arrivals book, the inbox as the WorkQueues kit draws it — where what an agent proposes
+// shows as a request — and the management screens, the whole of them under /agents.
+namespace Archive;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Agents.Management;
+
+[Layout]
+component ArchiveFrame() {
+  live var me = Session.CurrentUser;
+  live var myName = me == null ? "" : me.DisplayName;
+  action SignOut() { Session.SignOut(); }
+  action Appearance() { Theme.Toggle(); }
+  render {
+    InboxShell(new AppChrome {
+      Product = "Lantern Street",
+      Tagline = "Film archive",
+      Mark = Icons.Building,
+      Home = "/",
+      Panes = true,
+      User = new ShellUser {
+        Name = myName, Initials = InitialsOf(myName == "" ? "?" : myName), Presence = ShellPresence.Online,
+        Menu = [
+          new MenuAction { Label = "Appearance", Icon = Icons.Eye, OnPress = Appearance },
+          new MenuAction { Label = "Sign out", Icon = Icons.Logout, OnPress = SignOut, Tone = Tone.Danger, Divided = true },
+        ],
+      },
+      Nav = [
+        new NavItem { Kind = NavKind.Section, Label = "Archive", Children = [
+          new NavItem { Label = "Arrivals", To = "/", Icon = Icons.Home, Exact = true },
+          new NavItem { Label = "Agents", To = "/agents", Icon = Icons.Users },
+        ] },
+      ],
+    }) {
+      Outlet();
+    }
+  }
+}
+
+string InitialsOf(string name) {
+  var initials = "";
+  foreach (var part in name.Split(" ")) { if (part != "" && initials.Length < 2) { initials = initials + part.Substring(0, 1).ToUpper(); } }
+  return initials;
+}
+
+/// The arrivals book: each reel, and what the agents have made of it.
+[Route("/")] [Layout(ArchiveFrame)] [Authorize(IsStaff)] [Render(CSR)] [Title("Arrivals")]
+component ArrivalsPage() {
+  live var reels = Reel.OrderBy(r => r.Number).ToList();
+  render {
+    Stack(gap: 6, px: 5, py: 6, w: "100%", maxW: "860px", overflowY: Overflow.Auto, h: "100%") {
+      PageHead("Arrivals", subtitle: "Reels that have come in, and what has been found out about each.");
+      Stack(gap: 4) {
+        foreach (var r in reels) {
+          Stack(gap: 1, label: "Reel " + r.Number) {
+            Row(gap: 3, align: Align.Baseline, wrap: Wrapping.Wrap) {
+              Text(r.Number, fontSize: FontSize.Label, color: Colors.TextMuted, fontFamily: Font.Mono);
+              Text(r.Title, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+              if (r.Quarantined) { Badge("In quarantine", tone: Tone.Warning); }
+            }
+            Text(r.Description == "" ? "Not described yet." : r.Description, fontSize: FontSize.Body, color: r.Description == "" ? Colors.TextMuted : Colors.OnSurface, lineHeight: "1.5", maxW: "62ch");
+          }
+        }
+      }
+    }
+  }
+}
+
+[Route("/inbox/{view}")] [Layout(ArchiveFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Inbox")]
+component InboxPage(string view) {
+  render { InboxPanes(view, r => "/inbox/" + view + "/i/" + r.Id, Guid.Empty) { InboxOverview(view); } }
+}
+
+[Route("/inbox/{view}/i/{id}")] [Layout(ArchiveFrame)] [Authorize(WorksInbox)] [Render(CSR)] [Title("Item")]
+component ItemPage(string view, Guid id) {
+  live var items = WorkItem.Where(w => w.Id == id).Include(w => w.Queue).Include(w => w.Assignee).ToList();
+  render {
+    InboxPanes(view, r => "/inbox/" + view + "/i/" + r.Id, id) {
+      Stack(gap: 0, grow: 1, minW: "0", h: "100%", minH: "0", overflowY: Overflow.Auto) {
+        if (!Layout.AtLeast(Tablet)) {
+          Row(px: 4, pt: 3) { Link(href: "/inbox/" + view, label: "Back to the list") { Icon(Icons.ChevronLeft); } }
+        }
+        foreach (var item in items) { WorkItemView(item); }
+      }
+    }
+  }
+}
+
+// ⭐ The management screens: three routes, and all of it is there. A request opens in the inbox.
+[Route("/agents")] [Layout(ArchiveFrame)] [Authorize(IsStaff)] [Render(CSR)] [Title("Agents")]
+component AgentsHome() {
+  render { Box(w: "100%", h: "100%", overflowY: Overflow.Auto) { AgentsManagement(request: r => "/inbox/open/i/" + r); } }
+}
+
+[Route("/agents/{section}")] [Layout(ArchiveFrame)] [Authorize(IsStaff)] [Render(CSR)] [Title("Agents")]
+component AgentsSection(string section) {
+  render { Box(w: "100%", h: "100%", overflowY: Overflow.Auto) { AgentsManagement(section, request: r => "/inbox/open/i/" + r); } }
+}
+
+[Route("/agents/{section}/{id}")] [Layout(ArchiveFrame)] [Authorize(IsStaff)] [Render(CSR)] [Title("Agents")]
+component AgentsItem(string section, string id) {
+  render { Box(w: "100%", h: "100%", overflowY: Overflow.Auto) { AgentsManagement(section, id, request: r => "/inbox/open/i/" + r); } }
+}
