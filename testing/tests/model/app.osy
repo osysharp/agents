@@ -1,0 +1,98 @@
+// A lighthouse: the keeper logs what passes, and the mate — an agent — reads the day's log and files a report.
+namespace Lighthouse;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+
+[Role] enum LightRole { Authenticator, Keeper, Mate }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsKeeper => RoleGrant.Any(g => g.Member == user && g.Role == LightRole.Keeper);
+policy IsMate   => RoleGrant.Any(g => g.Member == user && g.Role == LightRole.Mate);
+policy UsesAgents       => IsKeeper;
+policy SupervisesAgents => IsKeeper;
+
+entity Hand : Principal {
+  security { allow read when IsAuthenticated || IsAuthenticator; allow create when IsAuthenticator; }
+}
+
+/// One line of the log.
+entity LogEntry {
+  [Required, MaxLength(200)] string What;
+  bool Filed = false;
+  security { allow read, create, update when IsKeeper || IsMate; }
+}
+
+/// What the mate hands back.
+public class Report {
+  public int Ships;
+  public string Weather = "";
+}
+
+/// How many entries the day's log has.
+[Action("Count the log", Query)]
+public int CountLog() { return LogEntry.Count(); }
+
+/// Mark every entry as filed.
+[Action("File the log")]
+public int FileLog() {
+  var entries = LogEntry.Where(e => !e.Filed).ToList();
+  foreach (var e in entries) { e.Filed = true; }
+  return entries.Count;
+}
+
+/// Not one of the mate's tools.
+[Action("Douse the lamp")]
+public string DouseLamp() { return "dark"; }
+
+public class FileReport : Skill<string, Report> {
+  public override string Description => "Read the day's log and file a report.";
+  public override List<ActionInfo> Tools => [Actions.Of(CountLog), Actions.Of(FileLog)];
+  public override string? Check(Report r) => r.Ships < 0 ? "Ships cannot be fewer than none." : null;
+}
+
+[Actor(Roles = [LightRole.Mate])]
+public class Mate : Agent {
+  public static Hand Principal => new Hand { Email = "mate@lighthouse.example", DisplayName = "Mate" };
+  public override string Purpose => "You keep the lighthouse's daily report.";
+  public override List<SkillBase> Skills => [new FileReport()];
+  // What it does here it does by itself: this app's tests are not about what a person approves first.
+  public override Permits May => Permits.Everything();
+  public override string Consults => "Beacon";
+}
+
+/// Says what ships are in sight.
+public class WatchTheSea : Skill<string, Report> {
+  public override string Description => "Say what ships are in sight.";
+}
+
+/// Keeps watch from the gallery.
+[Actor(Roles = [LightRole.Mate])]
+public class Lookout : Agent {
+  public static Hand Principal => new Hand { Email = "lookout@lighthouse.example", DisplayName = "Lookout" };
+  public override string Purpose => "You keep watch over the sea.";
+  public override List<SkillBase> Skills => [new WatchTheSea()];
+}
+
+/// Writes the day up: has the mate file the log and the lookout say what is in sight — both at once.
+public class WriteUpTheDay : Skill<string, Report> {
+  public override string Description => "Write the day up.";
+}
+
+[Actor(Roles = [LightRole.Mate])]
+public class Bosun : Agent {
+  public static Hand Principal => new Hand { Email = "bosun@lighthouse.example", DisplayName = "Bosun" };
+  public override string Purpose => "You see that the day is written up.";
+  public override List<SkillBase> Skills => [new WriteUpTheDay()];
+  public override Permits May => Permits.Everything();
+  public override Delegation Delegates => new Delegation {
+    To = [Specialist.Of<Mate>(new FileReport()), Specialist.Of<Lookout>(new WatchTheSea())],
+  };
+}
+
+public AgentOutcome<Report> WriteUp(string day) { return await Agents.Of<Bosun>().Do(new WriteUpTheDay(), day, about: "The day's write-up"); }
+
+public AgentOutcome<Report> FileToday() { return await Agents.Of<Mate>().Do(new FileReport(), "today", about: "Today's log"); }
+public AgentReply AskMate(string question) { return await Agents.Of<Mate>().Ask(question); }

@@ -1,0 +1,278 @@
+// A script for the model: what it answers on each turn of a piece of work.
+namespace Osysharp.Agents.Testing;
+
+using Osysharp.Llm;
+using Osysharp.Agents;
+
+/// ⭐ ONE THING A SCRIPTED MODEL SAYS on a turn.
+///
+///     Says.Tool(Actions.Of(Weigh), "{\"crate\":\"…\"}")      // it asks for a tool
+///     Says.HandBack(new Grade { Score = 7 })                 // it hands its typed result back
+///     Says.Words("Three crates, one short.")                 // it answers in words
+///     Says.Consult("Is 9.8 kg short?", "The rule says under 10 kg.")   // it asks the model it consults
+///     Says.AskPerson("May I send it to juice?", "It is bruised.")       // it asks a person, and the work waits
+///     Says.HandTo<Checker>(new CheckPapers(), "{\"id\":\"…\"}")          // it hands a piece of the work on
+///     Says.Together(Says.HandTo<…>(…), Says.HandTo<…>(…))               // …several pieces in one turn, done side by side
+///
+/// Each takes the tokens the answer is said to have used (`input`, `output`) — what the meter prices.
+public class Says {
+  /// It asks for one of the app's actions, with these arguments as JSON.
+  public static LlmResponse Tool(ActionInfo action, string argumentsJson, int input = 100, int output = 20) {
+    return Scripted.ToolUse(BareName(action.Name), argumentsJson, "call-" + BareName(action.Name), input, output);
+  }
+
+  /// It asks for a tool by the name the model would use — for a name that is NOT one of its tools.
+  public static LlmResponse Tool(string name, string argumentsJson, int input = 100, int output = 20) {
+    return Scripted.ToolUse(name, argumentsJson, "call-" + name, input, output);
+  }
+
+  /// It hands back its finished result.
+  public static LlmResponse HandBack<T>(T result, int input = 100, int output = 20) {
+    return Scripted.ToolUse("hand_back", JsonSerializer.Serialize(result), "call-hand-back", input, output);
+  }
+
+  /// It hands back this JSON as its result — for a result that is NOT of the shape, or breaks the skill's check.
+  public static LlmResponse HandBackJson(string resultJson, int input = 100, int output = 20) {
+    return Scripted.ToolUse("hand_back", resultJson, "call-hand-back", input, output);
+  }
+
+  /// It answers in words.
+  public static LlmResponse Words(string text, int input = 100, int output = 20) {
+    return Scripted.Text(text, input, output);
+  }
+
+  /// It says why, and then asks for one of the app's actions — what a model does before a tool a person must approve.
+  public static LlmResponse Tool(string why, ActionInfo action, string argumentsJson, int input = 100, int output = 20) {
+    var said = Scripted.ToolUse(BareName(action.Name), argumentsJson, "call-" + BareName(action.Name), input, output);
+    said.Content.Insert(0, new LlmContentBlock { Kind = LlmBlockKind.Text, Text = why });
+    return said;
+  }
+
+  /// It asks a person — the one the work is for, or the agent's sponsor.
+  public static LlmResponse AskPerson(string question, string context = "", int input = 100, int output = 20) {
+    return Scripted.ToolUse("ask_person", JsonSerializer.Serialize(new PersonAsk { Question = question, Context = context }),
+                            "call-ask-person", input, output);
+  }
+
+  /// It asks the model the agent consults.
+  public static LlmResponse Consult(string question, string context = "", int input = 100, int output = 20) {
+    return Scripted.ToolUse("consult", JsonSerializer.Serialize(new ConsultAsk { Question = question, Context = context }),
+                            "call-consult", input, output);
+  }
+
+  /// It hands a piece of the work on to the agent `T`, for `skill`, with this input as JSON of what the skill takes
+  /// (`{"id":"…"}` for a skill that takes a row). `call` tells two hand-ons to the same agent in one turn apart.
+  public static LlmResponse HandTo<T>(SkillBase skill, string inputJson, string call = "", int input = 100, int output = 20) {
+    var name = "hand_to_" + BareName(typeof(T).FullName) + "_" + BareName(skill.GetType().FullName);
+    return Scripted.ToolUse(name, inputJson, call == "" ? "call-" + name : call, input, output);
+  }
+
+  /// The input that names one row by its id — what a skill that takes a row is handed.
+  public static string Row(Guid id) { return "{\"id\":\"" + id.ToString() + "\"}"; }
+
+  /// ⭐ SEVERAL THINGS IN ONE TURN: everything each of `asks` asks for, asked for together — how a model hands
+  /// several pieces of work on at once. The tokens are the first one's.
+  public static LlmResponse Together(params LlmResponse[] asks) {
+    var all = new LlmResponse { StopReason = LlmStopReason.ToolUse };
+    var first = true;
+    foreach (var ask in asks) {
+      if (first) { all.InputTokens = ask.InputTokens; all.OutputTokens = ask.OutputTokens; first = false; }
+      foreach (var block in ask.Content) { all.Content.Add(block); }
+    }
+    return all;
+  }
+}
+
+/// ⭐ WHAT THE MODELS ANSWER, TURN BY TURN. The model doing the work answers `Turns` in order — its first answer on
+/// the first turn, the next on the second, whatever went on between. A model that is CONSULTED answers what
+/// `Advises` gave it.
+///
+///     var script = AgentScript.Of(Says.Tool(…), Says.HandBack(…)).Advises("Strong", "Flag it and say so.");
+///     ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+///
+/// Stateless: which turn it is is read from the request, so the same script answers the same way however the calls
+/// are interleaved.
+public class AgentScript {
+  public List<LlmResponse> Turns = [];
+  public List<string> Advisers = [];
+  public List<LlmResponse> Advice = [];
+  /// Names of models that are down: asked, each fails as a provider that cannot be reached.
+  public List<string> Down = [];
+
+  /// A script whose working model answers these, in order.
+  public static AgentScript Of(params LlmResponse[] turns) {
+    var script = new AgentScript();
+    foreach (var turn in turns) { script.Turns.Add(turn); }
+    return script;
+  }
+
+  /// One more turn.
+  public AgentScript Then(LlmResponse turn) { Turns.Add(turn); return this; }
+
+  /// What `model` says when it is consulted (a request that offers it no tools).
+  public AgentScript Advises(string model, string advice, int input = 200, int output = 50) {
+    Advisers.Add(model);
+    Advice.Add(Scripted.Text(advice, input, output));
+    return this;
+  }
+
+  /// `model` cannot be reached.
+  public AgentScript IsDown(string model) { Down.Add(model); return this; }
+
+  /// What `model` answers to `request` — what a test hands `ScriptedAnswer.Stub`.
+  public LlmResponse Answer(string model, LlmRequest request) {
+    if (Down.Contains(model)) { throw new ExternalServiceException(model + " is down."); }
+    // A consult: no tools are offered, and the model is one that advises.
+    if (request.Tools.Count == 0) {
+      var at = Advisers.IndexOf(model);
+      if (at >= 0) { return Advice[at]; }
+    }
+    var turn = 0;
+    foreach (var m in request.Messages) { if (m.Role == "assistant") { turn = turn + 1; } }
+    if (turn >= Turns.Count) {
+      throw new ExternalServiceException($"The script has no answer for turn {turn + 1} of '{model}': it has {Turns.Count}. "
+        + "Add one with `.Then(Says.…)`.");
+    }
+    return Turns[turn];
+  }
+}
+
+/// ⭐ WHAT A PIECE OF WORK DID, read back from its record — for a test to assert.
+///
+///     Assert.Equal(["Weigh", "FlagCrate"], Trajectory.Of(outcome.Task));
+///     Assert.Equal(["Small", "Small", "Small"], Trajectory.Models(outcome.Task));
+///
+/// Read as whoever runs the test: a person sees the record of the work they asked for.
+public class Trajectory {
+  /// The actions the work ASKED for and was allowed, in order, by their own names — "Weigh", "FlagCrate".
+  public static List<string> Of(Guid task) {
+    List<string> tools = [];
+    foreach (var line in Lines(task)) {
+      if (line.Kind == TraceKind.ToolResult) { tools.Add(BareName(line.Tool)); }
+    }
+    return tools;
+  }
+
+  /// Whether the work ran this action.
+  public static bool Called(Guid task, ActionInfo action) { return Of(task).Contains(BareName(action.Name)); }
+
+  /// The model that served each model call of the work, in order — a consult among them.
+  public static List<string> Models(Guid task) {
+    List<string> models = [];
+    foreach (var line in Lines(task)) {
+      if (line.Kind == TraceKind.ModelCall || (line.Kind == TraceKind.AskedForHelp && line.CostMicros > 0)) { models.Add(line.Model); }
+    }
+    return models;
+  }
+
+  /// Every line of the record, as its kind — "Started", "ModelCall", "ToolCall", "ToolResult", "Ended".
+  public static List<string> Kinds(Guid task) {
+    List<string> kinds = [];
+    foreach (var line in Lines(task)) { kinds.Add(line.Kind.Name); }
+    return kinds;
+  }
+
+  /// Every line of the record, as the sentence it says.
+  public static List<string> Said(Guid task) {
+    List<string> said = [];
+    foreach (var line in Lines(task)) { said.Add(line.Summary); }
+    return said;
+  }
+
+  /// How many times the work asked for help.
+  public static int Helps(Guid task) {
+    var asked = 0;
+    foreach (var line in Lines(task)) { if (line.Kind == TraceKind.AskedForHelp) { asked = asked + 1; } }
+    return asked;
+  }
+
+  /// What the work spent on models, in millionths of a US dollar, as its receipt says.
+  public static long Cost(Guid task) { return AgentTask.Single(t => t.Id == task).SpentMicros; }
+
+  /// ⭐ THE TREE of the work `task` is part of, a line a piece: the agent, the skill and where it stands, each piece
+  /// indented under the one that handed it on — `"Coordinator · Take on supplier: Done"`, `"  Checker · Check papers: Done"`.
+  public static List<string> Tree(Guid task) {
+    List<string> lines = [];
+    foreach (var node in WorkTree.Of(AgentTask.Single(t => t.Id == task))) {
+      var indent = "";
+      for (var i = 0; i < node.Depth; i++) { indent = indent + "  "; }
+      lines.Add(indent + node.Agent + (node.Skill == "" ? "" : " · " + node.Skill) + ": " + node.Status.Name);
+    }
+    return lines;
+  }
+
+  /// The agents a piece of work handed work on to, in the order it did — "Checker", "Analyst".
+  public static List<string> HandedOn(Guid task) {
+    List<string> agents = [];
+    foreach (var piece in WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == task))) { agents.Add(BareName(piece.Agent)); }
+    return agents;
+  }
+
+  /// What a piece of work and everything it handed on spent on models, in millionths of a US dollar.
+  public static long TreeCost(Guid task) { return WorkTree.CostOf(AgentTask.Single(t => t.Id == task)); }
+
+  /// The pieces of the work `task` is part of that have not ended — none, once the work at the top has.
+  public static List<string> StillGoing(Guid task) {
+    List<string> going = [];
+    foreach (var node in WorkTree.Of(AgentTask.Single(t => t.Id == task))) {
+      if (node.Status == AgentTaskStatus.Working || node.Status == AgentTaskStatus.Waiting) { going.Add(node.Agent + ": " + node.Status.Name); }
+    }
+    return going;
+  }
+
+  static List<TraceEvent> Lines(Guid task) {
+    return TraceEvent.Where(e => e.Task.Id == task).OrderBy(e => e.Seq).ToList();
+  }
+}
+
+/// ⭐ WHAT THE AGENTS DID IN ONE RUN OF A PROCESS, read back from their receipts — for a test that walks a whole
+/// process with scripted models and asserts where it went, what was proposed on the way and what it cost.
+///
+///     Assert.Equal(["CheckDocuments", "AssessRisk", "SettleTerms"], ProcessTrail.Skills(supplier.Id));
+///     Assert.Equal(["ApproveSupplier"], ProcessTrail.Proposed(supplier.Id));
+///     Assert.True(ProcessTrail.Cost(supplier.Id) <= 20000);            // two cents, in millionths of a dollar
+///
+/// `item` is the row the process's workflow tracks. Read as whoever runs the test: a person sees the receipts they
+/// may read.
+public class ProcessTrail {
+  /// The pieces of work the run itself gave, in the order it gave them, by their receipts.
+  public static List<AgentTask> Steps(Guid item) {
+    return AgentTask.Where(t => t.RunItem == item && t.Parent == null).OrderBy(t => t.StartedAt).ThenBy(t => t.RunStep).ToList();
+  }
+
+  /// The skill of each step, by its own name — "CheckDocuments". A step tried again is there once for each attempt.
+  public static List<string> Skills(Guid item) {
+    List<string> skills = [];
+    foreach (var step in Steps(item)) { skills.Add(BareName(step.Skill)); }
+    return skills;
+  }
+
+  /// The state of the process that gave each step its work.
+  public static List<string> States(Guid item) {
+    List<string> states = [];
+    foreach (var step in Steps(item)) { states.Add(step.RunState); }
+    return states;
+  }
+
+  /// How each step ended — "Done", "Failed", "Waiting".
+  public static List<string> Ended(Guid item) {
+    List<string> ended = [];
+    foreach (var step in Steps(item)) { ended.Add(step.Status.Name); }
+    return ended;
+  }
+
+  /// The actions the run's agents proposed to a person, in order, by their own names — "ApproveSupplier".
+  public static List<string> Proposed(Guid item) {
+    List<string> proposed = [];
+    foreach (var p in AgentProposal.Where(p => p.Task.RunItem == item).OrderBy(p => p.At).ToList()) { proposed.Add(BareName(p.Action)); }
+    return proposed;
+  }
+
+  /// What the run's agent work spent on models, in millionths of a US dollar — every step, every attempt, and the
+  /// work each handed on.
+  public static long Cost(Guid item) {
+    long micros = 0;
+    foreach (var t in AgentTask.Where(t => t.RunItem == item).ToList()) { micros = micros + t.SpentMicros; }
+    return micros;
+  }
+}

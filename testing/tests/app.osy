@@ -1,0 +1,11 @@
+// The producer's test project for Osysharp.Agents.Testing — a lighthouse whose keeper has a mate that reads the day's
+// log and files a report. Its models are scripted, as every test's are.
+app Lighthouse {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Agents@1;
+  use Osysharp.Agents.Testing@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Observability;
+}

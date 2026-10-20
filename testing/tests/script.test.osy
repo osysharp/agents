@@ -1,0 +1,177 @@
+// Osysharp.Agents.Testing — a script answers for the model turn by turn, and what the agent then did is read back from
+// its record.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Lighthouse;
+
+[TestFixture]
+void Rock() {
+  var kit = new Hand { Email = "kit@lighthouse.example", DisplayName = "Kit" };
+  new RoleGrant { Member = kit, Role = LightRole.Keeper };
+  new LogEntry { What = "A collier, north-bound, at dawn." };
+  new LogEntry { What = "Fog from noon." };
+  new AgentSeat { Agent = "Lighthouse.Mate", Sponsor = kit };
+  new AgentSeat { Agent = "Lighthouse.Lookout", Sponsor = kit };
+  new AgentSeat { Agent = "Lighthouse.Bosun", Sponsor = kit };
+}
+
+principal Kit => Hand.Single(h => h.Email == "kit@lighthouse.example");
+
+[Test(Rock)]
+[runas(Kit)]
+void a_script_answers_turn_by_turn_and_the_trajectory_is_what_the_agent_did() {
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(CountLog), "{}"),
+    Says.Tool(Actions.Of(FileLog), "{}"),
+    Says.HandBack(new Report { Ships = 1, Weather = "Fog from noon." }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = FileToday();
+
+  Assert.True(outcome.Done);
+  Assert.Equal(1, outcome.Result.Ships);
+  Assert.Equal("Fog from noon.", outcome.Result.Weather);
+  Assert.Equal(["CountLog", "FileLog"], Trajectory.Of(outcome.Task));
+  Assert.True(Trajectory.Called(outcome.Task, Actions.Of(FileLog)));
+  Assert.False(Trajectory.Called(outcome.Task, Actions.Of(DouseLamp)));
+  // The tools really ran.
+  Assert.Equal(2, LogEntry.Count(e => e.Filed));
+}
+
+[Test(Rock)]
+[runas(Kit)]
+void the_tokens_a_script_says_were_used_are_what_the_work_cost() {
+  var script = AgentScript.Of(Says.Tool(Actions.Of(CountLog), "{}", 1000, 100), Says.HandBack(new Report { Ships = 1 }, 2000, 200));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = FileToday();
+
+  // 1000 + 5×100 and 2000 + 5×200 millionths of a dollar, at the lamp's price.
+  Assert.Equal(4500, Trajectory.Cost(outcome.Task));
+  Assert.Equal(4500, outcome.CostMicros);
+  Assert.Equal(["Lamp", "Lamp"], Trajectory.Models(outcome.Task));
+}
+
+[Test(Rock)]
+[runas(Kit)]
+void a_result_of_the_wrong_shape_and_then_a_good_one() {
+  var script = AgentScript.Of(Says.HandBackJson("{\"Ships\":\"several\"}"), Says.HandBack(new Report { Ships = 3 }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = FileToday();
+
+  Assert.True(outcome.Done);
+  Assert.Equal(3, outcome.Result.Ships);
+  Assert.Equal(["Started", "ModelCall", "SentBack", "ModelCall", "Ended"], Trajectory.Kinds(outcome.Task));
+}
+
+[Test(Rock)]
+[runas(Kit)]
+void a_tool_by_a_name_that_is_not_the_agents_runs_nothing() {
+  var script = AgentScript.Of(Says.Tool("DouseLamp", "{}"), Says.HandBack(new Report { Ships = 0 }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = FileToday();
+
+  Assert.True(outcome.Done);
+  Assert.Equal(0, Trajectory.Of(outcome.Task).Count);
+  Assert.True(Trajectory.Said(outcome.Task).Any(s => s.Contains("`DouseLamp`, which is not one of its tools")));
+}
+
+[Test(Rock)]
+[runas(Kit)]
+void a_consulted_model_says_what_the_script_has_it_advise() {
+  var script = AgentScript.Of(
+    Says.Consult("Does fog count as weather?", "The log says: fog from noon."),
+    Says.HandBack(new Report { Ships = 1, Weather = "Fog." }))
+    .Advises("Beacon", "Yes: report it as the weather.");
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = FileToday();
+
+  Assert.True(outcome.Done);
+  Assert.Equal(1, Trajectory.Helps(outcome.Task));
+  Assert.Equal(["Lamp", "Beacon", "Lamp"], Trajectory.Models(outcome.Task));
+  Assert.Equal("Yes: report it as the weather.", AgentHelp.Single().Answer);
+}
+
+[Test(Rock)]
+[runas(Kit)]
+void a_model_that_is_down_and_a_script_that_runs_out() {
+  // The lamp is down: the work fails as it would with a provider that cannot be reached.
+  var down = AgentScript.Of(Says.HandBack(new Report { Ships = 1 })).IsDown("Lamp");
+  ScriptedAnswer.Stub((model, request) => down.Answer(model, request));
+  var failed = FileToday();
+  Assert.Equal(AgentTaskStatus.Failed, failed.Status);
+  Assert.Contains("Lamp is down.", failed.Problem);
+
+  // A script with one answer, and work that takes two turns: the second says which turn had none.
+  var shortScript = AgentScript.Of(Says.Tool(Actions.Of(CountLog), "{}"));
+  ScriptedAnswer.Stub((model, request) => shortScript.Answer(model, request));
+  var ranOut = FileToday();
+  Assert.Equal(AgentTaskStatus.Failed, ranOut.Status);
+  Assert.Contains("The script has no answer for turn 2 of 'Lamp': it has 1.", ranOut.Problem);
+}
+
+[Test(Rock)]
+[runas(Kit)]
+void words_are_an_answer_when_the_agent_is_only_asked() {
+  var script = AgentScript.Of(Says.Tool(Actions.Of(CountLog), "{}"), Says.Words("Two entries today."));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var reply = AskMate("How many entries are there?");
+
+  Assert.Equal("Two entries today.", reply.Text);
+  Assert.Equal(["CountLog"], Trajectory.Of(reply.Task));
+}
+
+/// What hands a text on: `{"input":"…"}`.
+string Handed(string text) { return "{\"input\":" + JsonSerializer.Serialize(text) + "}"; }
+
+[Test(Rock)]
+[runas(Kit)]
+void a_cast_scripts_several_agents_at_once_and_the_tree_is_what_they_did() {
+  // The bosun hands two pieces of its work on in ONE turn; each of the three has a script of its own.
+  var cast = AgentCast.Of()
+    .Plays<Bosun>(AgentScript.Of(
+      Says.Together(
+        Says.HandTo<Mate>(new FileReport(), Handed("today")),
+        Says.HandTo<Lookout>(new WatchTheSea(), Handed("at dusk"))),
+      Says.HandBack(new Report { Ships = 3, Weather = "Fog from noon." })))
+    .Plays<Mate>(AgentScript.Of(Says.Tool(Actions.Of(FileLog), "{}"), Says.HandBack(new Report { Ships = 1, Weather = "Fog from noon." })))
+    .PlaysAbout<Lookout>("at dusk", AgentScript.Of(Says.HandBack(new Report { Ships = 2 }, 1000, 100)));
+  ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+  var outcome = WriteUp("today");
+
+  Assert.True(outcome.Done);
+  Assert.Equal(3, outcome.Result.Ships);
+  // The tree, a line a piece — and who was handed work, in order.
+  Assert.Equal(["Bosun · Write up the day: Done", "  Mate · File report: Done", "  Lookout · Watch the sea: Done"], Trajectory.Tree(outcome.Task));
+  Assert.Equal(["Mate", "Lookout"], Trajectory.HandedOn(outcome.Task));
+  // Each piece's own trajectory and cost are read from its own receipt; the tree's cost is all of them.
+  var mate = AgentTask.Single(t => t.Agent == "Lighthouse.Mate");
+  Assert.Equal(["FileLog"], Trajectory.Of(mate.Id));
+  Assert.Equal(400, Trajectory.Cost(mate.Id));
+  Assert.Equal(400 + 400 + 1500, Trajectory.TreeCost(outcome.Task));
+  Assert.Equal(0, Trajectory.StillGoing(outcome.Task).Count);
+  Assert.Equal(2, LogEntry.Count(e => e.Filed));
+}
+
+[Test(Rock)]
+[runas(Kit)]
+void a_cast_with_no_script_for_an_agent_fails_the_call_and_says_which() {
+  var cast = AgentCast.Of().Plays<Bosun>(AgentScript.Of(
+    Says.HandTo<Lookout>(new WatchTheSea(), Handed("at dusk")),
+    Says.HandBack(new Report { Ships = 0, Weather = "Nobody watched." })));
+  ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+  var outcome = WriteUp("today");
+
+  // The lookout's model could not be reached — as a provider that is down — and the bosun was told, and went on.
+  Assert.True(outcome.Done);
+  Assert.Equal(["Bosun · Write up the day: Done", "  Lookout · Watch the sea: Failed"], Trajectory.Tree(outcome.Task));
+  Assert.Contains("The cast has no script for Lookout", AgentTask.Single(t => t.Agent == "Lighthouse.Lookout").Outcome);
+}

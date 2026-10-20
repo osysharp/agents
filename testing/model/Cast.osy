@@ -1,0 +1,79 @@
+// A cast — several agents scripted at once, for work that one agent hands on to others.
+namespace Osysharp.Agents.Testing;
+
+using Osysharp.Llm;
+using Osysharp.Agents;
+
+/// ⭐ SEVERAL AGENTS, EACH WITH ITS OWN SCRIPT. Work that is handed on has more than one model answering: the cast
+/// tells them apart by who each request says it is ("You are Checker.") and — when one agent has several pieces of
+/// work under way — by something its job or its brief says.
+///
+///     var cast = AgentCast.Of()
+///       .Plays<Coordinator>(AgentScript.Of(
+///           Says.Together(Says.HandTo<Checker>(new CheckPapers(), PapersOf(s)), Says.HandTo<Analyst>(new AssessRisk(), RiskOf(s))),
+///           Says.HandBack(new Verdict { Take = true })))
+///       .Plays<Checker>(AgentScript.Of(Says.HandBack(new Papers { Complete = true })))
+///       .Plays<Analyst>(AgentScript.Of(Says.HandBack(new Risk { Level = "Low" })));
+///     ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+///
+/// Stateless, like a script: which agent and which turn are read from the request, so the answers are the same
+/// however the calls are interleaved.
+public class AgentCast {
+  public List<string> Agents = [];
+  public List<string> Abouts = [];
+  public List<AgentScript> Scripts = [];
+
+  public static AgentCast Of() { return new AgentCast(); }
+
+  /// The script of every piece of work the agent `T` does.
+  public AgentCast Plays<T>(AgentScript script) { return PlaysAbout<T>("", script); }
+
+  /// The script of the pieces of `T`'s work whose job or brief says `about` — for an agent with several under way:
+  /// a few words of the skill's description ("Count a delivery"), or of what the piece was given ("Crate A-2").
+  public AgentCast PlaysAbout<T>(string about, AgentScript script) {
+    Agents.Add(BareName(typeof(T).FullName));
+    Abouts.Add(about);
+    Scripts.Add(script);
+    return this;
+  }
+
+  /// What `model` answers to `request` — what a test hands `ScriptedAnswer.Stub`.
+  public LlmResponse Answer(string model, LlmRequest request) {
+    var who = AskedAgent(request);
+    var brief = FirstAsked(request);
+    var scene = brief;
+    foreach (var segment in request.SystemSegments) { scene = scene + "\n" + segment.Content; }
+    // A consult says nothing of who it is: whichever script has advice from this model gives it.
+    if (who == "") {
+      foreach (var script in Scripts) { if (script.Advisers.Contains(model) || script.Down.Contains(model)) { return script.Answer(model, request); } }
+    }
+    var at = 0;
+    foreach (var agent in Agents) {
+      if (agent == who && (Abouts[at] == "" || scene.Contains(Abouts[at]))) { return Scripts[at].Answer(model, request); }
+      at = at + 1;
+    }
+    throw new ExternalServiceException($"The cast has no script for {(who == "" ? "this request" : who)}" + (brief == "" ? "." : $" (asked: {brief}).")
+      + " Add one with `.Plays<…>(AgentScript.Of(…))`.");
+  }
+
+  /// The agent a request is put to, by its own name: the request's first words to the model are "You are X."
+  public static string AskedAgent(LlmRequest request) {
+    if (request.SystemSegments.Count == 0) { return ""; }
+    var said = request.SystemSegments[0].Content;
+    if (!said.StartsWith("You are ")) { return ""; }
+    var rest = said.Substring(8);
+    var end = rest.IndexOf(".");
+    return end < 0 ? rest : rest.Substring(0, end);
+  }
+
+  /// What a piece of work was given: the text of the request's first message.
+  public static string FirstAsked(LlmRequest request) {
+    foreach (var m in request.Messages) {
+      if (m.Role != "user") { continue; }
+      var text = "";
+      foreach (var b in m.Content) { if (b.Kind == LlmBlockKind.Text) { text = text + (b.Text ?? ""); } }
+      return text;
+    }
+    return "";
+  }
+}
