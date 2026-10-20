@@ -1,0 +1,103 @@
+// Osysharp.Agents.HumanRequests — the tree of a piece of agent work on its page, driven as a person: who is doing
+// what, where each piece stands, whom it waits for, what each piece and the whole have cost. `osy test --pixels`
+// photographs it — wide and on a phone, light and dark (`Ui.Shot`).
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Workflow;
+using Purchasing;
+
+/// The dairy is being qualified for Noor: three pieces handed on — one finished, one waiting for her, one out of its
+/// allowance. Answers the receipt of the work at the top.
+Guid AQualificationUnderWay() {
+  Guid id = Guid.Empty;
+  runas (Noor) {
+    var dairy = Dairy();
+    var cast = QualifyingTheDairy(dairy);
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    id = Qualify(dairy).Task;
+    Background.Settle();
+    Workflow.Settle(MyRequest());
+  }
+  return id;
+}
+
+[Test(Office)]
+void the_tree_of_a_piece_of_work_is_read_on_its_page() {
+  var top = AQualificationUnderWay();
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Noor);
+  Ui.Visit("/work/" + top);
+  // The whole: what it is about, how many pieces, what it has cost of what it may, and what it waits for.
+  Assert.Visible("4 pieces of work", within: "The whole");
+  Assert.Visible("Qualifying Saltmarsh Dairy", within: "The whole");
+  Assert.Visible("$0.0052", within: "The whole");
+  Assert.Visible("of $0.05", within: "The whole");
+  Assert.Visible("It waits for Safety assessor, which waits for a decision from Noor Haddad.", within: "What it waits for");
+  // Each piece under the one that handed it on: who, what, where it stands, what it cost.
+  Assert.Visible("Waiting", within: "Qualifier Qualify supplier");
+  Assert.Visible("$0.0052 in all · $0.0002 itself", within: "Qualifier Qualify supplier");
+  Assert.Visible("Done", within: "Finance assessor Assess finances");
+  Assert.Visible("$0.0006", within: "Finance assessor Assess finances");
+  Assert.Visible("Waits for a decision from Noor Haddad", within: "Safety assessor Assess safety");
+  Assert.Visible("Stopped", within: "Terms reader Read terms");
+  Assert.Visible("Its money ran out: it could spend $0.0060.", within: "Terms reader Read terms");
+  Assert.Visible("$0.0040", within: "Terms reader Read terms");
+  // …and, under the tree, the request it is waiting on — a press away.
+  Assert.Visible("Safety assessor proposes: Restrict what the supplier may deliver", within: "Waiting on people");
+  Assert.Clickable("Refresh");
+  Assert.NoOverflow();
+  Ui.Shot("work-tree-waiting-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("work-tree-waiting-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/work/" + top);
+  Assert.Visible("It waits for Safety assessor, which waits for a decision from Noor Haddad.", within: "What it waits for");
+  Assert.Visible("Stopped", within: "Terms reader Read terms");
+  Assert.NoOverflow();
+  Ui.Shot("work-tree-waiting-phone-light");
+  Ui.Theme("dark");
+  Ui.Shot("work-tree-waiting-phone-dark");
+  Ui.Theme("light");
+
+  // She approves in her inbox; every piece goes on; the page says so.
+  runas (Noor) { AnswerRequest(MyRequest(), RequestAnswer.Approve()); }
+  LetItGoOn();
+  Ui.Viewport(1440, 900);
+  Ui.Visit("/work/" + top);
+  Assert.Visible("Done", within: "Qualifier Qualify supplier");
+  Assert.Visible("Done", within: "Safety assessor Assess safety");
+  Assert.Visible("$0.0056", within: "The whole");
+  Assert.Hidden("It waits for Safety assessor, which waits for a decision from Noor Haddad.");
+  Assert.NoOverflow();
+  Ui.Shot("work-tree-done-wide-light");
+  Ui.Viewport(390, 844);
+  Ui.Visit("/work/" + top);
+  Assert.Visible("Done", within: "Qualifier Qualify supplier");
+  Assert.NoOverflow();
+  Ui.Shot("work-tree-done-phone-light");
+}
+
+[Test(Office)]
+void a_tree_is_shown_only_to_whoever_may_read_the_work() {
+  var top = AQualificationUnderWay();
+  // Another buyer gives agents work too — and this piece is not hers.
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ilse);
+  Ui.Visit("/work/" + top);
+  Assert.Visible("This piece of work is not yours to see.", within: "Work");
+  Assert.Hidden("Qualifying Saltmarsh Dairy");
+  Assert.NoOverflow();
+  Ui.Shot("work-tree-not-yours-wide-light");
+  // The lead supervises the agents: she reads any piece of work, from any piece of its tree.
+  runas (Tariq) {
+    var piece = AgentTask.Single(t => t.Agent == "Purchasing.TermsReader");
+    Assert.Equal(4, WorkTreeCardOf(piece.Id)!.Lines.Count);
+  }
+}

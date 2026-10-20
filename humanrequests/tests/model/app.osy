@@ -1,0 +1,310 @@
+// The purchasing office: its people, its suppliers, what can be done to a supplier, and the agent that vets one.
+namespace Purchasing;
+
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.ServiceHours;
+
+[Role] enum OfficeRole { Authenticator, Buyer, Lead, Vetting, Finance }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsBuyer   => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Buyer);
+policy IsLead    => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Lead);
+policy IsVetting => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Vetting);
+policy IsOffice  => IsBuyer || IsLead;
+// Finance agrees payment terms. It works its own queue of the inbox, gives agents no work and supervises nothing.
+policy IsFinance => RoleGrant.Any(g => g.Member == user && g.Role == OfficeRole.Finance);
+
+// The inbox: the office works it — and so does the agent's own account, which can hold an item; the lead leads it.
+policy WorksInbox       => IsOffice || IsVetting || IsFinance;
+policy LeadsInbox       => IsLead;
+policy AdministersInbox => IsLead;
+policy ManagesOrganizations  => IsLead;
+policy CollaboratesOnRecords => IsOffice;
+// Requests: the office puts them; the lead oversees them.
+policy AsksPeople       => IsOffice;
+policy OverseesRequests => IsLead;
+// Agents: the office gives the vetter work; the lead answers for it, reads everything, and may widen what it does.
+policy UsesAgents          => IsOffice;
+policy SupervisesAgents    => IsLead;
+policy AuditsAgents        => IsLead;
+// The lead also takes a person who leaves off the records of what the agents did (normally a privacy request does).
+policy ErasesAgentRecords  => IsLead;
+policy WidensAgentAutonomy => IsLead;
+policy ReadsModelUsage     => IsLead;
+policy ManagesModelSpend   => IsLead;
+
+/// Somebody at the office — and the agent's own account.
+entity Person : Principal {
+  [MaxLength(200)] string CodeHash = "";
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+    deny read CodeHash when !IsAuthenticator;
+  }
+}
+
+partial entity ServiceHours { security { allow read when IsOffice; allow create, update, delete when IsLead; } }
+partial entity ServiceWindow { security { allow read when IsOffice; allow create, update, delete when IsLead; } }
+partial entity ServiceException { security { allow read when IsOffice; allow create, update, delete when IsLead; } }
+partial entity WorkItem { security { allow read when IsOffice || IsVetting || IsFinance; } }
+
+public enum SupplierStage { Applied, Vetting, Trading, Declined }
+
+/// A company that wants to sell to the bakeries.
+entity Supplier {
+  [Required, Unique, MaxLength(120)] string Name;
+  [MaxLength(120)] string ContactName = "";
+  [MaxLength(200)] string ContactEmail = "";
+  /// What the supplier told us.
+  [MaxLength(40)] string RegistrationNumber = "";
+  [MaxLength(60)] string Country = "";
+  int PaymentDays = 0;
+  /// What vetting found.
+  [MaxLength(600)] string Risk = "";
+  /// Cleared to trade, and on what terms. The purchasing lead clears a supplier, and so may the vetter's own account
+  /// — which, working for a person, does it only when that person may too.
+  bool Cleared = false;
+  int AgreedPaymentDays = 0;
+  [ModifiedBy] Guid? ChangedBy;
+  SupplierStage Stage = SupplierStage.Applied;
+  [MaxLength(600)] string Note = "";
+  /// What the supplier may deliver, when not everything.
+  [MaxLength(300)] string Restriction = "";
+  security {
+    allow read, create, update when IsOffice || IsVetting;
+    allow read, update when IsFinance;
+    deny update Cleared when !IsLead && !IsVetting;
+    // A payment term is agreed by the lead or by finance — and by the vetter's account, for one of them.
+    deny update AgreedPaymentDays when !IsLead && !IsVetting && !IsFinance;
+  }
+}
+
+/// What the public register says of a company.
+entity RegisterEntry {
+  [Required, Unique, MaxLength(40)] string Number;
+  [MaxLength(200)] string Says = "";
+  security { allow read when IsOffice || IsVetting; allow create when IsLead; }
+}
+
+/// What a supplier is asked for.
+public class CompanyDetails {
+  /// The company's registration number.
+  [MaxLength(40)] public string RegistrationNumber = "";
+  /// The country it is registered in.
+  [MaxLength(60)] public string Country = "";
+  /// The payment term it asks for, in days.
+  public int PaymentDays;
+}
+
+/// What the vetter hands back.
+public class Vetting {
+  /// Whether the supplier should be taken on.
+  public bool Recommend;
+  /// Why, in a sentence.
+  public string Finding = "";
+}
+
+// ── what can be done to a supplier ──────────────────────────────────────────────────────────────────────────────────
+
+/// What the public register says of the supplier's company.
+[Action("Look the company up", Query)]
+public string LookUp(Supplier supplier) {
+  var entry = RegisterEntry.FirstOrDefault(r => r.Number == supplier.RegistrationNumber);
+  return entry == null ? "No company is registered under " + supplier.RegistrationNumber + "." : entry!.Says;
+}
+
+/// Write down something vetting found.
+[Action("Note a risk")]
+public string NoteRisk(Supplier supplier, string risk) {
+  supplier.Risk = risk;
+  return "Noted.";
+}
+
+/// Clear the supplier to trade, on a payment term.
+[Action("Clear the supplier to trade")]
+public string ClearSupplier(Supplier supplier, int paymentDays) {
+  supplier.Cleared = true;
+  supplier.AgreedPaymentDays = paymentDays;
+  return $"{supplier.Name} is cleared to trade, paid in {paymentDays} days.";
+}
+
+/// Agree the payment term a supplier is paid on.
+[Action("Agree a payment term")]
+public string AgreeTerm(Supplier supplier, int paymentDays) {
+  supplier.AgreedPaymentDays = paymentDays;
+  return $"{supplier.Name} is paid in {paymentDays} days.";
+}
+
+/// The supplier a tool's arguments name, from their JSON.
+public Supplier? SupplierIn(string argumentsJson) {
+  var values = JsonSerializer.Deserialize<Dictionary<string, Json>>(argumentsJson);
+  if (!values.ContainsKey("supplier")) { return null; }
+  var id = Guid.Parse(values["supplier"].ToString().Replace("\"", ""));
+  return Supplier.FirstOrDefault(s => s.Id == id);
+}
+
+/// Vets one supplier.
+public class VetSupplier : Skill<Supplier, Vetting> {
+  public override string Description => "Vet one supplier: look the company up, note any risk, and clear it to trade if it is sound.";
+  public override string Instructions => "Look the company up first. A payment term over 30 days is the purchasing lead's to accept: ask before you propose it.";
+  public override List<ActionInfo> Tools => [Actions.Of(LookUp), Actions.Of(NoteRisk), Actions.Of(ClearSupplier)];
+  public override string Brief(Supplier s) => $"{s.Name}, registered as {s.RegistrationNumber} in {s.Country}, asks to be paid in {s.PaymentDays} days. Its id is {s.Id}.";
+  // A person reads the supplier's name, not its id.
+  public override string Names(string action, string argument, string value) {
+    if (argument != "supplier") { return value; }
+    var s = Supplier.FirstOrDefault(x => x.Id == Guid.Parse(value));
+    return s == null ? value : s!.Name;
+  }
+  // A yes to clearing a supplier covers the details it gave: given others, it is asked again.
+  public override string VersionOf(string action, string argumentsJson) {
+    var s = SupplierIn(argumentsJson);
+    return s == null ? "" : s!.RegistrationNumber + "/" + s!.Country + "/" + s!.PaymentDays.ToString();
+  }
+}
+
+/// Settles the payment term a supplier asks for. A term is money: what this proposes goes to Finance — to the queue
+/// its people work — and not to the buyer who asked.
+public class SettleTerms : Skill<Supplier, Vetting> {
+  public override string Description => "Settle the payment term a supplier asks for.";
+  public override List<ActionInfo> Tools => [Actions.Of(LookUp), Actions.Of(AgreeTerm)];
+  public override string Brief(Supplier s) => $"{s.Name} asks to be paid in {s.PaymentDays} days. Its id is {s.Id}.";
+  public override string Names(string action, string argument, string value) {
+    if (argument != "supplier") { return value; }
+    var s = Supplier.FirstOrDefault(x => x.Id == Guid.Parse(value));
+    return s == null ? value : s!.Name;
+  }
+  public override ProposalRoute? DecidedBy(string action) => ProposalRoute.ToQueue("Finance");
+}
+
+/// Vets the companies that apply. It notes what it finds by itself; clearing a supplier is proposed to a person.
+[Actor(Roles = [OfficeRole.Vetting])]
+public class Vetter : Agent {
+  public static Person Principal => new Person { Email = "vetter@crumbandcrust.example", DisplayName = "Vetter" };
+  public override string Purpose => "You vet the companies that apply to supply the bakeries.";
+  public override List<SkillBase> Skills => [new VetSupplier(), new SettleTerms()];
+  public override Permits May => new Permits { Alone = [Actions.Of(NoteRisk)] };
+  public override AsksPeople People => new AsksPeople { MayChoose = true, About = "A payment term over 30 days." };
+}
+
+/// Have the vetter settle a supplier's payment term, for whoever asks.
+public AgentOutcome<Vetting> SettleTermsOf(Supplier supplier) {
+  return await Agents.Of<Vetter>().Do(new SettleTerms(), supplier, about: supplier.Name + ": payment term");
+}
+
+/// Have the vetter vet a supplier, for whoever asks.
+public AgentOutcome<Vetting> Vet(Supplier supplier) {
+  return await Agents.Of<Vetter>().Do(new VetSupplier(), supplier, about: supplier.Name);
+}
+
+// ── taking a supplier on, from its application to trading ───────────────────────────────────────────────────────────
+
+/// A supplier's way in. The company is asked for its details through a link — it has no account; the vetter then
+/// vets it, asking and proposing as it must; and the supplier trades once it has been cleared.
+workflow Onboarding {
+  Tracks = Supplier.Stage; Autostart = false; Initial = Applied;
+  state Applied {
+    enter {
+      var request = Workflow.Once("ask-details", () => AskForDetails(this.Item));
+      var answer = await Requests.Answer(request);
+      if (!answer.Answered) {
+        this.Item.Note = "The company never sent its details: " + answer.ClosedWhy;
+        goto Declined;
+      }
+      var details = answer.As<CompanyDetails>();
+      this.Item.RegistrationNumber = details.RegistrationNumber;
+      this.Item.Country = details.Country;
+      this.Item.PaymentDays = details.PaymentDays;
+      goto Vetting;
+    }
+  }
+  state Vetting {
+    enter {
+      var outcome = await Agents.Of<Vetter>().Do(new VetSupplier(), this.Item, about: this.Item.Name);
+      this.Item.Note = outcome.Done ? outcome.Result.Finding : "Vetting did not finish: " + outcome.Problem;
+      if (outcome.Done && ClearedNow(this.Item.Id)) { goto Trading; }
+      goto Declined;
+    }
+  }
+  terminal success Trading { }
+  terminal cancel  Declined { Message = "the supplier was not taken on"; }
+}
+
+/// Whether the supplier is cleared, as it is stored now — after whatever a person approved meanwhile.
+[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+internal bool ClearedNow(Guid id) { return Supplier.Single(s => s.Id == id).Cleared; }
+
+/// Ask the company — which has no account — for its details.
+public HumanRequest AskForDetails(Supplier supplier) {
+  var ask = NewRequest.For<CompanyDetails>();
+  ask.Title = "Your company's details";
+  ask.Context = "Crumb & Crust needs these before it can take " + supplier.Name + " on as a supplier.";
+  ask.OutsideName = supplier.ContactName;
+  ask.OutsideEmail = supplier.ContactEmail;
+  ask.About = Subject.Of("Supplier", supplier.Id, supplier.Name);
+  ask.AskedByName = "Supplier onboarding";
+  return PutRequest(ask);
+}
+
+/// Start taking a supplier on.
+public void TakeOn(Supplier supplier) { Workflow.Run(supplier); }
+
+// ── an inbox item of the office's own, which a person can hand to the vetter ────────────────────────────────────────
+
+/// A supplier somebody asked the office to look at again.
+entity Review : WorkItem {
+  [Required] Supplier Supplier;
+  security { allow read, create, update when IsOffice || IsVetting; }
+}
+
+/// Hand a review to the vetter: it holds the item, and vets the supplier for whoever handed it over.
+public AgentOutcome<Vetting> HandToVetter(Review review) {
+  return await AgentDesk.Hand(review, Agents.Of<Vetter>(), new VetSupplier(), review.Supplier);
+}
+
+public void TakeBackFromVetter(Review review, string why) { AgentDesk.TakeBack(review, why); }
+
+// ── what the office hears, and sends ────────────────────────────────────────────────────────────────────────────────
+
+/// Something the office was told, so a test can read what happened.
+entity Heard {
+  [Required, MaxLength(40)] string What;
+  [MaxLength(4000)] string About = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}
+
+/// The mail the office "sends": a link for somebody with no account.
+[On] void MailTheLink(HumanRequestPut e) {
+  if (e.Request.OutsideEmail != "") { new Heard { What = "mailed", About = AnswerLinkFor(e.Request) }; }
+  else { new Heard { What = "put", About = e.Request.Title }; }
+}
+[On] void ItemWentToAgent(WorkHandedToAgent e) { new Heard { What = "handed", About = e.Handover.Agent }; }
+[On] void ItemCameBack(WorkBackFromAgent e)    { new Heard { What = "back", About = e.Handover.State.Name + ": " + e.Handover.Note }; }
+
+/// Note what the last message of a request tells the model its tools answered.
+public void NoteAsked(string model, LlmRequest request) {
+  new Heard { What = "asked", About = Scripted.Asked(request) };
+  if (request.Messages.Count == 0) { return; }
+  foreach (var b in request.Messages[request.Messages.Count - 1].Content) {
+    if (b.Kind == LlmBlockKind.ToolResult) { new Heard { What = "result", About = (b.IsError ? "error: " : "") + (b.ResultJson ?? "") }; }
+  }
+}
+
+[AuthMethod]
+string SignInWithCode(string email, string code) {
+  var p = Person.FirstOrDefault(x => x.Email == NormalisedEmail(email));
+  if (p == null || !p.IsActive) { Security.VerifyPassword(code); return ""; }
+  if (!Security.VerifyPassword(code, p.CodeHash)) { return ""; }
+  return Security.IssueJwt(p.Id, p.Email);
+}
+
+app.AuthBootstrap = new AuthBootstrap { Role = OfficeRole.Authenticator, Login = SignInWithCode };
+app.Auth = new PasswordAuth { LoginField = Email, PasswordField = CodeHash };
+app.Audit = new AuditConfig { Redact = new AuditRedaction { Properties = [Purchasing.Person.CodeHash] } };

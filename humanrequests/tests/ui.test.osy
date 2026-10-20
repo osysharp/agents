@@ -1,0 +1,220 @@
+// Osysharp.Agents.HumanRequests — on screen, driven as a person: the vetter's proposal in the lead's inbox (what will
+// happen, to what, why, what it looked at; approve, reject with a reason, approve and let it do this alone), its
+// question, and the page that says who the vetter is waiting on. `osy test --pixels` photographs each — wide and on a
+// phone, light and dark (`Ui.Shot`).
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Workflow;
+using Purchasing;
+
+/// The vetter looks the dairy up and proposes to clear it — for the lead, who asked. Answers the request's id.
+Guid AProposalForTariq() {
+  Guid id = Guid.Empty;
+  runas (Tariq) {
+    var dairy = Dairy();
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(LookUp), SupplierArg(dairy)),
+      Says.Tool("The company is registered and active. One charge is outstanding, which the register shows as routine.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "Cleared on 30 days." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Vet(dairy);
+    Background.Settle();
+    var request = MyRequest();
+    Workflow.Settle(request);
+    id = request.Id;
+  }
+  return id;
+}
+
+/// ⭐ THE PROPOSAL IN THE INBOX. The lead opens it: who proposes, what will happen and to what, why, what the agent
+/// had looked at, what her yes covers — and she approves. It is done at once, as her, and the sheet says so.
+[Test(Office)]
+void a_proposal_is_read_and_approved_from_the_inbox() {
+  var id = AProposalForTariq();
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Tariq);
+  Ui.Visit("/inbox/mine");
+  Assert.Visible("Vetter proposes: Clear the supplier to trade", within: "Mine list");
+  Ui.Visit("/inbox/mine/i/" + id);
+  Assert.Visible("Vetter (an agent) asks for your approval", within: "Request");
+  Assert.Visible("Waiting on this: Saltmarsh Dairy", within: "Request");
+  // Why — the agent's own words — then the call itself, argument by argument.
+  Assert.Visible("The company is registered and active. One charge is outstanding, which the register shows as routine.", within: "Request");
+  Assert.Visible("Clear the supplier to trade", within: "What will happen");
+  Assert.Visible("Changes data", within: "What will happen");
+  Assert.Visible("Saltmarsh Dairy", within: "What will happen");
+  Assert.Visible("Payment days", within: "What will happen");
+  Assert.Visible("30", within: "What will happen");
+  // What it had looked at first.
+  Assert.Visible("Look the company up", within: "What it looked at");
+  Assert.Visible("Saltmarsh Dairy Ltd, registered 2019, active, one charge outstanding.", within: "What it looked at");
+  Assert.Visible("If you approve, it is done at once, as you: Vetter can do it only if you may.", within: "How it runs");
+  Assert.Clickable("Approve");
+  Assert.Clickable("Reject");
+  Assert.Clickable("Approve, and let Vetter do this alone from now on");
+  Assert.NoOverflow();
+  Ui.Shot("proposal-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("proposal-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Click("Approve");
+  Assert.Visible("Approved", within: "Answer");
+  Background.Settle();
+  runas (Tariq) {
+    Assert.True(Dairy().Cleared);
+    Assert.Equal(ProposalStatus.Done, AgentProposal.Single().Status);
+  }
+  // Opened again, the proposal says what came of it.
+  Ui.Visit("/inbox/mine/i/" + id);
+  Assert.Visible("It was done, as Tariq Aziz.", within: "What came of it");
+  Assert.Hidden("Approve, and let Vetter do this alone from now on");
+  Ui.Shot("proposal-done-wide-light");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/inbox/mine/i/" + id);
+  Assert.Visible("It was done, as Tariq Aziz.", within: "What came of it");
+  Assert.NoOverflow();
+  Ui.Shot("proposal-done-phone-light");
+}
+
+/// A no, with its reason — on a phone, in the dark. The reason reaches the agent.
+[Test(Office)]
+void a_proposal_is_rejected_with_a_reason_on_a_phone() {
+  var id = AProposalForTariq();
+  Ui.Viewport(390, 844);
+  Ui.SignInAs(Tariq);
+  Ui.Visit("/inbox/mine/i/" + id);
+  Assert.Visible("Clear the supplier to trade", within: "What will happen");
+  Assert.NoOverflow();
+  Ui.Theme("dark");
+  Ui.Shot("proposal-phone-dark");
+  Ui.Theme("light");
+  Ui.Shot("proposal-phone-light");
+  Ui.Click("Reject");
+  Ui.Fill("Why not?", "Ask them to settle the charge first.");
+  Ui.Click("Reject");
+  Assert.Visible("Not approved", within: "Answer");
+  Background.Settle();
+  runas (Tariq) {
+    Assert.False(Dairy().Cleared);
+    Assert.Equal(ProposalStatus.Rejected, AgentProposal.Single().Status);
+    Assert.Equal("Ask them to settle the charge first.", AgentProposal.Single().Reason);
+  }
+  Ui.Visit("/inbox/mine/i/" + id);
+  Assert.Visible("It was not done.", within: "What came of it");
+  Ui.Shot("proposal-rejected-phone-light");
+}
+
+/// ⭐ "APPROVE, AND LET IT DO THIS ALONE FROM NOW ON". The lead is told what that means before it is said; saying it
+/// approves this one and makes the standing rule.
+[Test(Office)]
+void the_lead_approves_all_like_this_from_the_proposal() {
+  var id = AProposalForTariq();
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Tariq);
+  Ui.Visit("/inbox/mine/i/" + id);
+  Ui.Click("Approve, and let Vetter do this alone from now on");
+  Assert.Visible("From now on Vetter will “Clear the supplier to trade” without asking — in the work it does for you. You can take this back at any time.", within: "From now on, alone");
+  Ui.Shot("proposal-always-wide-light");
+  Ui.Click("Approve, from now on");
+  Assert.Visible("Approved", within: "Answer");
+  Assert.Visible("It was done, as Tariq Aziz.", within: "What came of it");
+  Background.Settle();
+  runas (Tariq) {
+    Assert.True(Dairy().Cleared);
+    Assert.Equal("Purchasing.ClearSupplier", AgentStandingRule.Single().Action);
+  }
+}
+
+/// A buyer is not offered "from now on": that is not hers to say. And the proposal she approves is not done, because
+/// she may not do it — the sheet says so when she looks again.
+[Test(Office)]
+void a_buyer_sees_no_from_now_on_and_is_told_when_her_yes_could_not_be_done() {
+  Guid id = Guid.Empty;
+  runas (Noor) {
+    var dairy = Dairy();
+    var script = AgentScript.Of(
+      Says.Tool("It is registered and active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "Proposed." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Vet(dairy);
+    Background.Settle();
+    id = MyRequest().Id;
+    Workflow.Settle(MyRequest());
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Noor);
+  Ui.Visit("/inbox/mine/i/" + id);
+  Assert.Visible("Clear the supplier to trade", within: "What will happen");
+  Assert.Hidden("Approve, and let Vetter do this alone from now on");
+  Ui.Click("Approve");
+  Background.Settle();
+  Ui.Visit("/inbox/mine/i/" + id);
+  Assert.Visible("It was approved, and could not be done:", within: "What came of it");
+  Ui.Shot("proposal-could-not-wide-light");
+  runas (Noor) { Assert.False(Dairy().Cleared); }
+}
+
+/// ⭐ THE AGENT'S QUESTION, and who it is waiting on. The lead answers in words; the vetter's page lists what it waits
+/// for, and is empty — and says so — once nothing does.
+[Test(Office)]
+void a_question_is_answered_and_the_agents_page_says_who_it_waits_on() {
+  Guid id = Guid.Empty;
+  Guid task = Guid.Empty;
+  runas (Tariq) {
+    var mill = Mill();
+    var script = AgentScript.Of(
+      Says.AskPerson("Hollin Mill asks to be paid in 45 days. Is that acceptable?", "Our standard term is 30 days. The register shows nothing against the company."),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "45 days accepted." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = Vet(mill).Task;
+    Background.Settle();
+    id = MyRequest().Id;
+    Workflow.Settle(MyRequest());
+  }
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Tariq);
+  Ui.Visit("/agents/vetter");
+  Assert.Visible("Hollin Mill asks to be paid in 45 days. Is that acceptable?", within: "Waiting on people");
+  Assert.Visible("Tariq Aziz", within: "Waiting on people");
+  Assert.NoOverflow();
+  Ui.Shot("agent-waiting-wide-light");
+  Ui.Theme("dark");
+  Ui.Shot("agent-waiting-wide-dark");
+  Ui.Theme("light");
+
+  Ui.Visit("/inbox/mine/i/" + id);
+  Assert.Visible("Vetter (an agent) asks", within: "Request");
+  Assert.Visible("Our standard term is 30 days. The register shows nothing against the company.", within: "Request");
+  Ui.Shot("question-wide-light");
+  Ui.Fill("Your answer", "Yes. 45 days is fine for a mill.");
+  Ui.Click("Send the answer");
+  Assert.Visible("Yes. 45 days is fine for a mill.", within: "Answer");
+  Background.Settle();
+  runas (Tariq) {
+    Workflow.Settle(AgentWait.Single());
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+    Assert.Equal("Yes. 45 days is fine for a mill.", AgentHelp.Single().Answer);
+  }
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/agents/vetter");
+  Assert.Visible("Nobody is being waited on.", within: "Waiting on people");
+  Assert.NoOverflow();
+  Ui.Shot("agent-waiting-empty-phone-light");
+}
+
+/// The door into the office: the right code signs a person in, and a wrong code or an unknown address answers the
+/// same nothing.
+[Test(Office)]
+void signing_in_takes_the_right_code_and_nothing_else() {
+  Assert.NotEqual("", SignInWithCode("noor@crumbandcrust.example", "1111"));
+  Assert.Equal("", SignInWithCode("noor@crumbandcrust.example", "9999"));
+  Assert.Equal("", SignInWithCode("nobody@crumbandcrust.example", "1111"));
+}

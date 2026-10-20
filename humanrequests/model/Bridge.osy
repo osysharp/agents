@@ -1,0 +1,221 @@
+// The bridge: what an agent proposes and asks becomes a request in a person's inbox, and their answer is carried
+// back to the work that waits for it.
+namespace Osysharp.Agents.HumanRequests;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+
+/// How this app puts its agents' proposals and questions to people —
+/// `app.AgentRequests = new AgentRequestsSetup { Queue = "Approvals", DecideWithin = TimeSpan.FromHours(8) };`.
+[AppSetting("AgentRequests")]
+public class AgentRequestsSetup {
+  /// The work queue they wait in. "": the requests kit's own default.
+  public string Queue = "";
+  /// How long a proposal may wait for its decision, and a question for its answer, before it is late — counted in
+  /// `Hours`. Null: the requests kit's own default.
+  public TimeSpan? DecideWithin;
+  public TimeSpan? AnswerWithin;
+  /// How long either may wait at all. When it runs out, a proposal is refused with that as the reason and a question
+  /// is told nobody answered; the agent's work goes on from there. Null: until it is answered.
+  public TimeSpan? GiveUpAfter;
+  /// The hours their time is counted in, by the name of the app's `ServiceHours`. "": around the clock.
+  public string Hours = "";
+  /// Work an agent gave up on is put to its sponsor as a question of what should become of it.
+  public bool TellSponsorOfFailures = true;
+}
+
+/// What a request the bridge puts is about: a proposal, a question, or work an agent gave up on.
+public const string ProposalSubject = "AgentProposal";
+public const string QuestionSubject = "AgentQuestion";
+public const string FailureSubject = "AgentFailure";
+/// What waits for it: the piece of work, by its receipt.
+public const string WorkSubject = "AgentTask";
+
+/// An agent's name as a person reads it: "Packhouse.Inspector" → "Inspector".
+public string AgentWords(string agent) { return AgentName(agent); }
+
+Osysharp.ServiceHours.ServiceHours? HoursOf(AgentRequestsSetup setup) {
+  if (setup.Hours == "") { return null; }
+  return Osysharp.ServiceHours.ServiceHours.FirstOrDefault(h => h.Name == setup.Hours);
+}
+
+/// Who a request says is asking: the agent — and, when its work was handed on by another agent, through whom it
+/// comes ("Checker, working for Coordinator"), so the person sees who is asking and for whose work.
+string AskerWords(string agent, string askedThrough) { return askedThrough != "" ? askedThrough : AgentWords(agent); }
+
+/// What a piece of work is called on a request: what it is about, or the agent's name when it says nothing.
+string WorkLabel(AgentTask task) { return task.About != "" ? task.About : AgentWords(task.Agent) + "'s work"; }
+
+/// "orderId" → "Order id".
+string Labelled(string key) {
+  var words = "";
+  foreach (var c in key) {
+    if (char.IsUpper(c) && words != "") { words = words + " " + char.ToLower(c); }
+    else { words = words + (words == "" ? char.ToUpper(c) : c); }
+  }
+  return words;
+}
+
+// ── a proposal becomes an approval in its person's inbox ────────────────────────────────────────────────────────────
+
+[On]
+void PutProposal(AgentProposed e) {
+  var p = e.Proposal;
+  // A proposal its skill sends to a queue is put to nobody by name: whoever works that queue decides it.
+  var toQueue = p.DecideQueue != "";
+  if (p.Status != ProposalStatus.Waiting || (p.DecideBy == null && !toQueue)) { return; }
+  var setup = App.Setting<AgentRequestsSetup>();
+  PutRequest(new NewRequest {
+    Kind = RequestKind.Approval, To = toQueue ? null : p.DecideBy, Queue = toQueue ? p.DecideQueue : setup.Queue,
+    // A proposal its skill sends elsewhere is not decided by the person the work is for, though they work that queue.
+    NotBy = p.Routed ? p.Task.Requester : null,
+    Title = $"{AgentWords(p.Agent)} proposes: {p.Label}",
+    Context = p.Why,
+    // The proposal's own record is read by the person the work is for and by whoever is in charge of the agents.
+    // Whoever works the queue reads the REQUEST — so what would be done, and for whom, is written on it.
+    Facts = toQueue ? FactsOfProposal(p) : [],
+    // A yes covers this call for this version of things: the first twelve characters of the proposal's own sum.
+    About = Subject.Of(ProposalSubject, p.Id, p.Label, version: p.Fingerprint.Substring(0, 12)),
+    WaitingWork = Subject.Of(WorkSubject, p.Task.Id, WorkLabel(p.Task)),
+    AskedByName = AskerWords(p.Agent, p.AskedThrough), AskedByAgent = true,
+    Within = setup.DecideWithin, ExpireAfter = setup.GiveUpAfter, Hours = HoursOf(setup),
+  });
+}
+
+/// What a proposal would do, as facts for a request: what it does, for whom the work is, each argument as the skill
+/// names it, and what the agent had looked at first.
+List<RequestFact> FactsOfProposal(AgentProposal p) {
+  List<RequestFact> facts = [];
+  facts.Add(new RequestFact("What it does", p.Spends ? "Spends money" : p.Sends ? "Sends something to somebody" : p.Changes ? "Changes data" : "Reads only"));
+  if (p.Task.Requester != null) { facts.Add(new RequestFact("The work is for", NameIn(p.Task.Requester!))); }
+  try {
+    foreach (var line in JsonSerializer.Deserialize<List<ProposalLine>>(p.ShownJson)) { facts.Add(new RequestFact(Labelled(line.Name), line.Value)); }
+  } catch (Exception e) { }
+  try {
+    foreach (var seen in JsonSerializer.Deserialize<List<ProposalEvidence>>(p.EvidenceJson).Take(6)) {
+      facts.Add(new RequestFact("It looked at " + seen.Tool, seen.Said.Length > 300 ? seen.Said.Substring(0, 297) + "…" : seen.Said));
+    }
+  } catch (Exception e) { }
+  return facts;
+}
+
+// ── a question becomes a question in its person's inbox ─────────────────────────────────────────────────────────────
+
+[On]
+void PutQuestion(AgentAskedForHelp e) {
+  var q = e.Help;
+  if (q.From != HelpFrom.Person || q.Status != HelpStatus.Waiting || q.AskedPerson == null) { return; }
+  var setup = App.Setting<AgentRequestsSetup>();
+  List<RequestOption> options = [];
+  foreach (var label in JsonSerializer.Deserialize<List<string>>(q.OptionsJson)) {
+    if (label.Trim() != "") { options.Add(RequestOption.Of(label)); }
+  }
+  var ask = new NewRequest {
+    Kind = RequestKind.Question, To = q.AskedPerson, Queue = setup.Queue,
+    Title = q.Question.Length > 200 ? q.Question.Substring(0, 197) + "…" : q.Question,
+    Context = q.Question.Length > 200 ? q.Question + "\n\n" + q.Context : q.Context,
+    Options = options,
+    About = new Subject { Type = QuestionSubject, Id = q.Id, Label = "A question from " + AskerWords(q.Agent, q.AskedThrough) },
+    AskedByName = AskerWords(q.Agent, q.AskedThrough), AskedByAgent = true,
+    Within = setup.AnswerWithin, ExpireAfter = setup.GiveUpAfter, Hours = HoursOf(setup),
+  };
+  if (q.Task != null) { ask.WaitingWork = Subject.Of(WorkSubject, q.Task!.Id, WorkLabel(q.Task!)); }
+  PutRequest(ask);
+}
+
+// ── the answer goes back ────────────────────────────────────────────────────────────────────────────────────────────
+
+[On]
+void CarryAnswer(HumanRequestAnswered e) {
+  var r = e.Request;
+  if (r.SubjectId == null) { return; }
+  if (r.SubjectType == ProposalSubject) {
+    var proposal = AgentProposal.FirstOrDefault(p => p.Id == r.SubjectId);
+    if (proposal == null || proposal!.Status != ProposalStatus.Waiting) { return; }
+    // SECURITY-INVARIANT(agents-an-inbox-yes-is-the-answerers): the decision carried to the proposal names the person
+    // the request recorded as having answered — never whoever asked, and never the app — so the tool runs as them.
+    // Guarded by tests/proposals.test.osy `approving_in_the_inbox_runs_it_as_whoever_approved`.
+    if (r.Choice == ApproveKey()) {
+      if (r.AnsweredBy == null) { return; }
+      RelayProposalDecision(proposal!, true, "", r.AnsweredBy);
+    } else {
+      RelayProposalDecision(proposal!, false, r.Comment, r.AnsweredBy);
+    }
+    return;
+  }
+  if (r.SubjectType == QuestionSubject) {
+    var question = AgentHelp.FirstOrDefault(h => h.Id == r.SubjectId);
+    if (question == null || question!.Status != HelpStatus.Waiting) { return; }
+    var said = AnswerWords(r);
+    if (said == "") { RelayNoAnswerToAgent(question!, "The answer was empty."); return; }
+    RelayAnswerToAgent(question!, said, r.AnsweredBy);
+  }
+}
+
+/// A request's answer as the agent is told it: the option chosen, by its label, and what was written beside it.
+string AnswerWords(HumanRequest r) {
+  var chosen = "";
+  if (r.Choice != "") {
+    foreach (var o in JsonSerializer.Deserialize<List<RequestOption>>(r.OptionsJson)) { if (o.Key == r.Choice) { chosen = o.Label; } }
+    if (chosen == "") { chosen = r.Choice; }
+  }
+  var comment = r.Comment.Trim();
+  if (chosen == "") { return comment; }
+  return comment == "" ? chosen : chosen + " — " + comment;
+}
+
+[On] void NobodyAnswered(HumanRequestExpired e) { WentUnanswered(e.Request, "Nobody answered in the time it could wait."); }
+[On] void RequestCalledOff(HumanRequestCancelled e) { WentUnanswered(e.Request, e.Why == "" ? "The request was called off." : "The request was called off: " + e.Why); }
+
+/// A request closed with no answer: the work that waited is told so, and goes on from there.
+void WentUnanswered(HumanRequest r, string why) {
+  if (r.SubjectId == null) { return; }
+  if (r.SubjectType == ProposalSubject) {
+    var proposal = AgentProposal.FirstOrDefault(p => p.Id == r.SubjectId);
+    if (proposal != null && proposal!.Status == ProposalStatus.Waiting) { RelayProposalDecision(proposal!, false, why, null); }
+  }
+  if (r.SubjectType == QuestionSubject) {
+    var question = AgentHelp.FirstOrDefault(h => h.Id == r.SubjectId);
+    if (question != null && question!.Status == HelpStatus.Waiting) { RelayNoAnswerToAgent(question!, why); }
+  }
+}
+
+// ── decided or answered somewhere else: the request is called off ───────────────────────────────────────────────────
+
+[On]
+void ProposalDecidedElsewhere(AgentProposalDecided e) {
+  CloseRequestsAbout(ProposalSubject, e.Proposal.Id,
+    e.Proposal.Status == ProposalStatus.Withdrawn ? "The work it belonged to was called off." : "It was decided outside the inbox.");
+}
+
+[On]
+void QuestionClosedElsewhere(AgentQuestionClosed e) {
+  CloseRequestsAbout(QuestionSubject, e.Question.Id, "It was answered outside the inbox.");
+}
+
+void CloseRequestsAbout(string type, Guid id, string why) {
+  foreach (var r in HumanRequest.Where(x => x.Status == RequestStatus.Open && x.SubjectType == type && x.SubjectId == id).Take(5).ToList()) {
+    CancelRequest(r, why);
+  }
+}
+
+// ── work an agent gave up on ────────────────────────────────────────────────────────────────────────────────────────
+
+[On]
+void TellTheSponsor(AgentWorkGaveUp e) {
+  var setup = App.Setting<AgentRequestsSetup>();
+  if (!setup.TellSponsorOfFailures) { return; }
+  var seat = AgentSeat.FirstOrDefault(s => s.Agent == e.Task.Agent);
+  if (seat == null || seat!.Sponsor == null) { return; }
+  var tries = e.Attempts == 1 ? "" : $" It was tried {e.Attempts} times.";
+  PutRequest(new NewRequest {
+    Kind = RequestKind.Question, To = seat!.Sponsor, Queue = setup.Queue,
+    Title = $"{AgentWords(e.Task.Agent)} could not finish: {WorkLabel(e.Task)}",
+    Context = e.Problem + tries,
+    Options = [RequestOption.Of("I will take it from here"), RequestOption.Of("Leave it")],
+    About = new Subject { Type = FailureSubject, Id = e.Task.Id, Label = WorkLabel(e.Task) },
+    AskedByName = AgentWords(e.Task.Agent), AskedByAgent = true,
+  });
+}

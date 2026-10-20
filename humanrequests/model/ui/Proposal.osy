@@ -1,0 +1,223 @@
+// What a person sees of an agent's proposal on the request in their inbox: the exact call, what it does, what the
+// agent had looked at — and, once decided, what came of it.
+namespace Osysharp.Agents.HumanRequests;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Ui;
+
+/// A proposal as whoever is looking reads it.
+public class ProposalCard {
+  public Guid Id;
+  /// The agent, as a person reads it, and what it wants to do — "Flag the crate".
+  public string Agent = "";
+  public string Label = "";
+  /// What running it does, as the compiler proved it.
+  public bool Changes = false;
+  public bool Sends = false;
+  public bool Spends = false;
+  /// What it would be run with, a line per argument.
+  public List<RequestFact> Lines = [];
+  /// What the agent had looked at first: each tool, and what came back.
+  public List<ProposalEvidence> Looked = [];
+  public ProposalStatus Status = ProposalStatus.Waiting;
+  /// What came of it, in a sentence, once it was decided.
+  public string Outcome = "";
+  /// Whoever is looking may say "from now on, alone" for this tool.
+  public bool MayAllowAlone = false;
+}
+
+/// A proposal, for the request that is about it. Null when it is not whoever-is-looking's to read.
+[Server, Authorize(IsAuthenticated)]
+public ProposalCard? ProposalCardOf(Guid proposal) {
+  var p = AgentProposal.FirstOrDefault(x => x.Id == proposal);
+  if (p == null) { return null; }
+  var card = new ProposalCard {
+    Id = p!.Id, Agent = AgentWords(p!.Agent), Label = p!.Label, Changes = p!.Changes, Sends = p!.Sends, Spends = p!.Spends,
+    Status = p!.Status,
+  };
+  try {
+    foreach (var line in JsonSerializer.Deserialize<List<ProposalLine>>(p!.ShownJson)) { card.Lines.Add(new RequestFact(Labelled(line.Name), line.Value)); }
+  } catch (Exception e) { }
+  try { card.Looked = JsonSerializer.Deserialize<List<ProposalEvidence>>(p!.EvidenceJson); } catch (Exception e) { }
+  card.Outcome = p!.Status == ProposalStatus.Done ? "It was done, as " + (p!.DecidedBy == null ? "the person who approved" : NameIn(p!.DecidedBy!)) + "."
+               : p!.Status == ProposalStatus.Failed ? "It was approved, and could not be done: " + p!.Problem
+               : p!.Status == ProposalStatus.Rejected ? "It was not done."
+               : p!.Status == ProposalStatus.Stale ? "It was not done: " + p!.Problem + " " + card.Agent + " is looking again."
+               : p!.Status == ProposalStatus.Withdrawn ? "It was withdrawn: " + p!.Problem
+               : "";
+  if (p!.Status == ProposalStatus.Waiting) {
+    var tool = Actions.Find(p!.Action);
+    var skills = Skills.Find(p!.Agent, p!.Skill);
+    var proposedFirst = false;
+    if (skills != null) {
+      foreach (var t in skills!.Tools) { if (t.Action == p!.Action && t.Leave == Leave.Propose) { proposedFirst = true; } }
+    }
+    card.MayAllowAlone = tool != null && proposedFirst && Security.Authorize(Session.CurrentUser, WidensAgentAutonomy);
+  }
+  return card;
+}
+
+/// Whether a request is put to nobody by name — to whoever works its queue.
+[Server, Authorize(IsAuthenticated)]
+public bool PutToAQueue(Guid request) {
+  var r = HumanRequest.FirstOrDefault(x => x.Id == request);
+  return r != null && r!.To == null && r!.OutsideEmail == "";
+}
+
+string NameIn(Principal p) { return p.DisplayName != "" ? p.DisplayName : p.Email; }
+
+/// ⭐ "YES — AND FROM NOW ON, DO THIS ALONE": the standing rule first (`AllowAlone`: for the work the agent does for
+/// whoever says so), then the request answered with a yes, which approves the proposal as that person.
+[Server, Authorize(IsAuthenticated)]
+public string ApproveAndAllowAlone(Guid proposal, Guid request) {
+  var p = AgentProposal.Single(x => x.Id == proposal);
+  var r = HumanRequest.Single(x => x.Id == request);
+  if (r.SubjectType != ProposalSubject || r.SubjectId != p.Id) { throw new AgentRefused("That request is not about this proposal."); }
+  var tool = Actions.Find(p.Action);
+  if (tool == null) { throw new AgentRefused($"There is no action {BareName(p.Action)} any more."); }
+  AllowAlone(p.Agent, tool!, p.Skill, fromProposal: p.Id);
+  var result = AnswerRequest(r, RequestAnswer.Approve());
+  return result.Said;
+}
+
+/// What an agent proposes, drawn on the request that asks for its approval.
+[Contribution("Agent proposal")]
+component ProposalOnARequest(string subjectType, Guid subjectId, Guid request, Action changed) : RequestSubject {
+  ProposalCard? card = null;
+  bool loaded = false;
+  string problem = "";
+  bool confirming = false;
+  bool inQueue = false;
+
+  on mount {
+    if (subjectType == ProposalSubject) {
+      try { card = ProposalCardOf(subjectId); } catch (Exception ex) { problem = ex.Message; }
+      if (card == null && problem == "") { try { inQueue = PutToAQueue(request); } catch (Exception ex) { inQueue = false; } }
+      loaded = true;
+    }
+  }
+
+  action Ask() { confirming = true; problem = ""; }
+  action Back() { confirming = false; }
+  action Always() {
+    problem = "";
+    try {
+      ApproveAndAllowAlone(subjectId, request);
+      confirming = false;
+      card = ProposalCardOf(subjectId);
+      changed();
+    } catch (Exception ex) { problem = ex.Message; }
+  }
+
+  render {
+    if (subjectType == ProposalSubject) {
+      if (!loaded) { Stack(gap: 2, label: "Loading the proposal") { Skeleton(SkeletonShape.Block); Skeleton(SkeletonShape.HalfLine); } }
+      // A proposal its skill sent to a queue is read, by whoever works the queue, from the request itself — what it
+      // would do is among the request's facts — so there is nothing to say here.
+      if (loaded && card == null && (problem != "" || !inQueue)) {
+        Row(gap: 2, align: Align.Center, px: 4, py: 3, bg: Colors.Sunken, rounded: Radius.Lg, label: "Proposal") {
+          Icon(Icons.Info, size: 14, color: Colors.TextMuted);
+          Text(problem != "" ? "The proposal could not be shown: " + problem : "The proposal is not yours to see.", fontSize: FontSize.Label, color: Colors.TextMuted);
+        }
+      }
+      if (card != null) { ProposalBlock(card, confirming, problem, Ask, Back, Always); }
+    }
+  }
+}
+
+/// The proposal itself: what will happen, to what, what the agent had looked at — and how to let it do this alone.
+[Composable]
+public component ProposalBlock(ProposalCard card, bool confirming = false, string problem = "", Action? ask = null, Action? back = null, Action? always = null) {
+  live var does = card.Spends ? "Spends money" : card.Sends ? "Sends something to somebody" : card.Changes ? "Changes data" : "Reads only";
+  render {
+    Stack(gap: 4, label: "Proposal") {
+      // What will happen — the one thing on the block that is big.
+      Stack(gap: 0, borderW: 1, border: Colors.Border, rounded: Radius.Lg, bg: Colors.Surface, label: "What will happen") {
+        Row(gap: 3, px: 4, py: 3, align: Align.Center, justify: Justify.Between, wrap: Wrapping.Wrap) {
+          Stack(gap: 1) {
+            Text("What will happen", fontSize: FontSize.Caption, fontWeight: FontWeight.Medium, color: Colors.TextMuted, letterSpacing: "0.04em", textTransform: TextTransform.Uppercase);
+            Text(card.Label, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold, letterSpacing: "-0.01em");
+          }
+          Badge(does, tone: card.Spends || card.Sends ? Tone.Warning : Tone.Ghost);
+        }
+        foreach (var line in card.Lines) {
+          Row(gap: 4, px: 4, py: 2, justify: Justify.Between, align: Align.Baseline, borderTW: 1, border: Colors.Border) {
+            Text(line.Label, fontSize: FontSize.Label, color: Colors.TextMuted);
+            Text(line.Value, fontSize: FontSize.Body, fontWeight: FontWeight.Medium, textAlign: TextAlign.Right);
+          }
+        }
+      }
+
+      if (card.Looked.Count > 0) {
+        Stack(gap: 2, label: "What it looked at") {
+          SectionLabel("What " + card.Agent + " looked at first");
+          Stack(gap: 0, borderW: 1, border: Colors.Border, rounded: Radius.Lg, bg: Colors.Surface) {
+            foreach (var seen in card.Looked) {
+              Stack(gap: 1, px: 4, py: 3) {
+                Text(seen.Tool, fontSize: FontSize.Label, color: Colors.TextMuted);
+                Text(seen.Said, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "62ch");
+              }
+            }
+          }
+        }
+      }
+
+      if (card.Status == ProposalStatus.Waiting) {
+        Text("If you approve, it is done at once, as you: " + card.Agent + " can do it only if you may.",
+             fontSize: FontSize.Label, color: Colors.TextSecondary, maxW: "62ch", lineHeight: "1.5", label: "How it runs");
+        if (card.MayAllowAlone && !confirming) {
+          Row(gap: 2, align: Align.Center) {
+            Button("Approve, and let " + card.Agent + " do this alone from now on", onPress: () => { if (ask != null) { ask(); } }, tone: Tone.Ghost, size: Size.Sm);
+          }
+        }
+        if (confirming) {
+          Stack(gap: 3, px: 4, py: 4, bg: Colors.Sunken, rounded: Radius.Lg, label: "From now on, alone") {
+            Text("From now on " + card.Agent + " will “" + card.Label + "” without asking — in the work it does for you. You can take this back at any time.",
+                 fontSize: FontSize.Body, maxW: "62ch", lineHeight: "1.5");
+            if (problem != "") { Alert(problem, tone: Tone.Danger); }
+            Row(gap: 2, justify: Justify.End) {
+              Button("Back", onPress: () => { if (back != null) { back(); } }, tone: Tone.Ghost);
+              Button("Approve, from now on", onPress: () => { if (always != null) { always(); } }, tone: Tone.Primary);
+            }
+          }
+        }
+      }
+      if (card.Outcome != "") {
+        Row(gap: 2, align: Align.Start, px: 4, py: 3, bg: Colors.Sunken, rounded: Radius.Lg, label: "What came of it") {
+          if (card.Status == ProposalStatus.Done) { Icon(Icons.Check, size: 14, color: Colors.Success.Text); }
+          if (card.Status != ProposalStatus.Done) { Icon(Icons.Info, size: 14, color: Colors.TextMuted); }
+          Text(card.Outcome, fontSize: FontSize.Body, color: Colors.TextSecondary, maxW: "62ch", lineHeight: "1.5");
+        }
+      }
+    }
+  }
+}
+
+/// ⭐ WHO AN AGENT IS WAITING ON — every open request the agent has put to a person: its proposals to decide and its
+/// questions to answer, of whom, since when, and whether each is late. `open` says where a request's own page is.
+///
+///     AgentWaitingOnPeople(Agents.Of<Clerk>().Name, open: r => "/inbox/open/i/" + r);
+[Composable]
+public component AgentWaitingOnPeople(string agent, Func<Guid, string>? open = null) {
+  // What people call the agent is the app's to say, so it is asked for once, when the component is put on a page.
+  string name = "";
+  bool named = false;
+  on mount { name = AgentWords(agent); named = true; }
+  render { if (named) { WaitingOnPeople(askedByName: name, open: open); } }
+}
+
+/// The same for one piece of an agent's work, by its receipt — and for everything that piece handed on: a request
+/// three pieces down is what the piece at the top is waiting on too.
+[Composable]
+public component WorkWaitingOnPeople(Guid task, Func<Guid, string>? open = null) {
+  List<Guid> behind = [];
+  bool loaded = false;
+  on mount { behind = RequestsBehindWork(task); loaded = true; }
+  render {
+    if (!loaded) { Stack(gap: 2, label: "Loading who it waits on") { Skeleton(); Skeleton(SkeletonShape.HalfLine); } }
+    if (loaded) { WaitingOnPeople(requests: behind, open: open); }
+  }
+}

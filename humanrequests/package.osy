@@ -1,0 +1,38 @@
+// Osysharp.Agents.HumanRequests — an agent's proposals and questions, in the inbox of the person they are for.
+//
+// An agent that may not do something alone proposes it; an agent that needs a person asks one. With both kits in an
+// app, each lands in that person's work queue as a request — an approval of the exact call proposed, a question
+// with its options — and their answer goes back to the work that waits for it:
+//
+//     app Purchasing {
+//       use Osysharp.Agents@1;
+//       use Osysharp.HumanRequests@1;        // …and this bridge is there: nothing to wire.
+//     }
+//
+// ⚑ APPROVING IN THE INBOX IS APPROVING THE PROPOSAL: it runs as whoever approved, for what was shown, exactly as
+//   `ApproveAgentProposal` does — this kit carries the decision, it does not make one.
+//
+// ⚑ AN INBOX ITEM CAN BE HANDED TO AN AGENT, AND TAKEN BACK: `AgentDesk.Hand(item, agent, skill, input)` gives the
+//   item to the agent's own account and the work to the agent; when the work ends the item comes back to whoever
+//   handed it over, with what the agent found. `AgentDesk.TakeBack(item)` calls the work off and takes the item.
+package Osysharp.Agents.HumanRequests {
+  version     "1.3.0";
+  minPlatform "0.14.0";
+  summary     "an agent's proposals and questions as requests in the work queue of the person they are for: the proposal shown as the exact call, why, and what the agent had looked at; approve, reject with a reason, or approve and let it do this alone from now on; the answer carried back to the waiting work; an inbox item handed to an agent and taken back; work an agent gave up on put to its sponsor; and the tree of a piece of agent work on its page — who is doing what, where each piece stands, whom it waits for and what it cost.";
+  completes   Osysharp.Agents@1, Osysharp.HumanRequests@1;
+
+  model "model/**/*.osy";
+  tests "tests";
+  // Who handed an item to an agent.
+  personal Identity;
+  personal Content;
+  use Osysharp.Agents@1;
+  use Osysharp.HumanRequests@1;
+  use Osysharp.WorkQueues@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Workflow;
+  use Osysharp.ServiceHours;
+  use Osysharp.Observability;
+  use Osysharp.Ui;
+}

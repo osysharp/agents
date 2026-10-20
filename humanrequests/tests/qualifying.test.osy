@@ -1,0 +1,152 @@
+// Qualifying a supplier, walked end to end — one agent in charge, three specialists at work at once. The qualifier
+// hands the dairy's finances, its food safety and its terms to an assessor each. The finance assessor finishes. The
+// safety assessor wants to restrict what the dairy may deliver, which it may not do alone: the proposal goes to the
+// buyer who asked, in her inbox, saying through whom it comes — and the whole chain waits for her. The reader of the
+// terms runs out of its allowance. Three days later she approves; each piece goes on; and the qualifier hands back
+// one typed qualification that says what was found, and what could not be.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Workflow;
+using Purchasing;
+
+string RestrictArgs(Supplier s, string to) { return "{\"supplier\":\"" + s.Id.ToString() + "\",\"restriction\":\"" + to + "\"}"; }
+
+/// What each model says while the dairy is qualified.
+AgentCast QualifyingTheDairy(Supplier dairy) {
+  return AgentCast.Of()
+    // The qualifier hands all three assessments on in ONE turn, and then decides from what came back.
+    .Plays<Qualifier>(AgentScript.Of(
+      Says.Together(
+        Says.HandTo<FinanceAssessor>(new AssessFinances(), Says.Row(dairy.Id)),
+        Says.HandTo<SafetyAssessor>(new AssessSafety(), Says.Row(dairy.Id)),
+        Says.HandTo<TermsReader>(new ReadTerms(), Says.Row(dairy.Id))),
+      Says.HandBack(new Qualification {
+        Take = true,
+        Finances = "Sound, with one routine charge outstanding.",
+        Safety = "The cold store passed; the dry store was not seen.",
+        Terms = "Not read: the reading ran out of its allowance.",
+        Conditions = "Chilled goods only, until the dry store is inspected. Have the terms read before the first order.",
+      })))
+    // The finance assessor looks the company up, notes the charge by itself, and hands back.
+    .Plays<FinanceAssessor>(AgentScript.Of(
+      Says.Tool(Actions.Of(LookUp), SupplierArg(dairy)),
+      Says.Tool(Actions.Of(NoteRisk), RiskArgs(dairy, "One charge outstanding")),
+      Says.HandBack(new FinanceFinding { Sound = true, Finding = "Sound, with one routine charge outstanding." })))
+    // The safety assessor reads the inspection and wants a restriction — which it may only propose.
+    .Plays<SafetyAssessor>(AgentScript.Of(
+      Says.Tool(Actions.Of(LastInspection), SupplierArg(dairy)),
+      Says.Tool("Only the cold store was inspected, so only chilled goods are shown to be safe.", Actions.Of(RestrictSupplier), RestrictArgs(dairy, "Chilled goods only")),
+      Says.HandBack(new SafetyFinding { Passed = true, Finding = "The cold store passed; the dry store was not seen." })))
+    // The terms are a long read: one answer of 1000 tokens in and 600 out costs 4000 of the reader's 6000.
+    .Plays<TermsReader>(AgentScript.Of(
+      Says.Tool(Actions.Of(StandardTerms), SupplierArg(dairy), 1000, 600),
+      Says.HandBack(new TermsFinding { Acceptable = true })));
+}
+
+/// Let whatever waits look again: a request that was answered is carried to its proposal, the piece that waited goes
+/// on, and the piece above it follows.
+void LetItGoOn() {
+  for (var i = 0; i < 5; i++) {
+    Background.Settle();
+    foreach (var wait in AgentWait.Where(w => w.Status == AgentWaitStatus.Waiting).ToList()) { Workflow.Settle(wait); }
+  }
+}
+
+[Test(Office)]
+void a_supplier_is_qualified_by_an_agent_in_charge_and_three_specialists() {
+  TestClock.Set(new DateTime(2031, 5, 5, 8, 0, 0, DateTimeKind.Utc));
+  Guid top;
+  runas (Noor) {
+    var dairy = Dairy();
+    var cast = QualifyingTheDairy(dairy);
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+
+    var outcome = Qualify(dairy);
+    top = outcome.Task;
+
+    // 1. Three pieces went out together. One finished, one is waiting for Noor, one ran out of its allowance — and
+    //    the qualifier waits for the one that waits.
+    Assert.True(outcome.Waiting);
+    Assert.Equal([
+      "Qualifier · Qualify supplier: Waiting",
+      "  FinanceAssessor · Assess finances: Done",
+      "  SafetyAssessor · Assess safety: Waiting",
+      "  TermsReader · Read terms: Stopped",
+    ], Trajectory.Tree(top));
+    Assert.Equal("Safety assessor, which waits for a decision from Noor Haddad", AgentTask.Single(t => t.Id == top).WaitingOn);
+    // The finance assessor noted the charge by itself; nothing is restricted yet.
+    Assert.Equal("One charge outstanding", Dairy().Risk);
+    Assert.Equal("", Dairy().Restriction);
+    // The reader of the terms was opened with its share, spent 4000 of it, and its next call did not fit.
+    var reader = AgentTask.Single(t => t.Agent == "Purchasing.TermsReader");
+    Assert.Equal(6000, reader.LimitMicros);
+    Assert.Equal(4000, reader.SpentMicros);
+    Assert.StartsWith("Its money ran out:", reader.Outcome);
+
+    // 2. What the safety assessor proposes is in Noor's inbox — she asked for the qualification — and says through
+    //    whom it comes.
+    Background.Settle();
+    var approval = MyRequest();
+    Assert.Equal(RequestKind.Approval, approval.Asks);
+    Assert.Equal("Safety assessor proposes: Restrict what the supplier may deliver", approval.Title);
+    Assert.Equal("Safety assessor, working for Qualifier", approval.AskedByName);
+    Assert.Equal(AskerKind.Agent, approval.AskedByKind);
+    Assert.Equal("Only the cold store was inspected, so only chilled goods are shown to be safe.", approval.Context);
+    Assert.Equal("Qualifying Saltmarsh Dairy", approval.WaitingLabel);
+    var card = ProposalCardOf(AgentProposal.Single().Id)!;
+    Assert.Equal(["Supplier", "Restriction"], card.Lines.Select(l => l.Label).ToList());
+    Assert.Equal("Saltmarsh Dairy", card.Lines[0].Value);
+    Assert.Equal("Read the last inspection", card.Looked[0].Tool);
+  }
+  // 3. Three days. Nothing runs, and no model is asked.
+  TestClock.Advance(TimeSpan.FromDays(3));
+  LetItGoOn();
+  runas (Noor) {
+    Assert.Equal(7, AgentTask.ToList().Sum(t => t.ModelCalls));
+
+    // 4. She approves in her inbox. The restriction is set at once — as her, and as the safety assessor.
+    AnswerRequest(MyRequest(), RequestAnswer.Approve());
+  }
+  LetItGoOn();
+  runas (Noor) {
+    var dairy = Dairy();
+    Assert.Equal("Chilled goods only", dairy.Restriction);
+    Assert.Equal(Actor.Of<SafetyAssessor>().Id, dairy.ChangedBy);
+    Assert.Equal(Noor.Id, AgentProposal.Single().DecidedBy!.Id);
+    Assert.Equal(0, Requests.Mine().Count);
+
+    // 5. Each piece went on from where it stood, and the qualifier handed back ONE typed result: what each
+    //    assessment found — and what could not be found, and why.
+    Assert.Equal([
+      "Qualifier · Qualify supplier: Done",
+      "  FinanceAssessor · Assess finances: Done",
+      "  SafetyAssessor · Assess safety: Done",
+      "  TermsReader · Read terms: Stopped",
+    ], Trajectory.Tree(top));
+    var receipt = AgentTask.Single(t => t.Id == top);
+    var result = new QualifySupplier().Read(receipt.Result!);
+    Assert.True(result.Take);
+    Assert.Equal("Sound, with one routine charge outstanding.", result.Finances);
+    Assert.Equal("Not read: the reading ran out of its allowance.", result.Terms);
+    Assert.Contains("Chilled goods only", result.Conditions);
+
+    // 6. The record is one chain for the whole tree; it says who handed what to whom and what each piece cost.
+    var said = Trajectory.Said(top);
+    Assert.Equal(3, said.Count(s => s.StartsWith("It handed ")));
+    Assert.True(said.Any(s => s.StartsWith("TermsReader was stopped: Its money ran out:")));
+    Assert.Contains("It waits for Safety assessor, which waits for a decision from Noor Haddad.", said);
+    Assert.True(VerifyTrace(receipt).Intact);
+    // The qualifier's two calls (400), the finance assessor's three (600), the safety assessor's three (600), the
+    // reader's one (4000): the whole cost what its pieces cost, and the meter counted all of it against the top.
+    Assert.Equal(5600, Trajectory.TreeCost(top));
+    Assert.Equal(0.0056m, SpentAgainst("task:" + top.ToString()));
+    // Nothing is left going.
+    Assert.Equal(0, Trajectory.StillGoing(top).Count);
+    Assert.Equal(0, AgentWait.Count(w => w.Status == AgentWaitStatus.Waiting));
+  }
+}

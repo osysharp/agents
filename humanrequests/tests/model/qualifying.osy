@@ -1,0 +1,138 @@
+// Qualifying a supplier — one agent in charge, three specialists at work at once. The qualifier hands the supplier's
+// finances, its food safety and its contract terms to an assessor each; gathers what they find; and hands back one
+// qualification. The safety assessor may change nothing alone, so what it wants to restrict is put to the buyer who
+// asked — in her inbox; the reader of the terms has a small allowance, and runs out.
+namespace Purchasing;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+
+/// What qualifying a supplier comes to.
+public class Qualification {
+  /// Whether to take the supplier on.
+  public bool Take;
+  /// What each assessment found — or why it could not be made.
+  public string Finances = "";
+  public string Safety = "";
+  public string Terms = "";
+  /// What the supplier is taken on under.
+  public string Conditions = "";
+}
+
+public class FinanceFinding { public bool Sound; public string Finding = ""; }
+public class SafetyFinding { public bool Passed; public string Finding = ""; }
+public class TermsFinding { public bool Acceptable; public string Finding = ""; }
+
+/// Limit what the supplier may deliver.
+[Action("Restrict what the supplier may deliver")]
+public string RestrictSupplier(Supplier supplier, string restriction) {
+  supplier.Restriction = restriction;
+  return $"{supplier.Name} is restricted: {restriction}.";
+}
+
+/// What the supplier's last inspection said.
+[Action("Read the last inspection", Query)]
+public string LastInspection(Supplier supplier) {
+  return supplier.Name == "Saltmarsh Dairy" ? "Inspected in March: the cold store passed; the dry store was not seen." : "No inspection on file.";
+}
+
+/// The supplier's standard terms, in full — a long read.
+[Action("Read the supplier's terms", Query)]
+public string StandardTerms(Supplier supplier) {
+  var text = $"Terms of {supplier.Name}. ";
+  for (var i = 1; i <= 30; i++) { text = text + $"Clause {i}: goods are delivered at the buyer's risk unless agreed otherwise in writing. "; }
+  return text;
+}
+
+/// A skill that takes a supplier is handed one by its id.
+public Supplier SupplierHanded(string inputJson) {
+  var id = HandOn.IdIn(inputJson);
+  return Supplier.Single(s => s.Id == id);
+}
+
+public class AssessFinances : Skill<Supplier, FinanceFinding> {
+  public override string Description => "Say whether the supplier's company is financially sound.";
+  public override List<ActionInfo> Tools => [Actions.Of(LookUp), Actions.Of(NoteRisk)];
+  public override string Brief(Supplier s) => $"{s.Name}, registered as {s.RegistrationNumber}. Its id is {s.Id}.";
+  public override string HandedSchema() => HandOn.ById("The supplier to assess.");
+  public override Supplier Handed(string inputJson) => SupplierHanded(inputJson);
+}
+
+public class AssessSafety : Skill<Supplier, SafetyFinding> {
+  public override string Description => "Say whether the supplier's food safety is good enough, and restrict what it may deliver when it is not.";
+  public override List<ActionInfo> Tools => [Actions.Of(LastInspection), Actions.Of(RestrictSupplier)];
+  public override string Brief(Supplier s) => $"{s.Name}. Its id is {s.Id}.";
+  public override string Names(string action, string argument, string value) {
+    if (argument != "supplier") { return value; }
+    var s = Supplier.FirstOrDefault(x => x.Id == Guid.Parse(value));
+    return s == null ? value : s!.Name;
+  }
+  public override string HandedSchema() => HandOn.ById("The supplier to assess.");
+  public override Supplier Handed(string inputJson) => SupplierHanded(inputJson);
+}
+
+public class ReadTerms : Skill<Supplier, TermsFinding> {
+  public override string Description => "Read the supplier's standard terms and say whether they are acceptable.";
+  public override List<ActionInfo> Tools => [Actions.Of(StandardTerms)];
+  public override string Brief(Supplier s) => $"{s.Name}. Its id is {s.Id}.";
+  public override string HandedSchema() => HandOn.ById("The supplier whose terms to read.");
+  public override Supplier Handed(string inputJson) => SupplierHanded(inputJson);
+}
+
+public class QualifySupplier : Skill<Supplier, Qualification> {
+  public override string Description => "Qualify one supplier: have its finances, its food safety and its terms assessed, and say whether to take it on.";
+  public override string Brief(Supplier s) => $"{s.Name}, registered as {s.RegistrationNumber} in {s.Country}. Its id is {s.Id}.";
+}
+
+/// Looks at the company's standing. It notes a risk by itself.
+[Actor(Roles = [OfficeRole.Vetting])]
+public class FinanceAssessor : Agent {
+  public static Person Principal => new Person { Email = "finance-assessor@crumbandcrust.example", DisplayName = "Finance assessor" };
+  public override string Purpose => "You assess whether a company is financially sound.";
+  public override List<SkillBase> Skills => [new AssessFinances()];
+  public override Permits May => new Permits { Alone = [Actions.Of(NoteRisk)] };
+}
+
+/// Looks at food safety. It says nothing of what it may do alone: a restriction is proposed to a person.
+[Actor(Roles = [OfficeRole.Vetting])]
+public class SafetyAssessor : Agent {
+  public static Person Principal => new Person { Email = "safety-assessor@crumbandcrust.example", DisplayName = "Safety assessor" };
+  public override string Purpose => "You assess the food safety of suppliers.";
+  public override List<SkillBase> Skills => [new AssessSafety()];
+}
+
+/// Reads contracts.
+[Actor(Roles = [OfficeRole.Vetting])]
+public class TermsReader : Agent {
+  public static Person Principal => new Person { Email = "terms-reader@crumbandcrust.example", DisplayName = "Terms reader" };
+  public override string Purpose => "You read suppliers' terms.";
+  public override List<SkillBase> Skills => [new ReadTerms()];
+}
+
+/// ⭐ In charge of a qualification: it hands the three assessments on — at once — and decides from what comes back.
+/// Reading the terms gets a small allowance of its own.
+[Actor(Roles = [OfficeRole.Vetting])]
+public class Qualifier : Agent {
+  public static Person Principal => new Person { Email = "qualifier@crumbandcrust.example", DisplayName = "Qualifier" };
+  public override string Purpose => "You qualify the companies that want to supply the bakeries.";
+  public override List<SkillBase> Skills => [new QualifySupplier()];
+  public override Permits May => Permits.ChangesAlone();
+  public override Delegation Delegates => new Delegation {
+    To = [
+      Specialist.Of<FinanceAssessor>(new AssessFinances()),
+      Specialist.Of<SafetyAssessor>(new AssessSafety()),
+      Specialist.Of<TermsReader>(new ReadTerms(), budget: 0.006m),
+    ],
+    MaxDepth = 1,
+  };
+}
+
+/// Have a supplier qualified, for whoever asks.
+public AgentOutcome<Qualification> Qualify(Supplier supplier) {
+  return await Agents.Of<Qualifier>().Do(new QualifySupplier(), supplier, about: "Qualifying " + supplier.Name);
+}

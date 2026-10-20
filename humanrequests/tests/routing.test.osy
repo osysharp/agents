@@ -1,0 +1,148 @@
+// Osysharp.Agents.HumanRequests — a proposal its skill sends to a queue: it lands in that queue's inbox, whoever
+// works the queue decides it, and it runs as them. The buyer who asked for the work does not decide it — not on the
+// proposal, and not from the queue if she works it too.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Workflow;
+using Purchasing;
+
+[TestFixture]
+void OfficeWithFinance() {
+  Office();
+  // Finance: two people and a queue of their own, which only its members read. Ilse — a buyer — works it too.
+  var femi = new Person { Email = "femi@crumbandcrust.example", DisplayName = "Femi Okafor", CodeHash = Security.HashPassword("4444") };
+  var rosa = new Person { Email = "rosa@crumbandcrust.example", DisplayName = "Rosa Lindqvist", CodeHash = Security.HashPassword("5555") };
+  new RoleGrant { Member = femi, Role = OfficeRole.Finance };
+  new RoleGrant { Member = rosa, Role = OfficeRole.Finance };
+  var finance = new Queue { Name = "Finance", Position = 2, Restricted = true };
+  new QueueMember { Queue = finance, Member = femi };
+  new QueueMember { Queue = finance, Member = rosa };
+  new QueueMember { Queue = finance, Member = Person.Single(p => p.Email == "ilse@crumbandcrust.example") };
+}
+
+principal Femi => Person.Single(p => p.Email == "femi@crumbandcrust.example");
+principal Rosa => Person.Single(p => p.Email == "rosa@crumbandcrust.example");
+
+string TermArgs(Supplier s, int days) { return "{\"supplier\":\"" + s.Id.ToString() + "\",\"paymentDays\":" + days.ToString() + "}"; }
+
+AgentScript SettlingTheDairy(Supplier dairy) {
+  return AgentScript.Of(
+    Says.Tool(Actions.Of(LookUp), SupplierArg(dairy)),
+    Says.Tool("It asks for 30 days, which is our standard term.", Actions.Of(AgreeTerm), TermArgs(dairy, 30)),
+    Says.HandBack(new Vetting { Recommend = true, Finding = "Agreed on 30 days." }));
+}
+
+/// ⭐ "TERMS GO TO FINANCE." Noor, a buyer, has the vetter settle the dairy's payment term. What it proposes is put to
+/// the Finance queue: it is not among Noor's requests, and she — who does not work that queue — does not see the
+/// request at all. Femi works the queue: he reads what would be done from the request, says yes, and the term is
+/// agreed AS HIM.
+[Test(OfficeWithFinance)]
+void a_proposal_its_skill_sends_to_a_queue_lands_in_that_queues_inbox_and_runs_as_whoever_approves_there() {
+  Guid task = Guid.Empty;
+  Guid request = Guid.Empty;
+  runas (Noor) {
+    var dairy = Dairy();
+    var script = SettlingTheDairy(dairy);
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var outcome = SettleTermsOf(dairy);
+    task = outcome.Task;
+    Background.Settle();
+
+    Assert.True(outcome.Waiting);
+    var proposal = AgentProposal.Single();
+    Assert.Equal("Finance", proposal.DecideQueue);
+    Assert.Null(proposal.DecideBy);
+    Assert.Equal("a decision from the Finance queue", AgentTask.Single().WaitingOn);
+    // Nothing is in her own inbox, and the Finance queue's request is not hers to see.
+    Assert.Equal(0, Requests.Mine().Count);
+    Assert.Equal(0, HumanRequest.Count());
+    // …nor is the proposal hers to decide, though the work is for her.
+    var refused = Assert.Throws<AgentRefused>(() => ApproveAgentProposal(AgentProposal.Single()));
+    Assert.StartsWith("This proposal is decided by the Finance queue:", refused.Message);
+  }
+  runas (Femi) {
+    // It waits in his queue, put to nobody by name, with what would be done written on it.
+    var waiting = HumanRequest.Single();
+    request = waiting.Id;
+    Assert.Equal("Vetter proposes: Agree a payment term", waiting.Title);
+    Assert.Null(waiting.To);
+    Assert.Equal("Finance", waiting.Queue!.Name);
+    var view = ViewRequest(request)!;
+    Assert.Equal(["What it does: Changes data", "The work is for: Noor Haddad", "Supplier: Saltmarsh Dairy", "Payment days: 30",
+                  "It looked at Look the company up: Saltmarsh Dairy Ltd, registered 2019, active, one charge outstanding."],
+      view.Facts.Select(f => f.Label + ": " + f.Value).ToList());
+    // The proposal's own record is not his: the request is what he reads.
+    Assert.Equal(0, AgentProposal.Count());
+    Assert.Null(ProposalCardOf(Guid.NewGuid()));
+
+    Assert.True(AnswerRequest(waiting, RequestAnswer.Approve()).Applied);
+  }
+  runas (Tariq) { GoOn(task); }
+  runas (Noor) {
+    var dairy = Dairy();
+    Assert.Equal(30, dairy.AgreedPaymentDays);
+    // Written by the vetter's account, for Femi: a buyer may not agree a term, so for Noor it could not have been.
+    Assert.Equal(Actor.Of<Vetter>().Id, dairy.ChangedBy);
+    var proposal = AgentProposal.Single();
+    Assert.Equal(ProposalStatus.Done, proposal.Status);
+    Assert.Equal(Femi.Id, proposal.DecidedBy!.Id);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+    Assert.Contains("Femi Okafor approved AgreeTerm, and it ran as them.", Trajectory.Said(task));
+  }
+}
+
+/// The buyer who asked works the Finance queue too — and still does not decide what her own work proposes there.
+/// Somebody else in the queue does.
+[Test(OfficeWithFinance)]
+void whoever_the_work_is_for_does_not_decide_it_from_the_queue_she_works() {
+  Guid task = Guid.Empty;
+  runas (Ilse) {
+    var dairy = Dairy();
+    var script = SettlingTheDairy(dairy);
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = SettleTermsOf(dairy).Task;
+    Background.Settle();
+    // She works the queue, so she sees the request — and it says it is not hers to answer.
+    var waiting = HumanRequest.Single();
+    var refused = Assert.Throws<RequestRefused>(() => AnswerRequest(waiting, RequestAnswer.Approve()));
+    Assert.Equal("This decides something that was asked for you, so it is not yours to answer. It waits for the people of Finance.", refused.Message);
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+    Assert.Equal(0, Dairy().AgreedPaymentDays);
+  }
+  runas (Rosa) { Assert.True(AnswerRequest(HumanRequest.Single(), RequestAnswer.Reject("We pay this dairy in 14 days.")).Applied); }
+  runas (Tariq) { GoOn(task); }
+  runas (Ilse) {
+    Assert.Equal(ProposalStatus.Rejected, AgentProposal.Single().Status);
+    Assert.Equal(Rosa.Id, AgentProposal.Single().DecidedBy!.Id);
+    Assert.Equal(0, Dairy().AgreedPaymentDays);
+  }
+}
+
+/// Whoever the app says decides agents' proposals still may, outside the queue: the lead says yes on the proposal
+/// itself, and the request in Finance's queue goes with it.
+[Test(OfficeWithFinance)]
+void whoever_decides_agents_proposals_may_still_decide_one_that_was_sent_to_a_queue() {
+  Guid task = Guid.Empty;
+  runas (Noor) {
+    var dairy = Dairy();
+    var script = SettlingTheDairy(dairy);
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = SettleTermsOf(dairy).Task;
+    Background.Settle();
+  }
+  runas (Tariq) {
+    Assert.Equal(ProposalStatus.Done, ApproveAgentProposal(AgentProposal.Single()).Status);
+    UnitOfWork.Commit();
+  }
+  runas (Tariq) { GoOn(task); }
+  runas (Femi) { Assert.Equal(0, HumanRequest.Count(r => r.Status == RequestStatus.Open)); }
+  runas (Tariq) {
+    Assert.Equal(30, Dairy().AgreedPaymentDays);
+    Assert.Equal(Tariq.Id, AgentProposal.Single().DecidedBy!.Id);
+  }
+}

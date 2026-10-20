@@ -1,0 +1,58 @@
+// The office the tests run in: two buyers and the purchasing lead, who answers for the vetter; one queue; and a mill
+// that has applied to supply flour.
+using Osysharp.Identity;
+using Osysharp.Organizations;
+using Osysharp.Organizations.ServicePlans;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Workflow;
+using Purchasing;
+
+[TestFixture]
+void Office() {
+  var noor  = new Person { Email = "noor@crumbandcrust.example",  DisplayName = "Noor Haddad",  CodeHash = Security.HashPassword("1111") };
+  var ilse  = new Person { Email = "ilse@crumbandcrust.example",  DisplayName = "Ilse Brandt",  CodeHash = Security.HashPassword("2222") };
+  var tariq = new Person { Email = "tariq@crumbandcrust.example", DisplayName = "Tariq Aziz",   CodeHash = Security.HashPassword("3333") };
+  new RoleGrant { Member = noor,  Role = OfficeRole.Buyer };
+  new RoleGrant { Member = ilse,  Role = OfficeRole.Buyer };
+  new RoleGrant { Member = tariq, Role = OfficeRole.Lead };
+
+  new OrganizationTier { Name = "Standard", Rank = 1, IsDefault = true };
+  var queue = new Queue { Name = "Purchasing", Position = 1 };
+  foreach (var p in new List<Person> { noor, ilse, tariq }) { new QueueMember { Queue = queue, Member = p }; }
+  new QueueMember { Queue = queue, Member = Actor.Of<Vetter>() };
+
+  new Supplier { Name = "Hollin Mill", ContactName = "Greta Hollin", ContactEmail = "greta@hollinmill.example" };
+  new Supplier { Name = "Saltmarsh Dairy", ContactName = "Owen Pryce", ContactEmail = "owen@saltmarsh.example",
+                 RegistrationNumber = "SD-2210", Country = "Wales", PaymentDays = 30 };
+  new RegisterEntry { Number = "HM-0457", Says = "Hollin Mill Ltd, registered 1987, active, no charges." };
+  new RegisterEntry { Number = "SD-2210", Says = "Saltmarsh Dairy Ltd, registered 2019, active, one charge outstanding." };
+
+  // The lead answers for the vetter — and for the qualifier and the three assessors it hands work to.
+  new AgentSeat { Agent = "Purchasing.Vetter", Sponsor = tariq };
+  new AgentSeat { Agent = "Purchasing.Qualifier", Sponsor = tariq };
+  new AgentSeat { Agent = "Purchasing.FinanceAssessor", Sponsor = tariq };
+  new AgentSeat { Agent = "Purchasing.SafetyAssessor", Sponsor = tariq };
+  new AgentSeat { Agent = "Purchasing.TermsReader", Sponsor = tariq };
+}
+
+principal Noor  => Person.Single(p => p.Email == "noor@crumbandcrust.example");
+principal Ilse  => Person.Single(p => p.Email == "ilse@crumbandcrust.example");
+principal Tariq => Person.Single(p => p.Email == "tariq@crumbandcrust.example");
+
+Supplier Mill()  { return Supplier.Single(s => s.Name == "Hollin Mill"); }
+Supplier Dairy() { return Supplier.Single(s => s.Name == "Saltmarsh Dairy"); }
+string SupplierArg(Supplier s) { return "{\"supplier\":\"" + s.Id.ToString() + "\"}"; }
+string RiskArgs(Supplier s, string risk) { return "{\"supplier\":\"" + s.Id.ToString() + "\",\"risk\":\"" + risk + "\"}"; }
+string ClearArgs(Supplier s, int days) { return "{\"supplier\":\"" + s.Id.ToString() + "\",\"paymentDays\":" + days.ToString() + "}"; }
+
+/// Let the work a person has decided or answered go on: the request's run, then the wait's.
+void GoOn(Guid task) {
+  Background.Settle();
+  Workflow.Settle(AgentWait.Where(w => w.Task.Id == task).OrderByDescending(w => w.Since).First());
+}
+
+/// The request that is open for whoever is signed in.
+HumanRequest MyRequest() { return Requests.Mine().Single(); }

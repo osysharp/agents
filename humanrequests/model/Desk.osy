@@ -1,0 +1,165 @@
+// Handing an inbox item to an agent, and taking it back.
+namespace Osysharp.Agents.HumanRequests;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+
+/// Where a handover stands. ⚠ Appended, never inserted: an enum is stored by position.
+public enum AgentHandoverState {
+  /// The agent holds the item and is working on it — or waiting on a person.
+  [Label("With the agent")] WithAgent,
+  /// The agent's work ended, and the item went back to whoever handed it over, with what the agent found.
+  [Label("Handed back")] Back,
+  /// A person took it back before the agent had finished; the work was called off.
+  [Label("Taken back")] TakenBack,
+}
+
+/// ⭐ ONE HANDOVER of an inbox item to an agent: who handed it over, the agent's piece of work on it — its receipt and
+/// record are the agent's account of what it did — and how it came back.
+public entity AgentHandover {
+  [Required, Immutable, Index] WorkItem Item;
+  /// The agent, by its class's full name, and its work on the item.
+  [Required, Immutable, MaxLength(200)] string Agent;
+  [Required, Immutable] AgentTask Task;
+  /// Who handed it over. Nobody: they have been taken off it (`ForgetWhoHandedWorkToAgents`), which waits until
+  /// every item they handed over has come back.
+  [Classification(Personal.Identity)] Principal? By;
+  [Immutable] DateTime At = DateTime.UtcNow;
+  AgentHandoverState State = AgentHandoverState.WithAgent;
+  DateTime? EndedAt;
+  /// What came back with the item: how the agent's work ended, in a sentence — or why it was taken back.
+  [MaxLength(700), Classification(Personal.Content)] string Note = "";
+
+  security {
+    allow read, create, update when WorksInbox;
+    deny create except via NoteAgentHandover;
+    deny update State, EndedAt, Note except via CloseAgentHandover;
+    deny update By except via ForgetWhoHandedWorkToAgents;
+    deny delete;
+  }
+}
+
+/// An item was handed to an agent.
+[Event("Item handed to an agent")]
+public sealed class WorkHandedToAgent { public AgentHandover Handover; }
+
+/// An item came back from an agent — handed back when its work ended, or taken back by a person.
+[Event("Item back from an agent")]
+public sealed class WorkBackFromAgent { public AgentHandover Handover; }
+
+[Server, Authorize(WorksInbox), OwnUnitOfWork]
+internal Guid NoteAgentHandover(Guid item, string agent, Guid task) {
+  var me = Security.CurrentUserId;
+  if (me == null) { throw new AgentRefused("An item is handed to an agent by a person: nobody is signed in."); }
+  var w = WorkItem.Single(x => x.Id == item);
+  if (AgentHandover.Any(h => h.Item == w && h.State == AgentHandoverState.WithAgent)) {
+    throw new AgentRefused("An agent already holds this item. Take it back first.");
+  }
+  var handover = new AgentHandover {
+    Item = w, Agent = agent, Task = AgentTask.Single(t => t.Id == task), By = Principal.Single(p => p.Id == me),
+  };
+  Raise(new WorkHandedToAgent { Handover = handover });
+  return handover.Id;
+}
+
+[Server, Authorize(IsAuthenticated)]
+internal void CloseAgentHandover(Guid id, AgentHandoverState state, string note) {
+  var handover = AgentHandover.Single(h => h.Id == id);
+  if (handover.State != AgentHandoverState.WithAgent) { return; }
+  handover.State = state;
+  handover.EndedAt = DateTime.UtcNow;
+  handover.Note = note.Length > 700 ? note.Substring(0, 700) : note;
+  Raise(new WorkBackFromAgent { Handover = handover });
+}
+
+/// ⭐ AN INBOX ITEM IN AN AGENT'S HANDS.
+///
+///     var outcome = await AgentDesk.Hand(ticket, Agents.Of<Tracer>(), new TraceParcel(), ticket.Order);
+///
+/// The item goes to the agent's own account — the inbox shows the agent holding it — and the agent is given the work,
+/// for whoever handed it over: it does nothing that person may not. When the work ends, however it ends, the item
+/// comes back to that person with a sentence of what came of it; the agent's receipt and record say the rest.
+public class AgentDesk {
+  /// Hand `item` to `agent`, with the skill it is to do on it and the skill's input.
+  public static async Task<AgentOutcome<TOut>> Hand<TIn, TOut>(WorkItem item, AgentRef agent, Skill<TIn, TOut> skill, TIn input) {
+    var work = agent.Open(skill, input, item.Title);
+    NoteAgentHandover(item.Id, agent.Name, work.Task);
+    HandWorkTo(item, agent.Actor, HolderOf(item));
+    UnitOfWork.Commit();
+    return await work.Run();
+  }
+
+  /// ⭐ TAKE IT BACK: the agent's work on the item is called off where it stands, and the item is yours. What the
+  /// agent had done is on its record. For whoever handed it over, and whoever leads the inbox.
+  public static void TakeBack(WorkItem item, string why = "") {
+    var handover = AgentHandover.FirstOrDefault(h => h.Item == item && h.State == AgentHandoverState.WithAgent);
+    if (handover == null) { throw new AgentRefused("No agent holds this item."); }
+    var me = Session.CurrentUser;
+    if ((handover!.By == null || handover!.By!.Id != me.Id) && !Security.Authorize(me, LeadsInbox)) {
+      throw new AgentRefused("An item is taken back from an agent by whoever handed it over, or by whoever leads the inbox.");
+    }
+    var reason = why.Trim() == "" ? "A person took the item back." : why.Trim();
+    CloseAgentHandover(handover!.Id, AgentHandoverState.TakenBack, reason);
+    StopAgentTask(handover!.Task, reason);
+    HandWorkTo(item, me, HolderOf(item));
+  }
+
+  /// The handover an item is under now, if an agent holds it.
+  public static AgentHandover? Of(WorkItem item) {
+    return AgentHandover.FirstOrDefault(h => h.Item == item && h.State == AgentHandoverState.WithAgent);
+  }
+
+  /// Every handover of an item, the latest first: who gave it to which agent, and how it came back.
+  public static List<AgentHandover> TrailOf(WorkItem item) {
+    return AgentHandover.Where(h => h.Item == item).OrderByDescending(h => h.At).Take(50).ToList();
+  }
+}
+
+[On] void HandBackWhenDone(AgentTaskFinished e)  { HandBack(e.Task, "It finished: " + (e.Task.Outcome == "" ? "the work is done." : e.Task.Outcome)); }
+[On] void HandBackWhenFailed(AgentTaskFailed e)  { HandBack(e.Task, "It could not finish: " + e.Problem); }
+[On] void HandBackWhenStopped(AgentTaskStopped e) { HandBack(e.Task, "It was stopped: " + e.Why); }
+
+/// The agent's work on an item ended: the item goes back to whoever handed it over, with what came of it.
+void HandBack(AgentTask task, string note) {
+  var handover = AgentHandover.FirstOrDefault(h => h.Task == task && h.State == AgentHandoverState.WithAgent);
+  if (handover == null) { return; }
+  CloseAgentHandover(handover!.Id, AgentHandoverState.Back, AgentWords(task.Agent) + " hands this back. " + note);
+  // The agent's own account holds the item, and hands on what it holds.
+  var item = handover!.Item;
+  // An item still with an agent always says who gave it: taking a person off waits until it has come back.
+  if (handover!.By == null) { return; }
+  var to = handover!.By!;
+  var holder = HolderOf(item);
+  var agent = Principal.Single(p => p.Id == task.Actor.Id);
+  runas (Actor.From(agent)) { HandWorkTo(item, to, holder); }
+}
+
+/// Who holds an item now, by their id — what the inbox is told was seen, so a hand-over is not refused as stale.
+Guid? HolderOf(WorkItem item) { return item.Assignee == null ? null : item.Assignee!.Id; }
+
+// ── the people who handed work over ───────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ TAKE A PERSON OFF THE ITEMS THEY HANDED TO AGENTS: each handover no longer says who gave it. That it was handed
+/// over, to which agent, and how it came back stay. Answers how many. Refused while an agent still holds an item they
+/// handed over (`HandoversWaitingOn`).
+[Server, Authorize(ErasesAgentRecords)]
+public int ForgetWhoHandedWorkToAgents(Principal person) {
+  var open = HandoversWaitingOn(person);
+  if (open > 0) { throw new AgentRefused($"An agent still holds {(open == 1 ? "an item" : open + " items")} they handed over: take it back, or let it come back, first."); }
+  var gone = 0;
+  foreach (var h in AgentHandover.Where(x => x.By == person).ToList()) { h.By = null; gone = gone + 1; }
+  return gone;
+}
+
+/// How many items an agent still holds that `person` handed over.
+public int HandoversWaitingOn(Principal person) {
+  return AgentHandover.Count(h => h.By == person && h.State == AgentHandoverState.WithAgent);
+}
+
+/// Every handover `person` made, oldest first.
+[SuppressWarning("cost-unbounded-read")]   // one person's handovers
+public List<AgentHandover> HandoversBy(Principal person) {
+  return AgentHandover.Where(h => h.By == person).OrderBy(h => h.At).ToList();
+}

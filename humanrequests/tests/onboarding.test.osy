@@ -1,0 +1,460 @@
+// Osysharp.Agents.HumanRequests — one case, walked end to end, and the bridge's own rules. A mill applies to supply
+// flour: it is asked for its details through a link, the vetter looks it up, asks the purchasing lead about the
+// payment term, proposes to clear it, and the lead approves in her inbox — where the supplier is cleared AS HER.
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Workflow;
+using Purchasing;
+
+/// What the model says while it vets the mill: look it up, ask about the term, propose to clear it, hand back.
+AgentScript VettingTheMill(Supplier mill) {
+  return AgentScript.Of(
+    Says.Tool(Actions.Of(LookUp), SupplierArg(mill)),
+    Says.AskPerson("Hollin Mill asks to be paid in 45 days. Is that acceptable?", "Our standard term is 30 days. The register shows nothing against the company."),
+    Says.Tool("The register is clean and the lead accepted 45 days.", Actions.Of(ClearSupplier), ClearArgs(mill, 45)),
+    Says.HandBack(new Vetting { Recommend = true, Finding = "Sound: registered since 1987, no charges. Cleared on 45 days." }));
+}
+
+// ── the case ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Office)]
+void a_supplier_is_taken_on_from_its_application_to_trading() {
+  TestClock.Set(new DateTime(2031, 5, 5, 8, 0, 0, DateTimeKind.Utc));
+  Guid mill;
+  runas (Noor) {
+    var m = Mill();
+    mill = m.Id;
+    var script = VettingTheMill(m);
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    TakeOn(m);
+    Workflow.Settle(m);
+    // 1. The company has no account: it was sent a link, and the process waits for it.
+    Assert.Equal(SupplierStage.Applied, Mill().Stage);
+    Assert.Equal(1, Heard.Count(h => h.What == "mailed"));
+    Assert.Equal(0, AgentTask.Count());
+  }
+  // Two days later the mill fills the form in behind its link.
+  TestClock.Advance(TimeSpan.FromDays(2));
+  var link = "";
+  runas (Noor) { link = Heard.Single(h => h.What == "mailed").About; }
+  var sent = AnswerByLink(AnswerLink.From(link), new RequestAnswer { Values = new Dictionary<string, string> {
+    ["RegistrationNumber"] = "HM-0457", ["Country"] = "England", ["PaymentDays"] = "45" } }, "Greta Hollin");
+  Assert.True(sent.Applied);
+  Background.Settle();
+  runas (Noor) {
+    Workflow.Settle(Mill());
+    // 2. Its details are on the supplier, and the vetter has started: it looked the company up alone — and stopped
+    //    on a question for the lead, because a term over 30 days is hers to accept.
+    var m = Mill();
+    Assert.Equal("HM-0457", m.RegistrationNumber);
+    Assert.Equal(45, m.PaymentDays);
+    Assert.Equal(SupplierStage.Vetting, m.Stage);
+  }
+  Guid task;
+  runas (Tariq) {
+    var receipt = AgentTask.Single();
+    task = receipt.Id;
+    Assert.Equal(AgentTaskStatus.Waiting, receipt.Status);
+    Assert.Equal("an answer from Tariq Aziz", receipt.WaitingOn);
+    Assert.Null(receipt.Requester);
+    // 3. The question is in her inbox, as a request from the agent, with the work that waits on it.
+    Background.Settle();
+    var question = MyRequest();
+    Assert.Equal(RequestKind.Question, question.Asks);
+    Assert.Equal("Hollin Mill asks to be paid in 45 days. Is that acceptable?", question.Title);
+    Assert.Equal("Our standard term is 30 days. The register shows nothing against the company.", question.Context);
+    Assert.Equal(AskerKind.Agent, question.AskedByKind);
+    Assert.Equal("Vetter", question.AskedByName);
+    Assert.Equal("Hollin Mill", question.WaitingLabel);
+    Assert.Equal("Purchasing", question.Queue!.Name);
+  }
+  // She is away for a week. Nothing runs meanwhile.
+  TestClock.Advance(TimeSpan.FromDays(7));
+  Background.Settle();
+  runas (Tariq) {
+    Assert.Equal(2, AgentTask.Single().ModelCalls);
+    AnswerRequest(MyRequest(), RequestAnswer.Say("Yes, 45 days is fine for a mill."));
+    GoOn(task);
+    // 4. Her answer reached the model as what its question answered; it went on — and stopped again, on a proposal:
+    //    clearing a supplier is not the vetter's to do alone.
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About == "\"Yes, 45 days is fine for a mill.\""));
+    Assert.Equal(AgentTaskStatus.Waiting, AgentTask.Single().Status);
+    Assert.Equal("a decision from Tariq Aziz", AgentTask.Single().WaitingOn);
+    Assert.False(Mill().Cleared);
+    Background.Settle();
+    var approval = MyRequest();
+    Assert.Equal(RequestKind.Approval, approval.Asks);
+    Assert.Equal("Vetter proposes: Clear the supplier to trade", approval.Title);
+    Assert.Equal("The register is clean and the lead accepted 45 days.", approval.Context);
+    Assert.Equal(AgentProposal.Single().Fingerprint.Substring(0, 12), approval.SubjectVersion);
+    var card = ProposalCardOf(AgentProposal.Single().Id)!;
+    Assert.Equal("Clear the supplier to trade", card.Label);
+    Assert.Equal(["Supplier", "Payment days"], card.Lines.Select(l => l.Label).ToList());
+    Assert.Equal("Hollin Mill", card.Lines[0].Value);
+    Assert.Equal("45", card.Lines[1].Value);
+    Assert.Equal("Look the company up", card.Looked[0].Tool);
+    Assert.Contains("registered 1987", card.Looked[0].Said);
+
+    // 5. She approves in her inbox. The supplier is cleared at once, on HER say.
+    AnswerRequest(approval, RequestAnswer.Approve());
+    GoOn(task);
+    var m = Mill();
+    Assert.True(m.Cleared);
+    Assert.Equal(45, m.AgreedPaymentDays);
+    Assert.Equal(ProposalStatus.Done, AgentProposal.Single().Status);
+    Assert.Equal(Tariq.Id, AgentProposal.Single().DecidedBy!.Id);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+    Assert.Equal(0, Requests.Mine().Count);
+    Workflow.Settle(AgentWorkWait.Single());
+    // The whole of it is on the vetter's record, and the record checks.
+    var said = Trajectory.Said(task);
+    Assert.Contains("It asked Tariq Aziz a question because it chose to.", said);
+    Assert.Contains("Tariq Aziz answered after 7 days.", said);
+    Assert.Contains("Tariq Aziz approved ClearSupplier, and it ran as them.", said);
+    Assert.True(VerifyTrace(AgentTask.Single()).Intact);
+  }
+  runas (Noor) {
+    // 6. The process went on with the finished work: the mill trades.
+    var m = Mill();
+    Workflow.Settle(m);
+    Assert.Equal(SupplierStage.Trading, m.Stage);
+    Assert.Equal("Sound: registered since 1987, no charges. Cleared on 45 days.", m.Note);
+  }
+}
+
+// ── the bridge's rules ──────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Office)]
+void approving_in_the_inbox_runs_it_as_whoever_approved() {
+  // Noor is a buyer: she may not clear a supplier. She has the vetter vet the dairy; its proposal comes to her.
+  Guid task;
+  runas (Noor) {
+    var dairy = Dairy();
+    var script = AgentScript.Of(
+      Says.Tool("It is registered and active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "Proposed; not cleared." }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    task = Vet(dairy).Task;
+    Background.Settle();
+    var approval = MyRequest();
+    // She cannot be shown "do this alone from now on": that is the lead's to say.
+    Assert.False(ProposalCardOf(AgentProposal.Single().Id)!.MayAllowAlone);
+    AnswerRequest(approval, RequestAnswer.Approve());
+    GoOn(task);
+    // Her yes ran it as her — and she may not. Nothing was cleared; the proposal says so, and so was the agent told.
+    Assert.False(Dairy().Cleared);
+    Assert.Equal(ProposalStatus.Failed, AgentProposal.Single().Status);
+    Assert.StartsWith("It was approved, and could not be done:", ProposalCardOf(AgentProposal.Single().Id)!.Outcome);
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.StartsWith("error: ")));
+  }
+}
+
+[Test(Office)]
+void whoever_takes_the_item_and_approves_is_who_it_runs_as() {
+  // The proposal comes to Noor, who asked. The lead takes the item from her inbox and approves it himself.
+  Guid task;
+  runas (Noor) {
+    var dairy = Dairy();
+    var script = AgentScript.Of(
+      Says.Tool("It is registered and active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "Cleared." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = Vet(dairy).Task;
+    Background.Settle();
+    Workflow.Settle(MyRequest());
+  }
+  runas (Tariq) {
+    var request = HumanRequest.Single();
+    TakeWork(request, request.Assignee == null ? null : request.Assignee!.Id);
+    Workflow.Settle(request);
+    AnswerRequest(HumanRequest.Single(), RequestAnswer.Approve());
+    GoOn(task);
+    // It ran as HIM — the one who answered — not as Noor, to whom it was put and who may not clear a supplier.
+    Assert.True(Dairy().Cleared);
+    Assert.Equal(Tariq.Id, AgentProposal.Single().DecidedBy!.Id);
+    Assert.Equal(Noor.Id, AgentProposal.Single().DecideBy!.Id);
+  }
+}
+
+[Test(Office)]
+void a_no_in_the_inbox_reaches_the_agent_with_its_reason() {
+  runas (Noor) {
+    var dairy = Dairy();
+    var script = AgentScript.Of(
+      Says.Tool("It is registered and active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)),
+      Says.Tool(Actions.Of(NoteRisk), RiskArgs(dairy, "One charge outstanding.")),
+      Says.HandBack(new Vetting { Recommend = false, Finding = "A charge is outstanding." }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    var task = Vet(dairy).Task;
+    Background.Settle();
+    AnswerRequest(MyRequest(), RequestAnswer.Reject("The register shows a charge outstanding. Note it first."));
+    GoOn(task);
+
+    Assert.Equal(ProposalStatus.Rejected, AgentProposal.Single().Status);
+    Assert.Equal(Noor.Id, AgentProposal.Single().DecidedBy!.Id);
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.Contains("The register shows a charge outstanding. Note it first.")));
+    // It went on from the reason: it noted the risk — which it does alone — and finished.
+    Assert.Equal("One charge outstanding.", Dairy().Risk);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+    Assert.False(Dairy().Cleared);
+  }
+}
+
+[Test(Office)]
+void a_proposal_decided_outside_the_inbox_takes_its_request_with_it() {
+  Guid task;
+  runas (Noor) {
+    var dairy = Dairy();
+    var script = AgentScript.Of(
+      Says.Tool("It is registered and active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "Cleared." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = Vet(dairy).Task;
+    Background.Settle();
+    Assert.Equal(1, Requests.Mine().Count);
+  }
+  // The lead decides it from the agents' own screen, not from Noor's inbox.
+  runas (Tariq) {
+    Assert.Equal(ProposalStatus.Done, ApproveAgentProposal(AgentProposal.Single()).Status);
+    GoOn(task);
+    Assert.True(Dairy().Cleared);
+  }
+  runas (Noor) {
+    Background.Settle();
+    // Nothing is left for her to answer.
+    Assert.Equal(0, Requests.Mine().Count);
+    var request = HumanRequest.Single();
+    Workflow.Settle(request);
+    Assert.Equal(RequestStatus.Cancelled, HumanRequest.Single().Status);
+    Assert.Equal("It was decided outside the inbox.", HumanRequest.Single().ClosedWhy);
+  }
+}
+
+[Test(Office)]
+void a_proposal_nobody_decides_in_time_is_refused_and_the_work_goes_on() {
+  TestClock.Set(new DateTime(2031, 5, 5, 8, 0, 0, DateTimeKind.Utc));
+  runas (Noor) {
+    var dairy = Dairy();
+    var script = AgentScript.Of(
+      Says.Tool("It is registered and active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "Nobody decided." }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    var task = Vet(dairy).Task;
+    Background.Settle();
+    Workflow.Settle(MyRequest());
+    // Whoever oversees requests calls it off: Noor will not be there to decide.
+    runas (Tariq) {
+      var request = HumanRequest.Single();
+      CancelRequest(request, "Noor is leaving the office.");
+      Workflow.Settle(request);
+    }
+    GoOn(task);
+
+    // The request closed with no answer, so the proposal is a no with that as its reason — and the agent finished.
+    Assert.Equal(ProposalStatus.Rejected, AgentProposal.Single().Status);
+    Assert.Null(AgentProposal.Single().DecidedBy);
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.Contains("The request was called off: Noor is leaving the office.")));
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+    Assert.False(Dairy().Cleared);
+  }
+}
+
+// ── "approve all like this" ─────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Office)]
+void the_lead_approves_and_lets_it_clear_suppliers_alone_from_now_on() {
+  runas (Tariq) {
+    var dairy = Dairy();
+    var script = AgentScript.Of(
+      Says.Tool("It is registered and active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "Cleared." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var task = Vet(dairy).Task;
+    Background.Settle();
+    var request = MyRequest();
+    var proposal = AgentProposal.Single();
+    Assert.True(ProposalCardOf(proposal.Id)!.MayAllowAlone);
+
+    ApproveAndAllowAlone(proposal.Id, request.Id);
+    GoOn(task);
+
+    Assert.True(Dairy().Cleared);
+    Assert.Equal(RequestStatus.Answered, HumanRequest.Single().Status);
+    Assert.Equal("Purchasing.ClearSupplier", AgentStandingRule.Single().Action);
+    Assert.Equal(Tariq.Id, AgentStandingRule.Single().For!.Id);
+
+    // The next supplier he has vetted is cleared without a proposal.
+    var mill = Mill();
+    var again = AgentScript.Of(
+      Says.Tool("Clean.", Actions.Of(ClearSupplier), ClearArgs(mill, 30)),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "Cleared." }));
+    ScriptedAnswer.Stub((model, request) => again.Answer(model, request));
+    Assert.True(Vet(mill).Done);
+    Assert.True(Mill().Cleared);
+    Assert.Equal(1, AgentProposal.Count());
+  }
+  // A buyer cannot say it, whatever request she holds.
+  runas (Noor) {
+    var mill = Mill();
+    var script = AgentScript.Of(Says.Tool("Clean.", Actions.Of(ClearSupplier), ClearArgs(mill, 60)));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Vet(mill);
+    Background.Settle();
+    var proposal = AgentProposal.Single(p => p.Status == ProposalStatus.Waiting);
+    Assert.Denied(() => ApproveAndAllowAlone(proposal.Id, MyRequest().Id));
+    Assert.False(Mill().AgreedPaymentDays == 60);
+  }
+}
+
+// ── handing an item to the agent, and taking it back ────────────────────────────────────────────────────────────────
+
+[Test(Office)]
+void a_person_hands_an_item_to_an_agent_and_takes_it_back() {
+  Guid review;
+  Guid task;
+  runas (Noor) {
+    var dairy = Dairy();
+    var r = new Review { Title = "Look at Saltmarsh Dairy again", Supplier = dairy, Queue = QueueNamed("Purchasing") };
+    UnitOfWork.Commit();
+    Workflow.Settle(r);
+    TakeWork(r);
+    Workflow.Settle(r);
+    review = r.Id;
+    Assert.Equal(Noor.Id, r.Assignee!.Id);
+
+    // The vetter will look the company up, and then stop on a proposal.
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(LookUp), SupplierArg(dairy)),
+      Says.Tool("It is active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+    var outcome = HandToVetter(r);
+    task = outcome.Task;
+    Workflow.Settle(r);
+
+    // The agent's own account holds the item now, and the handover names its work.
+    Assert.True(outcome.Waiting);
+    var held = Review.Single(x => x.Id == review);
+    Assert.Equal(Actor.Of<Vetter>().Id, held.Assignee!.Id);
+    var handover = AgentDesk.Of(held)!;
+    Assert.Equal("Purchasing.Vetter", handover.Agent);
+    Assert.Equal(task, handover.Task.Id);
+    Assert.Equal(Noor.Id, handover.By!.Id);
+    // The work is for her: its receipt is hers to read, with what the agent did so far.
+    Assert.Equal(Noor.Id, AgentTask.Single().Requester!.Id);
+    Assert.Equal(["LookUp"], Trajectory.Of(task));
+    Assert.Equal("Purchasing.ClearSupplier", AgentProposal.Single().Action);
+
+    // She takes it back. The work is called off where it stands; the item is hers again.
+    TakeBackFromVetter(held, "I will call them myself.");
+    UnitOfWork.Commit();
+    Workflow.Settle(held);
+    GoOn(task);
+    var mine = Review.Single(x => x.Id == review);
+    Assert.Equal(Noor.Id, mine.Assignee!.Id);
+    Assert.Null(AgentDesk.Of(mine));
+    var trail = AgentDesk.TrailOf(mine).Single();
+    Assert.Equal(AgentHandoverState.TakenBack, trail.State);
+    Assert.Equal("I will call them myself.", trail.Note);
+    Assert.Equal(AgentTaskStatus.Cancelled, AgentTask.Single().Status);
+    Assert.Equal(ProposalStatus.Withdrawn, AgentProposal.Single().Status);
+    Assert.False(Dairy().Cleared);
+  }
+}
+
+[Test(Office)]
+void an_agent_hands_an_item_back_to_the_person_with_what_it_found() {
+  runas (Noor) {
+    var dairy = Dairy();
+    var r = new Review { Title = "Look at Saltmarsh Dairy again", Supplier = dairy, Queue = QueueNamed("Purchasing") };
+    UnitOfWork.Commit();
+    Workflow.Settle(r);
+    TakeWork(r);
+    Workflow.Settle(r);
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(NoteRisk), RiskArgs(dairy, "One charge outstanding.")),
+      Says.HandBack(new Vetting { Recommend = false, Finding = "A charge is outstanding." }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+    var outcome = HandToVetter(r);
+    Background.Settle();
+    Workflow.Settle(r);
+
+    // Its work ended, so the item came back to her by itself — with a sentence of what came of it, and the agent's
+    // receipt and record behind it.
+    Assert.True(outcome.Done);
+    var back = Review.Single(x => x.Id == r.Id);
+    Assert.Equal(Noor.Id, back.Assignee!.Id);
+    var trail = AgentDesk.TrailOf(back).Single();
+    Assert.Equal(AgentHandoverState.Back, trail.State);
+    Assert.StartsWith("Vetter hands this back. It finished:", trail.Note);
+    Assert.Equal(outcome.Task, trail.Task.Id);
+    Assert.Equal(1, Heard.Count(h => h.What == "handed" && h.About == "Purchasing.Vetter"));
+    Assert.Equal(1, Heard.Count(h => h.What == "back" && h.About.StartsWith("Back: Vetter hands this back.")));
+  }
+}
+
+// ── work it gave up on ──────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Office)]
+void work_an_agent_gave_up_on_is_put_to_its_sponsor() {
+  runas (Noor) {
+    var script = AgentScript.Of(Says.Words("It seems fine."), Says.Words("Fine."), Says.Words("Fine."));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Assert.Equal(AgentTaskStatus.Failed, Vet(Dairy()).Status);
+  }
+  Background.Settle();
+  runas (Tariq) {
+    var told = MyRequest();
+    Assert.Equal("Vetter could not finish: Saltmarsh Dairy", told.Title);
+    Assert.StartsWith("It could not finish:", told.Context);
+    Assert.Equal(AskerKind.Agent, told.AskedByKind);
+  }
+}
+
+/// ⭐ A PERSON WHO LEAVES IS TAKEN OFF THE ITEMS THEY HANDED TO AN AGENT — once every one has come back. While the
+/// vetter still holds Noor's item, taking her off is refused; when it has handed the item back, the handover no longer
+/// says who gave it, and says how it came back as before.
+[Test(Office)]
+void a_person_is_taken_off_the_items_they_handed_to_an_agent_once_each_has_come_back() {
+  Guid review = Guid.Empty;
+  runas (Noor) {
+    var dairy = Dairy();
+    var r = new Review { Title = "Look at Saltmarsh Dairy again", Supplier = dairy, Queue = QueueNamed("Purchasing") };
+    UnitOfWork.Commit();
+    Workflow.Settle(r);
+    TakeWork(r);
+    Workflow.Settle(r);
+    review = r.Id;
+    var script = AgentScript.Of(Says.Tool("It is active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    HandToVetter(r);
+    Workflow.Settle(r);
+  }
+  // Still with the agent: it is not hers to be taken off yet.
+  runas (Tariq) {
+    Assert.Equal(1, HandoversWaitingOn(Noor));
+    var refused = Assert.Throws<AgentRefused>(() => ForgetWhoHandedWorkToAgents(Noor));
+    Assert.Equal("An agent still holds an item they handed over: take it back, or let it come back, first.", refused.Message);
+  }
+  runas (Noor) {
+    var held = Review.Single(x => x.Id == review);
+    TakeBackFromVetter(held, "I will call them myself.");
+    UnitOfWork.Commit();
+  }
+  runas (Tariq) {
+    Assert.Equal(1, HandoversBy(Noor).Count);
+    Assert.Equal(1, ForgetWhoHandedWorkToAgents(Noor));
+    UnitOfWork.Commit();
+    var trail = AgentDesk.TrailOf(Review.Single(x => x.Id == review)).Single();
+    Assert.Null(trail.By);
+    Assert.Equal(AgentHandoverState.TakenBack, trail.State);
+    Assert.Equal("I will call them myself.", trail.Note);
+    Assert.Equal(0, HandoversBy(Noor).Count);
+  }
+}

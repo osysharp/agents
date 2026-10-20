@@ -1,0 +1,23 @@
+// The producer's test project for Osysharp.Agents.HumanRequests — the purchasing office of a bakery group, taking on a
+// new supplier. The supplier, who has no account, is asked for the company's details through a link; an agent vets
+// them — looks the company up, notes what it finds, asks the purchasing lead what it cannot know, and PROPOSES to
+// clear the supplier to trade; the lead approves in her inbox, and the supplier is cleared as her. One case, walked
+// from the application to the first order. No model is ever called: its one model is scripted.
+app Purchasing {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Agents@1;
+  use Osysharp.Agents.Testing@1;
+  use Osysharp.Agents.HumanRequests@1;
+  use Osysharp.HumanRequests@1;
+  use Osysharp.WorkQueues@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Organizations@0;
+  use Osysharp.Organizations.ServicePlans@0;
+  use Osysharp.Presence@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.ServiceHours;
+  use Osysharp.Ui;
+}

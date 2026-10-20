@@ -1,0 +1,204 @@
+// The tree of a piece of agent work, as a person reads it: who handed what to whom, where each piece stands, what it
+// waits for, and what each piece — and the whole — has cost.
+namespace Osysharp.Agents.HumanRequests;
+
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Agents;
+using Osysharp.Llm;
+using Osysharp.Ui;
+
+/// One piece of the work, as a line of the tree.
+public class WorkTreeLine {
+  public Guid Task;
+  /// How far under the top it is: 0 for the top.
+  public int Depth = 0;
+  /// The agent and the job — "Checker", "Check papers".
+  public string Agent = "";
+  public string Skill = "";
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  /// Where it stands, in a word or two.
+  public string Stands = "";
+  /// What it waits for, while it waits; how it ended, when it did not finish.
+  public string Waits = "";
+  public string Ended = "";
+  /// What it spent itself and, when it handed work on, what it cost with everything under it — as money.
+  public string Own = "";
+  public string WithUnder = "";
+  public int Attempt = 1;
+}
+
+/// A piece of work with everything under it, for whoever is looking.
+public class WorkTreeCard {
+  /// What the work is about, as its receipt says.
+  public string About = "";
+  /// Where the top stands, and what it waits for.
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  public string Stands = "";
+  public string Waits = "";
+  /// How many pieces, what the whole has cost and the most it may.
+  public int Pieces = 0;
+  public string Cost = "";
+  public string Limit = "";
+  public List<WorkTreeLine> Lines = [];
+}
+
+/// Where a piece of work stands, as a person reads it.
+string StandsWords(AgentTaskStatus status) {
+  return status == AgentTaskStatus.Working ? "Working"
+       : status == AgentTaskStatus.Waiting ? "Waiting"
+       : status == AgentTaskStatus.Done ? "Done"
+       : status == AgentTaskStatus.Failed ? "Could not finish"
+       : status == AgentTaskStatus.Stopped ? "Stopped"
+       : "Called off";
+}
+
+/// How a piece that did not finish ended, as a person reads it. Money that ran out is said as money: whose limit it
+/// was — its own, or a piece of work's above it — not which row of the meter refused.
+string EndedWords(WorkNode node) {
+  if (!node.Outcome.StartsWith("Its money ran out")) { return node.Outcome; }
+  return node.Outcome.Contains("task:" + node.Task.ToString())
+    ? "Its money ran out: it could spend $" + Dollars(node.LimitMicros) + "."
+    : "Its money ran out: the work above it had no more to spend.";
+}
+
+/// The open requests behind a piece of work and behind everything it handed on — what `WorkWaitingOnPeople` lists.
+[Server, Authorize(IsAuthenticated)]
+public List<Guid> RequestsBehindWork(Guid task) {
+  List<Guid> requests = [];
+  var receipt = AgentTask.FirstOrDefault(t => t.Id == task);
+  if (receipt == null) { return requests; }
+  // The piece itself, then everything under it: the tree lists each piece after the one that handed it on.
+  List<Guid> under = [task];
+  foreach (var node in WorkTree.Of(receipt!)) {
+    if (node.Parent != null && under.Contains(node.Parent!.Value) && !under.Contains(node.Task)) { under.Add(node.Task); }
+  }
+  foreach (var piece in under) {
+    foreach (var r in Requests.WaitedOnBy(WorkSubject, piece)) { requests.Add(r.Id); }
+  }
+  return requests;
+}
+
+/// ⭐ THE TREE of the work `task` is part of — the top first, each piece followed by what it handed on. Null when the
+/// work is not whoever-is-looking's to read.
+[Server, Authorize(IsAuthenticated)]
+public WorkTreeCard? WorkTreeCardOf(Guid task) {
+  var receipt = AgentTask.FirstOrDefault(t => t.Id == task);
+  if (receipt == null) { return null; }
+  var nodes = WorkTree.Of(receipt!);
+  if (nodes.Count == 0) { return null; }
+  var top = nodes[0];
+  var card = new WorkTreeCard {
+    About = top.About != "" ? top.About : AgentName(top.Agent) + "'s work", Status = top.Status, Stands = StandsWords(top.Status), Waits = top.WaitingOn,
+    Pieces = nodes.Count, Cost = "$" + Dollars(top.TreeMicros), Limit = "$" + Dollars(top.LimitMicros),
+  };
+  foreach (var node in nodes) {
+    var handedOn = node.TreeMicros != node.OwnMicros;
+    card.Lines.Add(new WorkTreeLine {
+      Task = node.Task, Depth = node.Depth, Agent = AgentName(node.Agent), Skill = node.Skill, Status = node.Status, Stands = StandsWords(node.Status),
+      Waits = node.Status == AgentTaskStatus.Waiting ? node.WaitingOn : "",
+      Ended = node.Status == AgentTaskStatus.Done || node.Status == AgentTaskStatus.Working || node.Status == AgentTaskStatus.Waiting ? "" : EndedWords(node),
+      Own = "$" + Dollars(node.OwnMicros), WithUnder = handedOn ? "$" + Dollars(node.TreeMicros) : "", Attempt = node.Attempt,
+    });
+  }
+  return card;
+}
+
+/// ⭐ THE TREE OF A PIECE OF AGENT WORK, on its page: who is doing what, for whom it waits, and what it has cost.
+/// `task` is any piece of the work — the tree drawn is the whole of it. `open` says where a piece's own page is.
+///
+///     AgentWorkTree(task.Id, open: t => "/work/" + t);
+[Composable]
+public component AgentWorkTree(Guid task, Func<Guid, string>? open = null) {
+  WorkTreeCard? card = null;
+  bool loaded = false;
+  string problem = "";
+
+  on mount { Load(); }
+  action Load() {
+    problem = "";
+    try { card = WorkTreeCardOf(task); } catch (Exception ex) { problem = ex.Message; card = null; }
+    loaded = true;
+  }
+
+  render {
+    if (!loaded) { Stack(gap: 2, label: "Loading the work") { Skeleton(SkeletonShape.Block); Skeleton(SkeletonShape.HalfLine); } }
+    if (loaded && card == null) {
+      Row(gap: 2, align: Align.Center, px: 4, py: 3, bg: Colors.Sunken, rounded: Radius.Lg, label: "Work") {
+        Icon(Icons.Info, size: 14, color: Colors.TextMuted);
+        Text(problem != "" ? "The work could not be shown: " + problem : "This piece of work is not yours to see.", fontSize: FontSize.Label, color: Colors.TextMuted);
+      }
+    }
+    if (card != null) { WorkTreeBlock(card, open, Load); }
+  }
+}
+
+/// The tree itself.
+[Composable]
+public component WorkTreeBlock(WorkTreeCard card, Func<Guid, string>? open = null, Action? refresh = null) {
+  live var pieces = card.Pieces == 1 ? "One piece of work" : card.Pieces.ToString() + " pieces of work";
+  render {
+    Stack(gap: 3, label: "Work tree") {
+      // The whole, in one line: what it is about, where it stands, what it has cost of what it may.
+      Row(gap: 3, align: Align.End, justify: Justify.Between, wrap: Wrapping.Wrap, label: "The whole") {
+        Stack(gap: 1, minW: "0") {
+          Text(pieces, fontSize: FontSize.Caption, fontWeight: FontWeight.Medium, color: Colors.TextMuted, letterSpacing: "0.04em", textTransform: TextTransform.Uppercase);
+          Text(card.About, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold, letterSpacing: "-0.01em");
+        }
+        Row(gap: 3, align: Align.Center) {
+          Stack(gap: 0, align: Align.End) {
+            Text(card.Cost, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold, label: "Spent in all");
+            Text("of " + card.Limit, fontSize: FontSize.Caption, color: Colors.TextMuted);
+          }
+          if (refresh != null) { Button("Refresh", onPress: () => { if (refresh != null) { refresh(); } }, tone: Tone.Ghost, size: Size.Sm); }
+        }
+      }
+
+      if (card.Status == AgentTaskStatus.Waiting && card.Waits != "") {
+        Row(gap: 2, align: Align.Start, px: 4, py: 3, bg: Colors.Warning.Subtle, rounded: Radius.Lg, label: "What it waits for") {
+          Icon(Icons.Clock, size: 14, color: Colors.Warning.Strong);
+          Text("It waits for " + card.Waits + ".", fontSize: FontSize.Body, color: Colors.Warning.Strong, lineHeight: "1.5", maxW: "62ch");
+        }
+      }
+
+      Stack(gap: 0, borderW: 1, border: Colors.Border, rounded: Radius.Lg, bg: Colors.Surface, label: "Pieces") {
+        foreach (var line in card.Lines) { WorkTreeRow(line, open); }
+      }
+    }
+  }
+}
+
+/// One piece: indented under the piece that handed it on.
+[Composable]
+component WorkTreeRow(WorkTreeLine line, Func<Guid, string>? open = null) {
+  live var tone = line.Status == AgentTaskStatus.Done ? Tone.Success
+                : line.Status == AgentTaskStatus.Waiting ? Tone.Warning
+                : line.Status == AgentTaskStatus.Working ? Tone.Primary
+                : line.Status == AgentTaskStatus.Cancelled ? Tone.Ghost
+                : Tone.Danger;
+  live var indent = (line.Depth * 20).ToString() + "px";
+  live var name = line.Agent + (line.Attempt > 1 ? " (attempt " + line.Attempt.ToString() + ")" : "");
+  render {
+    Row(gap: 3, px: 4, py: 3, align: Align.Start, borderTW: line.Depth == 0 ? 0 : 1, border: Colors.Border, label: line.Agent + " " + line.Skill) {
+      // The guide: one step in for each piece above it.
+      if (line.Depth > 0) {
+        Row(w: indent, shrink: 0, justify: Justify.End) { Text("↳", fontSize: FontSize.Body, color: Colors.TextMuted); }
+      }
+      Stack(gap: 1, grow: 1, minW: "0") {
+        Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+          if (open != null) { Link(href: open(line.Task), label: name) { Text(name, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold); } }
+          if (open == null) { Text(name, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold); }
+          if (line.Skill != "") { Text(line.Skill, fontSize: FontSize.Label, color: Colors.TextMuted); }
+        }
+        // What the top waits for is said once, above the pieces.
+        if (line.Waits != "" && line.Depth > 0) { Text("Waits for " + line.Waits, fontSize: FontSize.Label, color: Colors.Warning.Strong, lineHeight: "1.45"); }
+        if (line.Ended != "") { Text(line.Ended, fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.45", maxW: "62ch"); }
+      }
+      Stack(gap: 1, align: Align.End, shrink: 0) {
+        Badge(line.Stands, tone: tone);
+        Text(line.WithUnder != "" ? line.WithUnder + " in all · " + line.Own + " itself" : line.Own, fontSize: FontSize.Caption, color: Colors.TextMuted, textAlign: TextAlign.Right);
+      }
+    }
+  }
+}
