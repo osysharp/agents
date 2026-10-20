@@ -1,0 +1,493 @@
+// What the inspector reads: one piece of an agent's work, as whoever is looking may see it — every fact of it turned
+// into words a person who was not there can follow.
+namespace Osysharp.Agents.Inspector;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+
+/// How this app shows its agents' work —
+/// `app.AgentInspector = new AgentInspectorSetup { WorkPage = "/work/{task}" };`.
+[AppSetting("AgentInspector")]
+public class AgentInspectorSetup {
+  /// Where the app shows one piece of work — the route it draws `WorkInspector` on, with `{task}` where the
+  /// receipt's id goes, and `{step}` where a step's number goes when the route takes one: "/work/{task}/{step}".
+  /// "": the inspector links nowhere.
+  public string WorkPage = "";
+}
+
+/// The address of a piece of work on the app's own page for one — and of one step of it, when the page takes a step.
+/// "" when the app has said no page.
+public string WorkPageOf(Guid task, int step = 0) {
+  var page = App.Setting<AgentInspectorSetup>().WorkPage;
+  if (page == "") { return ""; }
+  var at = page.Replace("{task}", task.ToString());
+  if (at.Contains("{step}")) { return at.Replace("{step}", step.ToString()); }
+  return at;
+}
+
+/// One step of the record, as a person reads it.
+public class InspectedStep {
+  /// Its place in the record, from 1 — what a link to the step names.
+  public int Seq = 0;
+  /// The piece of work it belongs to, the agent that did it, and how deep in the tree that work is.
+  public Guid Task;
+  public string By = "";
+  public int Depth = 0;
+  public TraceKind Kind = TraceKind.Started;
+  /// What kind of step it is, for the filter: "model", "tool", "person" or "other".
+  public string Group = "other";
+  /// The step in a sentence, and when.
+  public string Said = "";
+  public string When = "";
+  /// Something went wrong at it: a tool that did not run, a result sent back, a guard, a failed end.
+  public bool Problem = false;
+  /// A model call: the model, the rule of the router that chose it, how many were tried.
+  public string Model = "";
+  public string Why = "";
+  public int Attempts = 0;
+  /// What the step cost — "$0.0002" — or "".
+  public string Cost = "";
+  /// A tool: what it is called, the arguments it was asked with as a person reads them, and what it answered.
+  public string Tool = "";
+  public List<ProposalLine> Given = [];
+  /// What the step said in full: a model's words, a tool's answer, a question and its answer.
+  public string Content = "";
+  /// How long it was until the next step, when that is worth saying: "2 days 3 hours".
+  public string Took = "";
+  /// It was the last step, and the work is still waiting there.
+  public bool StillWaiting = false;
+  /// What it said is kept from whoever is looking: they may see that it happened, not what it said.
+  public bool Kept = false;
+  /// What it said was erased.
+  public bool Erased = false;
+  /// The step's own address.
+  public string Href = "";
+}
+
+/// Something the agent proposed, and what a person decided.
+public class InspectedProposal {
+  public Guid Id;
+  /// What it wanted to do — "Clear the supplier to trade" — and what that does.
+  public string Label = "";
+  public string Does = "";
+  public List<ProposalLine> Shown = [];
+  /// Why, in the agent's words, and what it had looked at first.
+  public string Why = "";
+  public List<ProposalEvidence> Evidence = [];
+  /// Who it was put to; where it stands; who decided, when, and after how long; their reason; what came of it.
+  public string PutTo = "";
+  public ProposalStatus Status = ProposalStatus.Waiting;
+  public string Decided = "";
+  public string Reason = "";
+  public string Outcome = "";
+  /// The instruction set the agent was working under as it proposed.
+  public int InstructionSet = 0;
+}
+
+/// Help the agent asked for — of a model, or of a person.
+public class InspectedHelp {
+  public Guid Id;
+  /// Who was asked — "Mara Oyelaran", "Strong (a model)" — and why.
+  public string Of = "";
+  public bool OfAPerson = false;
+  public string Why = "";
+  public string Question = "";
+  public HelpStatus Status = HelpStatus.Waiting;
+  public string Answer = "";
+  /// "Answered by Mara Oyelaran after 2 days 3 hours", "Advice that cost $0.0031".
+  public string Came = "";
+  public bool Kept = false;
+  public bool Erased = false;
+}
+
+/// One tool of the skill, with what the agent may do with it.
+public class InspectedTool {
+  public string Label = "";
+  /// "only reads", "changes the app's data", "sends something", "spends".
+  public string Does = "";
+  public Leave Leave = Leave.Alone;
+}
+
+/// One piece of work in the tree this work belongs to.
+public class InspectedWork {
+  public Guid Task;
+  public string Name = "";
+  public string Skill = "";
+  public string About = "";
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  public int Depth = 0;
+  public string Cost = "";
+  /// It is the piece the page is about.
+  public bool This = false;
+  public string Href = "";
+}
+
+/// Everything the inspector shows for one piece of work.
+public class WorkInspection {
+  public Guid Task;
+  /// The agent, by its class's full name and as a person reads it; the skill, in words; what the work is about.
+  public string Agent = "";
+  public string Name = "";
+  public string Skill = "";
+  public string About = "";
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+  public bool Ended = false;
+  /// How it ended, in a sentence; what it is waiting on and for how long, while it waits.
+  public string Outcome = "";
+  public string Waiting = "";
+
+  /// Who gave the work, who it was for, and as which account it ran — a sentence each.
+  public string GivenBy = "";
+  public string For = "";
+  public string RanAs = "";
+  /// What it was given, as the model was shown it; what it handed back.
+  public string Brief = "";
+  public string Result = "";
+  /// The process it is a step of: the workflow, in words, and the state that gave it the work. "": none.
+  public string Process = "";
+  public string ProcessState = "";
+
+  /// When it started, when it ended, and how long that was.
+  public string Started = "";
+  public string EndedAt = "";
+  public string Lasted = "";
+  /// Which attempt this is, when its skill tries again.
+  public int Attempt = 1;
+
+  /// What it spent of what it may, the share of that as a whole number, and its use in figures.
+  public string Spent = "";
+  public string Limit = "";
+  public int Percent = 0;
+  public string Use = "";
+  /// What else it was charged to, one scope each.
+  public List<string> ChargedTo = [];
+
+  /// The skill's tools and what the agent may do with each.
+  public List<InspectedTool> Tools = [];
+
+  /// What it ran with, in a sentence; the instructions it was sent; those made active since that it was not sent.
+  public string RanWith = "";
+  public List<string> Sent = [];
+  public List<string> Since = [];
+
+  public List<InspectedProposal> Proposals = [];
+  public List<InspectedHelp> Help = [];
+  /// The work it belongs to, as a tree: the top piece first, each piece under the one that handed it on.
+  public List<InspectedWork> Tree = [];
+  /// Every step of the record the work belongs to, in order.
+  public List<InspectedStep> Steps = [];
+
+  /// Whether the record's chain checks, in a sentence; how many lines; how many no longer say what they said.
+  public bool Intact = true;
+  public string Record = "";
+  public int Lines = 0;
+  public int ErasedLines = 0;
+  /// What was erased of it, in a sentence each. Empty: nothing.
+  public List<string> Erasures = [];
+}
+
+// ── words ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+string Named(Principal? p) { return p == null ? "somebody no longer here" : (p!.DisplayName != "" ? p!.DisplayName : p!.Email); }
+
+/// A moment as a person reads it: "3 Mar 2031, 09:12".
+public string At(DateTime at) { return at.ToString("d MMM yyyy, HH:mm"); }
+
+/// A length of time in its two largest parts: "2 days 3 hours", "4 minutes", "under a minute".
+public string Lasting(TimeSpan span) {
+  var minutes = (long)span.TotalMinutes;
+  if (minutes < 1) { return "under a minute"; }
+  var days = minutes / 1440;
+  var hours = (minutes % 1440) / 60;
+  var mins = minutes % 60;
+  if (days > 0) { return Counted(days, "day") + (hours > 0 ? " " + Counted(hours, "hour") : ""); }
+  if (hours > 0) { return Counted(hours, "hour") + (mins > 0 ? " " + Counted(mins, "minute") : ""); }
+  return Counted(mins, "minute");
+}
+
+string Counted(long n, string unit) { return n.ToString() + " " + unit + (n == 1 ? "" : "s"); }
+
+/// "VetSupplier" → "vet supplier".
+string Words(string name) {
+  var bare = BareName(name);
+  var words = "";
+  foreach (var c in bare) {
+    if (char.IsUpper(c) && words != "") { words = words + " " + char.ToLower(c); }
+    else { words = words + char.ToLower(c); }
+  }
+  return words;
+}
+
+/// A scope of the meter — `assignment:<id>`, `lot:A1` — as a person reads it: "its assignment", "lot A1".
+string ScopeInWords(string scope) {
+  var colon = scope.IndexOf(":");
+  if (colon < 0) { return scope; }
+  var kind = scope.Substring(0, colon);
+  var subject = scope.Substring(colon + 1);
+  var isId = Guid.TryParse(subject, out var id);
+  return isId ? "its " + Words(kind) : Words(kind) + " " + subject;
+}
+
+string Capital(string text) { return text == "" ? "" : char.ToUpper(text[0]).ToString() + text.Substring(1); }
+
+/// A JSON value as a person reads it: the text of a string; each member of an object on a line of its own.
+string Readable(string? json) {
+  if (json == null || json == "") { return ""; }
+  var text = json!;
+  if (text.StartsWith("\"") && text.EndsWith("\"") && text.Length >= 2) { return Unquoted(text); }
+  if (!text.StartsWith("{")) { return text; }
+  try {
+    var parts = JsonSerializer.Deserialize<Dictionary<string, Json>>(text);
+    List<string> lines = [];
+    foreach (var key in parts.Keys) {
+      var value = parts[key].ToString();
+      if (value.StartsWith("\"") && value.EndsWith("\"") && value.Length >= 2) { value = Unquoted(value); }
+      lines.Add(parts.Keys.Count == 1 ? value : key + ": " + value);
+    }
+    return string.Join("\n", lines);
+  } catch (Exception e) {
+    return text;
+  }
+}
+
+string Unquoted(string text) {
+  // A JSON text is read as JSON — every escape it may carry (a dash, a quote, a letter outside ASCII), not the few
+  // that were thought of. What is not one after all is shown with the common escapes undone.
+  var inner = "";
+  try {
+    inner = JsonSerializer.Deserialize<string>(text);
+  } catch (Exception e) {
+    inner = text.Substring(1, text.Length - 2).Replace("\\n", "\n").Replace("\\\"", "\"").Replace("\\u0022", "\"").Replace("\\u0027", "'");
+  }
+  // A text handed on as JSON of a text — a skill whose input is a plain string — is that text.
+  if (inner.StartsWith("\"") && inner.EndsWith("\"") && inner.Length >= 2) { return inner.Substring(1, inner.Length - 2); }
+  return inner;
+}
+
+/// What a model said in words, from the content it answered with.
+string SaidInWords(string json) {
+  try {
+    var blocks = JsonSerializer.Deserialize<List<LlmContentBlock>>(json);
+    List<string> said = [];
+    foreach (var b in blocks) { if (b.Kind == LlmBlockKind.Text && b.Text != null && b.Text!.Trim() != "") { said.Add(b.Text!.Trim()); } }
+    return string.Join("\n", said);
+  } catch (Exception e) {
+    return "";
+  }
+}
+
+string DoesWords(SkillToolInfo tool) {
+  List<string> does = [];
+  if (tool.Changes) { does.Add("changes the app's data"); }
+  if (tool.Sends) { does.Add("sends something"); }
+  if (tool.Spends) { does.Add("spends"); }
+  return does.Count == 0 ? "only reads" : string.Join(", ", does);
+}
+
+string GroupOf(TraceKind kind) {
+  if (kind == TraceKind.ModelCall) { return "model"; }
+  if (kind == TraceKind.ToolCall || kind == TraceKind.ToolResult) { return "tool"; }
+  if (kind == TraceKind.AskedForHelp || kind == TraceKind.Waiting || kind == TraceKind.Decided) { return "person"; }
+  return "other";
+}
+
+// ── the inspection ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ ONE PIECE OF WORK, FOR SOMEBODY WHO WAS NOT THERE — everything its receipt, its record and the rows beside
+/// them say, in words. Null when the work is not whoever-is-looking's to read.
+///
+/// Read as whoever is looking, and no further: a step whose content they may not see comes back with what happened
+/// and `Kept` true; one that was erased with `Erased` true and nothing in its place.
+[Server, Authorize(IsAuthenticated)]
+public WorkInspection? InspectAgentWork(Guid task) {
+  var t = AgentTask.FirstOrDefault(x => x.Id == task);
+  if (t == null) { return null; }
+  var now = DateTime.UtcNow;
+  var name = AgentName(t!.Agent);
+  var view = new WorkInspection {
+    Task = t!.Id, Agent = t!.Agent, Name = name, Skill = t!.Skill == "" ? "" : Words(t!.Skill), About = t!.About,
+    Status = t!.Status, Ended = t!.Status != AgentTaskStatus.Working && t!.Status != AgentTaskStatus.Waiting,
+    Outcome = OutcomeInWords(t!), Result = Readable(t!.Result), Attempt = t!.Attempt,
+    Started = At(t!.StartedAt), EndedAt = t!.EndedAt == null ? "" : At(t!.EndedAt!),
+    Lasted = Lasting((t!.EndedAt ?? now) - t!.StartedAt),
+  };
+
+  // Who, for whom, as whom.
+  view.GivenBy = t!.StartedBy != null ? "Given by " + Named(t!.StartedBy) + "."
+               : t!.Run != null ? "Given by a process: nobody was signed in." : t!.AnonymisedAt != null ? "Who gave it has been taken off it."
+               : "Given by the app itself: nobody was signed in.";
+  view.For = t!.Requester != null ? "Done for " + Named(t!.Requester) + ": never past what they may do themselves."
+           : t!.AnonymisedAt != null ? "Who it was for has been taken off it." : "Done for nobody: with the agent's own rights alone.";
+  view.RanAs = "It ran as " + Named(t!.Actor) + ", " + name + "'s own account.";
+  if (t!.Run != null) {
+    view.Process = Capital(Words(t!.RunWorkflow));
+    view.ProcessState = Capital(Words(t!.RunState));
+  }
+
+  // Money and use.
+  view.Spent = "$" + Dollars(t!.SpentMicros);
+  view.Limit = t!.LimitMicros > 0 ? "$" + Dollars(t!.LimitMicros) : "";
+  view.Percent = t!.LimitMicros <= 0 ? 0 : (int)Math.Min(100, t!.SpentMicros * 100 / t!.LimitMicros);
+  view.Use = Counted(t!.ModelCalls, "model call") + " · " + Counted(t!.ToolCalls, "tool call") + " · "
+           + t!.InputTokens.ToString() + " tokens in, " + t!.OutputTokens.ToString() + " out";
+  // What else its spending counts against, as a person reads it: the kind of thing, never the id on the meter.
+  foreach (var scope in t!.ChargedTo.Split("\n")) { if (scope.Trim() != "") { view.ChargedTo.Add(ScopeInWords(scope.Trim())); } }
+  if (t!.Run != null) { view.ChargedTo.Add("the run of " + Capital(Words(t!.RunWorkflow)).ToLower() + " it is a step of"); }
+
+  // What it may do, tool by tool.
+  Dictionary<string, string> labels = new Dictionary<string, string>();
+  var skill = t!.Skill == "" ? null : Skills.Find(t!.Agent, t!.Skill);
+  if (skill != null) {
+    foreach (var tool in skill!.Tools) {
+      labels[tool.Action] = tool.Label;
+      view.Tools.Add(new InspectedTool { Label = tool.Label, Does = DoesWords(tool), Leave = tool.Leave });
+    }
+  }
+
+  // What it had been told, and what it has been told since.
+  var ran = InstructionsOf(t!);
+  view.RanWith = ran.Words;
+  foreach (var i in ran.Sent) { view.Sent.Add(i.Guidance); }
+  foreach (var i in ran.NotYet) { view.Since.Add(i.Guidance); }
+
+  // The tree it belongs to.
+  var root = t!.Root ?? t!;
+  List<AgentTask> pieces = [root];
+  foreach (var piece in AgentTask.Where(x => x.Root == root).OrderBy(x => x.StartedAt).Take(500).ToList()) { pieces.Add(piece); }
+  Dictionary<Guid, AgentTask> byId = new Dictionary<Guid, AgentTask>();
+  foreach (var piece in pieces) { byId[piece.Id] = piece; }
+  foreach (var piece in InTreeOrder(pieces)) {
+    view.Tree.Add(new InspectedWork {
+      Task = piece.Id, Name = AgentName(piece.Agent), Skill = piece.Skill == "" ? "" : Words(piece.Skill), About = piece.About,
+      Status = piece.Status, Depth = piece.Depth, Cost = "$" + Dollars(piece.SpentMicros), This = piece.Id == t!.Id, Href = WorkPageOf(piece.Id),
+    });
+  }
+
+  // What it proposed, and the help it asked for.
+  foreach (var p in AgentProposal.Where(x => x.Task == t!).OrderBy(x => x.At).Take(200).ToList()) { view.Proposals.Add(ProposalOf(p)); }
+  foreach (var h in AgentHelp.Where(x => x.Task == t!).OrderBy(x => x.At).Take(200).ToList()) { view.Help.Add(HelpOf(h)); }
+
+  // Every step, in order.
+  var lines = TraceOf(t!);
+  var index = 0;
+  foreach (var line in lines) {
+    var owner = byId.ContainsKey(line.Task) ? byId[line.Task] : null;
+    var step = new InspectedStep {
+      Seq = line.Seq, Task = line.Task, By = owner == null ? "" : AgentName(owner!.Agent), Depth = owner == null ? 0 : owner!.Depth,
+      Kind = line.Kind, Group = GroupOf(line.Kind), Said = line.Summary, When = At(line.At), Erased = line.Erased,
+      Model = line.Model, Why = line.RouteRule, Attempts = line.Attempts, Cost = line.CostMicros > 0 ? "$" + Dollars(line.CostMicros) : "",
+      Href = WorkPageOf(line.Task, line.Seq),
+    };
+    if (line.Tool != "") { step.Tool = labels.ContainsKey(line.Tool) ? labels[line.Tool] : Capital(Words(line.Tool)); }
+    step.Problem = line.Kind == TraceKind.SentBack || line.Kind == TraceKind.Guarded
+      || (line.Kind == TraceKind.ToolResult && line.Summary.Contains("did not run"))
+      || (line.Kind == TraceKind.ToolCall && line.Summary.Contains("Nothing ran"))
+      || (line.Kind == TraceKind.Ended && owner != null && owner!.Status != AgentTaskStatus.Done);
+    // What it said: there, kept from this reader, or erased.
+    if (line.PayloadHash != "" && line.Payload == null) { step.Kept = true; }
+    else if (line.PayloadHash != "" && line.Payload == "") { step.Erased = true; }
+    else if (line.Payload != null) {
+      // The first line of this piece holds what it was given, as the model was shown it.
+      if (line.Kind == TraceKind.Started && line.Task == t!.Id) { view.Brief = Readable(line.Payload); }
+      if (line.Kind == TraceKind.ModelCall) { step.Content = SaidInWords(line.Payload!); }
+      else if (line.Kind == TraceKind.ToolCall && owner != null) { step.Given = ArgumentsAsRead(owner!.Agent, owner!.Skill, line.Tool, line.Payload!); }
+      else { step.Content = Readable(line.Payload); }
+    }
+    if (index + 1 < lines.Count) {
+      var gap = lines[index + 1].At - line.At;
+      if (gap.TotalMinutes >= 1) { step.Took = Lasting(gap); }
+    } else if (owner != null && owner!.Status == AgentTaskStatus.Waiting) {
+      step.StillWaiting = true;
+      step.Took = Lasting(now - line.At);
+    }
+    view.Steps.Add(step);
+    index = index + 1;
+  }
+  if (t!.Status == AgentTaskStatus.Waiting) {
+    var since = t!.StartedAt;
+    foreach (var line in lines) { if (line.Task == t!.Id && line.Kind == TraceKind.Waiting) { since = line.At; } }
+    view.Waiting = "Waiting on " + (t!.WaitingOn == "" ? "a person" : t!.WaitingOn) + ", for " + Lasting(now - since) + " so far.";
+  }
+
+  // Whether the record still checks, and what has been erased.
+  var check = VerifyTrace(t!);
+  view.Intact = check.Intact;
+  view.Lines = check.Lines;
+  view.ErasedLines = check.Erased;
+  view.Record = RecordInWords(check);
+  if (t!.ContentErasedAt != null) {
+    view.Erasures.Add("What it said was erased on " + At(t!.ContentErasedAt!) + (t!.ErasedWhy == "" ? "." : ": " + t!.ErasedWhy));
+  }
+  if (t!.AnonymisedAt != null) {
+    view.Erasures.Add("Who it was for and what it was about were taken off it on " + At(t!.AnonymisedAt!) + (t!.ErasedWhy == "" ? "." : ": " + t!.ErasedWhy));
+  }
+  if (check.Erased > 0) {
+    view.Erasures.Add(Counted(check.Erased, "line") + " of the record no longer " + (check.Erased == 1 ? "says what it said. It still fits" : "say what they said. They still fit") + " the chain: what happened, in what order and at what cost is unchanged.");
+  }
+  return view;
+}
+
+/// The pieces of one tree, each directly under the piece that handed it on.
+List<AgentTask> InTreeOrder(List<AgentTask> pieces) {
+  List<AgentTask> ordered = [];
+  if (pieces.Count == 0) { return ordered; }
+  AddUnder(pieces[0], pieces, ordered);
+  // A piece whose parent whoever is looking may not read still belongs to the tree.
+  foreach (var piece in pieces) { if (!ordered.Contains(piece)) { ordered.Add(piece); } }
+  return ordered;
+}
+
+void AddUnder(AgentTask piece, List<AgentTask> pieces, List<AgentTask> ordered) {
+  if (ordered.Contains(piece) || ordered.Count > 500) { return; }
+  ordered.Add(piece);
+  foreach (var child in pieces) {
+    if (child.Parent != null && child.Parent!.Id == piece.Id) { AddUnder(child, pieces, ordered); }
+  }
+}
+
+InspectedProposal ProposalOf(AgentProposal p) {
+  var view = new InspectedProposal {
+    Id = p.Id, Label = p.Label, Does = p.Does, Why = p.Why, Status = p.Status, Reason = p.Reason, InstructionSet = p.InstructionSet,
+    PutTo = p.DecideQueue != "" ? "the " + p.DecideQueue + " queue" : p.DecideBy == null ? "" : Named(p.DecideBy),
+  };
+  try { view.Shown = JsonSerializer.Deserialize<List<ProposalLine>>(p.ShownJson); } catch (Exception e) { }
+  try { view.Evidence = JsonSerializer.Deserialize<List<ProposalEvidence>>(p.EvidenceJson); } catch (Exception e) { }
+  var who = p.DecidedBy == null ? "" : Named(p.DecidedBy);
+  var after = p.DecidedAt == null ? "" : " after " + Lasting(p.DecidedAt! - p.At);
+  var when = p.DecidedAt == null ? "" : " on " + At(p.DecidedAt!);
+  if (p.Status == ProposalStatus.Waiting) { view.Decided = "Waiting for " + (view.PutTo == "" ? "a person" : view.PutTo) + " since " + At(p.At) + "."; }
+  else if (p.Status == ProposalStatus.Done) { view.Decided = "Approved by " + who + when + after + ", and it ran as them."; }
+  else if (p.Status == ProposalStatus.Rejected) { view.Decided = "Rejected by " + who + when + after + "."; }
+  else if (p.Status == ProposalStatus.Withdrawn) { view.Decided = "Withdrawn: " + (p.Problem == "" ? "the work ended first." : p.Problem); }
+  else if (p.Status == ProposalStatus.Stale) { view.Decided = "Not run: things had changed since it was proposed."; }
+  else { view.Decided = (who == "" ? "Approved" : "Approved by " + who) + when + ", and it could not be done."; }
+  view.Outcome = p.Status == ProposalStatus.Done ? Readable(p.ResultJson) : p.Status == ProposalStatus.Waiting || p.Status == ProposalStatus.Rejected ? "" : p.Problem;
+  return view;
+}
+
+InspectedHelp HelpOf(AgentHelp h) {
+  var person = h.From == HelpFrom.Person;
+  var why = h.Why == HelpReason.Stuck ? "It was stuck." : h.Why == HelpReason.LowConfidence ? "It was not sure enough." : "It chose to ask.";
+  var view = new InspectedHelp {
+    Id = h.Id, OfAPerson = person, Of = person ? (h.AskedPerson == null ? "A person" : Named(h.AskedPerson)) : h.AskedModel + " (a model)",
+    Why = why, Question = h.Question, Status = h.Status, Answer = h.Answer, Erased = h.ErasedAt != null,
+  };
+  // What was asked is content: there, erased, or kept from this reader.
+  if (!view.Erased && h.Question == "" && h.Answer == "") { view.Kept = true; }
+  if (h.Status == HelpStatus.Waiting) { view.Came = "No answer yet, since " + At(h.At) + "."; }
+  else if (person && h.Status == HelpStatus.Answered) {
+    view.Came = "Answered by " + (h.AnsweredBy == null ? view.Of : Named(h.AnsweredBy)) + (h.AnsweredAt == null ? "" : " after " + Lasting(h.AnsweredAt! - h.At)) + ".";
+  }
+  else if (h.Status == HelpStatus.Answered) { view.Came = h.CostMicros > 0 ? "Advice that cost $" + Dollars(h.CostMicros) + "." : "It answered."; }
+  else if (h.Status == HelpStatus.Refused) { view.Came = "It was not asked: there was no leave or no room for it."; }
+  else { view.Came = "No answer came."; }
+  return view;
+}
+
+/// What the inspector says of a record's check: that every line is as it was written — or that it does not check,
+/// and where. A record nobody can write cannot be broken from an app, so this is said apart from the page.
+public string RecordInWords(TraceCheck check) {
+  if (!check.Intact) { return "Its record does not check. " + check.Problem; }
+  return check.Lines == 1 ? "The one line of its record is as it was written." : $"All {check.Lines} lines of its record are as they were written.";
+}

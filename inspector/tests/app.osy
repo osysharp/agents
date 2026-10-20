@@ -1,0 +1,16 @@
+// The producer's test project for Osysharp.Agents.Inspector — a small weather station whose daily bulletin is drafted
+// by an agent. The forecaster reads the gauges alone, asks the duty meteorologist what it cannot know, and proposes
+// a storm warning it may not post by itself. Each piece of its work is then opened and read. No model is ever
+// called: its one model is scripted.
+app Station {
+  model "model/**/*.osy";
+  tests "**/*.test.osy";
+  use Osysharp.Agents@1;
+  use Osysharp.Agents.Testing@1;
+  use Osysharp.Agents.Inspector@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Observability;
+  use Osysharp.Workflow;
+  use Osysharp.Ui;
+}

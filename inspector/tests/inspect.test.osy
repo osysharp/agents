@@ -1,0 +1,250 @@
+// Osysharp.Agents.Inspector — one piece of the forecaster's work, read back: who asked and as whom it ran, each step
+// with what it was given and what it answered, the question it put to a person and how long the answer took, the
+// warning it proposed and who said no, what it cost — as whoever is looking may read it. Then on screen.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Station;
+
+[TestFixture]
+void Skerry() {
+  var ilse = new Person { Email = "ilse@skerrypoint.example", DisplayName = "Ilse Varga" };
+  var bram = new Person { Email = "bram@skerrypoint.example", DisplayName = "Bram Okoro" };
+  var anouk = new Person { Email = "anouk@skerrypoint.example", DisplayName = "Anouk Feld" };
+  var odd = new Person { Email = "odd@skerrypoint.example", DisplayName = "Odd Sunde" };
+  new RoleGrant { Member = ilse, Role = StationRole.Meteorologist };
+  new RoleGrant { Member = bram, Role = StationRole.Meteorologist };
+  new RoleGrant { Member = anouk, Role = StationRole.Chief };
+  new RoleGrant { Member = odd, Role = StationRole.Observer };
+  new Gauge { Name = "Wind", Reading = 24, Unit = "m/s" };
+  new Gauge { Name = "Barometer", Reading = 978, Unit = "hPa" };
+  new AgentSeat { Agent = "Station.Forecaster", Sponsor = anouk };
+}
+
+principal Ilse  => Person.Single(p => p.Email == "ilse@skerrypoint.example");
+principal Bram  => Person.Single(p => p.Email == "bram@skerrypoint.example");
+principal Anouk => Person.Single(p => p.Email == "anouk@skerrypoint.example");
+principal Odd   => Person.Single(p => p.Email == "odd@skerrypoint.example");
+
+void GoOn(Guid task) { Workflow.Settle(AgentWait.Where(w => w.Task.Id == task).OrderByDescending(w => w.Since).First()); }
+
+/// ⭐ THE BULLETIN OF THE NINTH. Ilse has the forecaster draft it at six. It reads the wind, asks her whether the
+/// north quay is closed — she answers two hours later —, proposes a gale warning, which she turns down, and hands
+/// the bulletin back. Answers the work's receipt.
+Guid TheBulletinOfTheNinth() {
+  TestClock.Set(new DateTime(2031, 11, 9, 6, 0, 0, DateTimeKind.Utc));
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(ReadGauge), "{\"gauge\":\"Wind\"}", 300, 20),
+    Says.AskPerson("Has the harbour master closed the north quay?", "The wind is 24 m/s.", 400, 30),
+    Says.Tool("The wind is 24 metres a second, over the limit for small craft.", Actions.Of(PostWarning), "{\"text\":\"Gale warning: 24 m/s from the north-west.\"}", 500, 40),
+    Says.HandBack(new Bulletin { Headline = "Gale from the north-west; the north quay is closed.", Warned = false }, 600, 40));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  Guid task = Guid.Empty;
+  runas (Ilse) {
+    var outcome = Draft("9 November");
+    Assert.True(outcome.Waiting);
+    task = outcome.Task;
+  }
+  TestClock.Advance(TimeSpan.FromHours(2));
+  runas (Ilse) {
+    AnswerAgentQuestion(QuestionsForMe().Single(), "Yes, since five this morning.");
+    GoOn(task);
+    Assert.Equal(AgentTaskStatus.Waiting, AgentTask.Single().Status);
+  }
+  TestClock.Advance(TimeSpan.FromMinutes(30));
+  runas (Ilse) {
+    RejectAgentProposal(ProposalsForMe().Single(), "The harbour master posts warnings himself.");
+    GoOn(task);
+    Assert.Equal(AgentTaskStatus.Done, AgentTask.Single().Status);
+  }
+  return task;
+}
+
+[Test(Skerry)]
+void work_done_for_a_person_is_told_with_its_question_its_proposal_and_every_step() {
+  var task = TheBulletinOfTheNinth();
+  runas (Ilse) {
+    var seen = InspectAgentWork(task)!;
+    Assert.Equal("Forecaster", seen.Name);
+    Assert.Equal("draft bulletin", seen.Skill);
+    Assert.Equal("Bulletin for 9 November", seen.About);
+    Assert.Equal(AgentTaskStatus.Done, seen.Status);
+    Assert.Equal("Given by Ilse Varga.", seen.GivenBy);
+    Assert.Equal("Done for Ilse Varga: never past what they may do themselves.", seen.For);
+    Assert.Equal("It ran as Forecaster, Forecaster's own account.", seen.RanAs);
+    Assert.Equal("", seen.Process);
+    Assert.Equal("9 November", seen.Brief);
+    Assert.Equal("Headline: Gale from the north-west; the north quay is closed.\nWarned: false", seen.Result);
+    Assert.Equal("9 Nov 2031, 06:00", seen.Started);
+    Assert.Equal("2 hours 30 minutes", seen.Lasted);
+    // Its tools, and what it may do with each.
+    Assert.Equal(["Read a gauge: Alone, only reads", "Post a warning to the harbour: Proposes first, changes the app's data"],
+                 seen.Tools.Select(t => t.Label + ": " + t.Leave.Label + ", " + t.Does).ToList());
+    // The question it put to her, and the wait.
+    var asked = seen.Help.Single();
+    Assert.True(asked.OfAPerson);
+    Assert.Equal("Ilse Varga", asked.Of);
+    Assert.Equal("Has the harbour master closed the north quay?", asked.Question);
+    Assert.Equal("Yes, since five this morning.", asked.Answer);
+    Assert.Equal("Answered by Ilse Varga after 2 hours.", asked.Came);
+    // The warning it proposed, and who said no.
+    var proposed = seen.Proposals.Single();
+    Assert.Equal("Post a warning to the harbour", proposed.Label);
+    Assert.Equal(ProposalStatus.Rejected, proposed.Status);
+    Assert.Equal("The wind is 24 metres a second, over the limit for small craft.", proposed.Why);
+    Assert.Equal("Rejected by Ilse Varga on 9 Nov 2031, 08:30 after 30 minutes.", proposed.Decided);
+    Assert.Equal("The harbour master posts warnings himself.", proposed.Reason);
+    Assert.Equal("Read a gauge", proposed.Evidence.Single().Tool);
+    // Every step, in order; a tool's answer; each wait with how long it lasted.
+    Assert.Equal(["Started", "ModelCall", "ToolCall", "ToolResult", "ModelCall", "AskedForHelp", "Waiting", "AskedForHelp",
+                  "ModelCall", "ToolCall", "Waiting", "Decided", "ModelCall", "Ended"], seen.Steps.Select(s => s.Kind.Name).ToList());
+    Assert.Equal("24 m/s", seen.Steps.Single(s => s.Kind == TraceKind.ToolResult).Content);
+    Assert.Equal(["gauge: Wind"], seen.Steps.First(s => s.Kind == TraceKind.ToolCall).Given.Select(g => g.Name + ": " + g.Value).ToList());
+    Assert.Equal(["2 hours", "30 minutes"], seen.Steps.Where(s => s.Kind == TraceKind.Waiting).Select(s => s.Took).ToList());
+    Assert.Equal(["model", "tool", "person", "other"], seen.Steps.Select(s => s.Group).Distinct().OrderBy(g => g == "model" ? 0 : g == "tool" ? 1 : g == "person" ? 2 : 3).ToList());
+    Assert.True(seen.Steps.Single(s => s.Kind == TraceKind.Decided).Said.StartsWith("Ilse Varga said no to PostWarning"));
+    // What it cost, step by step and in all.
+    Assert.Equal(["$0.0004", "$0.0006", "$0.0007", "$0.0008"], seen.Steps.Where(s => s.Kind == TraceKind.ModelCall).Select(s => s.Cost).ToList());
+    Assert.Equal("$0.0025", seen.Spent);
+    Assert.Equal("$0.05", seen.Limit);
+    Assert.Equal(4, seen.Percent);
+    Assert.Equal("4 model calls · 1 tool call · 1800 tokens in, 130 out", seen.Use);
+    Assert.Equal(0, seen.ChargedTo.Count);
+    // Each step has its address; the record checks.
+    Assert.Equal("/work/" + task.ToString(), seen.Steps[0].Href);
+    Assert.True(seen.Intact);
+    Assert.Equal("All 14 lines of its record are as they were written.", seen.Record);
+    Assert.Equal("", seen.Waiting);
+  }
+}
+
+[Test(Skerry)]
+void work_that_waits_says_on_whom_and_since_when() {
+  TestClock.Set(new DateTime(2031, 11, 9, 6, 0, 0, DateTimeKind.Utc));
+  var script = AgentScript.Of(Says.AskPerson("Has the harbour master closed the north quay?"));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  Guid task = Guid.Empty;
+  runas (Ilse) { task = Draft("9 November").Task; }
+  TestClock.Advance(TimeSpan.FromHours(26));
+  runas (Ilse) {
+    var seen = InspectAgentWork(task)!;
+    Assert.Equal(AgentTaskStatus.Waiting, seen.Status);
+    Assert.False(seen.Ended);
+    Assert.Equal("Waiting on an answer from Ilse Varga, for 1 day 2 hours so far.", seen.Waiting);
+    Assert.Equal("No answer yet, since 9 Nov 2031, 06:00.", seen.Help.Single().Came);
+    Assert.True(seen.Steps.Last().StillWaiting);
+    Assert.Equal("1 day 2 hours", seen.Steps.Last().Took);
+    Assert.Equal("", seen.Result);
+  }
+}
+
+[Test(Skerry)]
+void each_reader_is_shown_what_the_agents_kit_lets_them_read_and_no_more() {
+  var task = TheBulletinOfTheNinth();
+  // Another meteorologist uses the agents, and this work was not his.
+  runas (Bram) { Assert.Null(InspectAgentWork(task)); }
+  // An observer has no part in the agents at all.
+  runas (Odd) { Assert.Null(InspectAgentWork(task)); }
+  // The chief supervises and audits: all of it, with what it said.
+  runas (Anouk) {
+    var seen = InspectAgentWork(task)!;
+    Assert.False(seen.Steps.Any(s => s.Kept));
+    Assert.Equal("24 m/s", seen.Steps.Single(s => s.Kind == TraceKind.ToolResult).Content);
+    Assert.Equal("Has the harbour master closed the north quay?", seen.Help.Single().Question);
+  }
+  // Nobody signed in reads nothing.
+  Assert.Throws<NotAuthorized>(() => InspectAgentWork(task));
+}
+
+[Test(Skerry)]
+void something_the_agent_was_only_asked_is_inspected_like_any_work() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A gale from the north-west by noon.", 200, 20));
+  Guid task = Guid.Empty;
+  runas (Ilse) { task = AskForecaster("What does the afternoon look like?").Task; }
+  runas (Ilse) {
+    var seen = InspectAgentWork(task)!;
+    Assert.Equal("", seen.Skill);
+    Assert.Equal("What does the afternoon look like?", seen.Brief);
+    Assert.Equal("A gale from the north-west by noon.", seen.Result);
+    Assert.Equal(0, seen.Tools.Count);
+    Assert.Equal(["Started", "ModelCall", "Ended"], seen.Steps.Select(s => s.Kind.Name).ToList());
+    Assert.Equal("A gale from the north-west by noon.", seen.Steps[1].Content);
+  }
+}
+
+// ── on screen ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(Skerry)]
+void a_meteorologist_reads_the_bulletins_work_on_its_page() {
+  var task = TheBulletinOfTheNinth();
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Ilse);
+  Ui.Visit("/work/" + task.ToString());
+  Assert.Visible("Bulletin for 9 November", within: "The work");
+  Assert.Visible("Done", within: "The work");
+  Assert.Visible("Given by Ilse Varga.", within: "What was asked");
+  Assert.Visible("9 November", within: "What it was given");
+  Assert.Visible("Headline: Gale from the north-west; the north quay is closed.", within: "The result");
+  Assert.Visible("$0.0025 of $0.05", within: "Spent on models");
+  Assert.Visible("Rejected by Ilse Varga on 9 Nov 2031, 08:30 after 30 minutes.", within: "Proposal: Post a warning to the harbour");
+  Assert.Visible("Their reason: The harbour master posts warnings himself.", within: "Proposal: Post a warning to the harbour");
+  Assert.Visible("Has the harbour master closed the north quay?", within: "Asked Ilse Varga");
+  Assert.Visible("Yes, since five this morning.", within: "The answer");
+  Assert.Visible("Answered by Ilse Varga after 2 hours.", within: "Asked Ilse Varga");
+  Assert.Visible("14 steps, in order", within: "Steps");
+  Assert.Visible("then 2 hours", within: "Step 7");
+  Assert.Visible("Proposes first", within: "Its tools");
+  Assert.Visible("All 14 lines of its record are as they were written.", within: "The record");
+  // No app page was named for a run, and nothing was contributed: neither slot draws anything.
+  Assert.Hidden("Open the run");
+  Assert.NoOverflow();
+  Ui.Shot("work-wide-light");
+
+  // What a tool answered, and only the steps a tool had a part in.
+  Ui.Click("Tools");
+  Assert.Visible("ReadGauge answered.", within: "Steps");
+  Assert.Hidden("It waits for an answer from Ilse Varga.");
+  Ui.Click("More of step 4");
+  Assert.Visible("24 m/s", within: "More of step 4");
+  Ui.Click("All");
+
+  Ui.Viewport(390, 844);
+  Ui.Visit("/work/" + task.ToString());
+  Assert.Visible("Bulletin for 9 November", within: "The work");
+  Assert.NoOverflow();
+  Ui.Theme("dark");
+  Ui.Shot("work-phone-dark");
+  Ui.Theme("light");
+}
+
+[Test(Skerry)]
+void somebody_elses_work_says_that_it_is_not_yours() {
+  var task = TheBulletinOfTheNinth();
+  Ui.Viewport(1440, 900);
+  Ui.SignInAs(Bram);
+  Ui.Visit("/work/" + task.ToString());
+  Assert.Visible("This piece of work is not yours to see");
+  Assert.Visible("It was done for somebody else, or its record has been deleted.");
+  Assert.Hidden("Bulletin for 9 November");
+  Ui.Shot("work-not-yours-wide-light");
+}
+
+/// A record that does not check is said so, with where it breaks — on the page as in the kit's own check. Nothing an
+/// app runs can rewrite a line, so the test breaks a copy of the lines the record holds.
+[Test(Skerry)]
+void a_record_that_does_not_check_is_said_so_and_where() {
+  var task = TheBulletinOfTheNinth();
+  runas (Ilse) {
+    var receipt = AgentTask.Single(t => t.Id == task);
+    Assert.Equal("All 14 lines of its record are as they were written.", RecordInWords(VerifyTrace(receipt)));
+    var lines = TraceOf(receipt);
+    lines[3].Summary = "Nobody was asked anything.";
+    Assert.Equal("Its record does not check. Line 4 is not as it was written.", RecordInWords(CheckChain(lines)));
+    lines = TraceOf(receipt);
+    lines.RemoveAt(5);
+    Assert.Equal("Its record does not check. Line 6 is missing.", RecordInWords(CheckChain(lines)));
+  }
+}

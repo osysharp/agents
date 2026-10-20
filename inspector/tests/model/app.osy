@@ -1,0 +1,112 @@
+// Skerry Point weather station: the meteorologists have the forecaster draft the day's bulletin; the station chief
+// answers for it; an observer watches the gauges and has no part in the forecaster's work.
+namespace Station;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Inspector;
+
+[Role] enum StationRole { Authenticator, Meteorologist, Chief, Observer, Forecasting }
+
+partial entity RoleGrant { security { allow read when IsAuthenticated; } }
+
+policy IsMeteorologist => RoleGrant.Any(g => g.Member == user && g.Role == StationRole.Meteorologist);
+policy IsChief         => RoleGrant.Any(g => g.Member == user && g.Role == StationRole.Chief);
+policy IsForecasting   => RoleGrant.Any(g => g.Member == user && g.Role == StationRole.Forecasting);
+
+policy UsesAgents       => IsMeteorologist || IsChief;
+policy SupervisesAgents => IsChief;
+policy AuditsAgents     => IsChief;
+
+/// Somebody at the station — and the forecaster's own account.
+entity Person : Principal {
+  security {
+    allow read when IsAuthenticated || IsAuthenticator;
+    allow create when IsAuthenticator;
+  }
+}
+
+/// One gauge and what it reads.
+entity Gauge {
+  [Required, Unique, MaxLength(40)] string Name;
+  decimal Reading = 0;
+  [MaxLength(20)] string Unit = "";
+  security { allow read when IsAuthenticated; allow create when IsChief; }
+}
+
+/// A warning posted to the harbour.
+entity Warning {
+  [Required, MaxLength(200)] string Text;
+  [ModifiedBy] Guid? PostedBy;
+  security { allow read when IsAuthenticated; allow create when IsMeteorologist || IsChief || IsForecasting; }
+}
+
+/// What a gauge reads now.
+[Action("Read a gauge", Query)]
+public string ReadGauge(string gauge) {
+  var g = Gauge.FirstOrDefault(x => x.Name == gauge);
+  return g == null ? "There is no gauge called " + gauge + "." : g!.Reading.ToString() + " " + g!.Unit;
+}
+
+/// Post a warning to the harbour.
+[Action("Post a warning to the harbour")]
+public string PostWarning(string text) {
+  new Warning { Text = text };
+  return "Posted: " + text;
+}
+
+/// What the forecaster hands back.
+public class Bulletin {
+  public string Headline = "";
+  public bool Warned;
+}
+
+/// Drafts the day's bulletin.
+public class DraftBulletin : Skill<string, Bulletin> {
+  public override string Description => "Draft the day's bulletin for the harbour.";
+  public override string Instructions => "Read the wind and the barometer first. Above 20 metres a second, post a warning.";
+  public override List<ActionInfo> Tools => [Actions.Of(ReadGauge), Actions.Of(PostWarning)];
+}
+
+/// Drafts the bulletin. It reads the gauges alone; a warning is proposed to a person; and what the harbour master
+/// has said is a person's to say.
+[Actor(Roles = [StationRole.Forecasting])]
+public class Forecaster : Agent {
+  public static Person Principal => new Person { Email = "forecaster@skerrypoint.example", DisplayName = "Forecaster" };
+  public override string Purpose => "You draft the daily weather bulletin of Skerry Point station.";
+  public override List<SkillBase> Skills => [new DraftBulletin()];
+  public override AsksPeople People => new AsksPeople { MayChoose = true };
+}
+
+/// Have the forecaster draft a bulletin, for whoever is signed in.
+public AgentOutcome<Bulletin> Draft(string day) { return await Agents.Of<Forecaster>().Do(new DraftBulletin(), day, about: "Bulletin for " + day); }
+
+/// Ask the forecaster something.
+public AgentReply AskForecaster(string question) { return await Agents.Of<Forecaster>().Ask(question); }
+
+/// The station's front door: the forecaster's work, newest first, each a way into its page.
+[Route("/")] [Authorize(UsesAgents)] [Render(CSR)] [Title("The forecaster")]
+component Home() {
+  live var work = AgentTask.OrderByDescending(t => t.StartedAt).Take(20).ToList();
+  render {
+    Stack(gap: 4, px: 5, py: 6, w: "100%", maxW: "920px", mx: "auto", label: "The forecaster's work") {
+      Text("The forecaster's work", fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold);
+      if (work.Count == 0) { EmptyState("Nothing yet", body: "Work the forecaster is given shows here."); }
+      foreach (var t in work) {
+        Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+          TextLink(t.About == "" ? "A piece of work" : t.About, to: "/work/" + t.Id.ToString());
+          Text(t.Status.Label, fontSize: FontSize.Label, color: Colors.TextMuted);
+        }
+      }
+    }
+  }
+}
+
+/// One piece of the forecaster's work.
+[Route("/work/{task}")] [Authorize(UsesAgents)] [Render(CSR)] [Title("The forecaster's work")]
+component WorkPage(Guid task) {
+  render {
+    Stack(gap: 5, px: 5, py: 6, w: "100%", maxW: "920px", mx: "auto") { WorkInspector(task); }
+  }
+}

@@ -1,0 +1,369 @@
+// The inspector — one piece of an agent's work, laid out to be read from the top by somebody who was not there:
+// what it was and how it ended, who asked and as whom it ran, what it handed back, what people decided, every step
+// in order, what it cost, and whether its record still checks.
+namespace Osysharp.Agents.Inspector;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Ui;
+
+/// ⭐ MORE ABOUT A PIECE OF WORK, under its record — a section each from whoever adds one. The page that corrects an
+/// agent's work is three lines in the app that has `Osysharp.Agents.Teaching`:
+///
+///     [Contribution("Teaching")]
+///     component TeachHere(Guid task) : AgentWorkPanel { render { WorkTeaching(task, beside: true); } }
+[Slot] public abstract component AgentWorkPanel(Guid task);
+
+/// ⭐ WHAT CAN BE DONE ABOUT A PIECE OF WORK, at the head of the page — straight under what it is and how it stands,
+/// so that nobody scrolls past a long record to stop it. `Osysharp.Agents.Management` puts calling it off, trying it
+/// again and handing it to a person here.
+///
+///     [Contribution("In charge")]
+///     component StopHere(Guid task) : AgentWorkActions { render { WorkInCharge(task); } }
+[Slot] public abstract component AgentWorkActions(Guid task);
+
+/// ⭐ WHERE A PIECE OF WORK CAME FROM, beside who asked for it — `Osysharp.Agents.Processes` shows the run of the
+/// process the work is a step of, with the way to it.
+[Slot] public abstract component AgentWorkOrigin(Guid task);
+
+Tone ToneOfWork(AgentTaskStatus status) {
+  return status == AgentTaskStatus.Done ? Tone.Success : status == AgentTaskStatus.Failed ? Tone.Danger
+       : status == AgentTaskStatus.Waiting ? Tone.Warning : status == AgentTaskStatus.Working ? Tone.Primary : Tone.Ghost;
+}
+
+Tone ToneOfLeave(Leave leave) {
+  return leave == Leave.Alone ? Tone.Success : leave == Leave.Never ? Tone.Danger : Tone.Warning;
+}
+
+Tone ToneOfProposal(ProposalStatus status) {
+  return status == ProposalStatus.Done ? Tone.Success : status == ProposalStatus.Waiting ? Tone.Warning
+       : status == ProposalStatus.Rejected || status == ProposalStatus.Failed ? Tone.Danger : Tone.Ghost;
+}
+
+/// A fact with its caption above it.
+[Composable]
+component Fact(string caption, string value, bool mono = false) {
+  render {
+    Stack(gap: 1, minW: "9rem") {
+      Text(caption, fontSize: FontSize.Caption, color: Colors.TextMuted);
+      if (mono) { Text(value, fontSize: FontSize.Body, fontWeight: FontWeight.Medium, fontFamily: Font.Mono); }
+      if (!mono) { Text(value, fontSize: FontSize.Body, fontWeight: FontWeight.Medium); }
+    }
+  }
+}
+
+/// Words that were said — a brief, a result, an answer — set apart from what the page says about them.
+[Composable]
+component Quoted(string text, string name) {
+  render {
+    Stack(gap: 0, px: 4, py: 3, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Md, label: name) {
+      Text(text, fontSize: FontSize.Body, lineHeight: "1.55", maxW: "68ch", whiteSpace: WhiteSpace.PreLine);
+    }
+  }
+}
+
+/// One step of the record. Its number is its link; what it said in full opens under it.
+[Composable]
+public component InspectedStepLine(InspectedStep step, bool marked = false, bool showWho = false) {
+  bool open = false;
+  action Toggle() { open = !open; }
+  render {
+    Stack(gap: 2, py: 3, pl: marked ? 3 : 0, borderLW: marked ? 3 : 0, border: Colors.Primary.Default, label: "Step " + step.Seq.ToString()) {
+      Row(gap: 3, align: Align.Start) {
+        Stack(gap: 0, minW: "2rem", pt: "0.1rem") {
+          if (step.Href != "") { TextLink(step.Seq.ToString(), to: step.Href, tone: Tone.Ghost); }
+          if (step.Href == "") { Text(step.Seq.ToString(), fontSize: FontSize.Label, color: Colors.TextMuted, fontFamily: Font.Mono); }
+        }
+        Stack(gap: 1, grow: 1, minW: "0", pl: step.Depth > 0 ? 4 : 0) {
+          if (step.Erased && step.Said == "Erased.") { Text("What this step said has been erased.", fontSize: FontSize.Body, color: Colors.TextMuted, lineHeight: "1.5"); }
+          if (!(step.Erased && step.Said == "Erased.")) {
+            if (step.Problem) { Text(step.Said, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "68ch", color: Colors.Danger.Text); }
+            if (!step.Problem) { Text(step.Said, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "68ch"); }
+          }
+          Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+            Text(step.Kind.Label + (showWho && step.By != "" ? " · " + step.By : ""), fontSize: FontSize.Caption, color: Colors.TextMuted);
+            Text(step.When, fontSize: FontSize.Caption, color: Colors.TextMuted);
+            if (step.Cost != "") { Text(step.Cost, fontSize: FontSize.Caption, color: Colors.TextSecondary, fontFamily: Font.Mono); }
+            if (step.Took != "") { Badge((step.StillWaiting ? "waiting " : "then ") + step.Took + (step.StillWaiting ? " so far" : ""), tone: step.StillWaiting ? Tone.Warning : Tone.Ghost); }
+            if (step.Erased) { Badge("Erased", tone: Tone.Ghost); }
+            if (step.Model != "" || step.Tool != "" || step.Content != "" || step.Given.Count > 0 || step.Kept) {
+              Button(open ? "Hide" : "More", onPress: Toggle, size: Size.Sm, tone: Tone.Ghost, announceAs: (open ? "Hide step " : "More of step ") + step.Seq.ToString());
+            }
+          }
+          if (open) {
+            Stack(gap: 2, pt: 1, label: "More of step " + step.Seq.ToString()) {
+              if (step.Model != "") {
+                Text(step.Model + (step.Why == "" ? "" : " — chosen by the rule " + step.Why) + (step.Attempts > 1 ? ", the " + step.Attempts.ToString() + " model tried" : ""),
+                     fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.5");
+              }
+              if (step.Tool != "") { Text(step.Tool, fontSize: FontSize.Label, fontWeight: FontWeight.Medium); }
+              if (step.Given.Count > 0) {
+                Stack(gap: 1, label: "What it was given") {
+                  foreach (var g in step.Given) {
+                    Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+                      Text(g.Name, fontSize: FontSize.Label, color: Colors.TextMuted, minW: "7rem");
+                      Text(g.Value, fontSize: FontSize.Label, fontWeight: FontWeight.Medium, maxW: "56ch");
+                    }
+                  }
+                }
+              }
+              if (step.Content != "") { Quoted(step.Content, "What it said"); }
+              if (step.Kept) {
+                Text("What it said is kept from you: you may see that this happened, not what was said.", fontSize: FontSize.Label, color: Colors.TextMuted, lineHeight: "1.5", maxW: "62ch");
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// One proposal, and what a person decided.
+[Composable]
+public component InspectedProposalCard(InspectedProposal p) {
+  render {
+    Stack(gap: 2, px: 4, py: 3, label: "Proposal: " + p.Label) {
+      Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+        Text(p.Label, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold);
+        Badge(p.Status.Label, tone: ToneOfProposal(p.Status));
+      }
+      if (p.Shown.Count > 0) {
+        Stack(gap: 1) {
+          foreach (var line in p.Shown) {
+            Row(gap: 2, align: Align.Baseline, wrap: Wrapping.Wrap) {
+              Text(line.Name, fontSize: FontSize.Label, color: Colors.TextMuted, minW: "7rem");
+              Text(line.Value, fontSize: FontSize.Label, fontWeight: FontWeight.Medium, maxW: "56ch");
+            }
+          }
+        }
+      }
+      if (p.Why != "") { Text("Because: " + p.Why, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch"); }
+      Text(p.Decided, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch");
+      if (p.Reason != "") { Text("Their reason: " + p.Reason, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch"); }
+      if (p.Outcome != "") { Text(p.Outcome, fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch"); }
+    }
+  }
+}
+
+/// One request for help, and what came of it.
+[Composable]
+public component InspectedHelpCard(InspectedHelp h) {
+  render {
+    Stack(gap: 2, px: 4, py: 3, label: "Asked " + h.Of) {
+      Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+        Text("Asked " + h.Of, fontSize: FontSize.Body, fontWeight: FontWeight.Semibold);
+        Badge(h.Status.Label, tone: h.Status == HelpStatus.Answered ? Tone.Success : h.Status == HelpStatus.Waiting ? Tone.Warning : Tone.Ghost);
+        Text(h.Why, fontSize: FontSize.Caption, color: Colors.TextMuted);
+      }
+      if (h.Erased) { Text("What was asked and answered has been erased.", fontSize: FontSize.Body, color: Colors.TextMuted); }
+      if (h.Kept) { Text("What was asked and answered is kept from you.", fontSize: FontSize.Body, color: Colors.TextMuted); }
+      if (!h.Erased && !h.Kept) {
+        if (h.Question != "") { Text(h.Question, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch"); }
+        if (h.Answer != "") { Quoted(h.Answer, "The answer"); }
+      }
+      Text(h.Came, fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.5");
+    }
+  }
+}
+
+/// ⭐ THE INSPECTOR: one piece of an agent's work, readable by a person who was not there.
+///
+///     [Route("/work/{task}")] component WorkPage(Guid task) { render { WorkInspector(task); } }
+///     [Route("/work/{task}/{step}")] component StepPage(Guid task, int step) { render { WorkInspector(task, step: step); } }
+///
+/// `step` marks one step of the record — the one a link named. `embedded` leaves out the headline, for the work
+/// shown inside another page (a process run's step). It changes nothing and decides nothing: every line is read as
+/// whoever is looking, under `Osysharp.Agents`' own rules.
+///
+/// In a test: `Assert.Visible("Done", within: "The work")`, `Ui.Click("Tools")`, `Ui.Click("More of step 3")`,
+/// `Assert.Visible("All 9 lines of its record are as they were written.", within: "The record")`.
+[Composable]
+public component WorkInspector(Guid task, int step = 0, bool embedded = false) {
+  WorkInspection? view = null;
+  bool loaded = false;
+  string problem = "";
+  string only = "";
+  bool whole = true;
+
+  action Load() {
+    try { view = InspectAgentWork(task); problem = ""; } catch (Exception ex) { problem = ex.Message; }
+    loaded = true;
+  }
+  on mount { Load(); }
+  action All() { only = ""; }
+  action Models() { only = "model"; }
+  action ToolsOnly() { only = "tool"; }
+  action People() { only = "person"; }
+  action Problems() { only = "problem"; }
+  action ThisPiece() { whole = !whole; }
+
+  render {
+    Stack(gap: 6, w: "100%", maxW: "860px", label: "Agent work") {
+      if (!loaded) {
+        Stack(gap: 4, label: "Loading the work") {
+          Skeleton(SkeletonShape.HalfLine);
+          Skeleton(SkeletonShape.Block);
+          Stack(gap: 2) { Skeleton(); Skeleton(); Skeleton(SkeletonShape.HalfLine); }
+        }
+      }
+      if (loaded && problem != "") { Alert("This piece of work could not be shown: " + problem, tone: Tone.Danger); }
+      if (loaded && problem == "" && view == null) {
+        EmptyState("This piece of work is not yours to see", body: "It was done for somebody else, or its record has been deleted.");
+      }
+      if (view != null) {
+        // What it was, and how it ended: the one thing on the page that is big.
+        Stack(gap: 3, label: "The work") {
+          Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+            Text(view.Name + (view.Skill == "" ? "" : ", " + view.Skill) + (view.Attempt > 1 ? " · attempt " + view.Attempt.ToString() : ""), fontSize: FontSize.Label, color: Colors.TextMuted);
+            Badge(view.Status.Label, tone: ToneOfWork(view.Status));
+          }
+          if (!embedded && view.About != "") { Text(view.About, fontSize: FontSize.Heading, fontWeight: FontWeight.Semibold, letterSpacing: "-0.015em", lineHeight: "1.2"); }
+          if (embedded && view.About != "") { Text(view.About, fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold); }
+          if (view.Outcome != "" && view.Status != AgentTaskStatus.Done) { Alert(view.Outcome, title: view.Status.Label, tone: view.Status == AgentTaskStatus.Failed ? Tone.Danger : Tone.Warning); }
+          if (view.Waiting != "") { Alert(view.Waiting, tone: Tone.Warning); }
+          foreach (var erased in view.Erasures) { Text(erased, fontSize: FontSize.Label, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "66ch"); }
+        }
+
+        AgentWorkActions(view.Task);
+
+        Stack(gap: 3, label: "What was asked") {
+          Text("What was asked", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          Stack(gap: 1) {
+            Text(view.GivenBy, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch");
+            Text(view.For, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch");
+            Text(view.RanAs, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch");
+            if (view.Process != "") { Text("A step of the process " + view.Process + ", given at " + view.ProcessState + ".", fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch"); }
+          }
+          AgentWorkOrigin(view.Task);
+          if (view.Brief != "") { Quoted(view.Brief, "What it was given"); }
+        }
+
+        if (view.Result != "" || view.Status == AgentTaskStatus.Done) {
+          Stack(gap: 2, label: "What it handed back") {
+            Text("What it handed back", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            if (view.Result != "") { Quoted(view.Result, "The result"); }
+            if (view.Result == "") { Text("Nothing is kept of what it handed back.", fontSize: FontSize.Body, color: Colors.TextMuted); }
+          }
+        }
+
+        Row(gap: 6, wrap: Wrapping.Wrap, align: Align.Start, label: "In figures") {
+          Fact("Started", view.Started);
+          Fact(view.Ended ? "Took" : "So far", view.Lasted);
+          Stack(gap: 1, minW: "12rem", label: "Spent on models") {
+            Text("Spent on models", fontSize: FontSize.Caption, color: Colors.TextMuted);
+            Text(view.Limit == "" ? view.Spent : view.Spent + " of " + view.Limit, fontSize: FontSize.Body, fontWeight: FontWeight.Medium, fontFamily: Font.Mono);
+            if (view.Limit != "") { Box(w: "11rem", pt: 1) { ProgressBar(percent: view.Percent, tone: view.Percent >= 100 ? Tone.Danger : Tone.Primary, label: "Spent on models"); } }
+            Text(view.Use, fontSize: FontSize.Caption, color: Colors.TextMuted);
+          }
+        }
+        if (view.ChargedTo.Count > 0) {
+          Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap, label: "Charged to") {
+            Text("Also charged to", fontSize: FontSize.Caption, color: Colors.TextMuted);
+            Text(string.Join(", and ", view.ChargedTo) + ".", fontSize: FontSize.Caption, color: Colors.TextSecondary);
+          }
+        }
+
+        if (view.Proposals.Count > 0 || view.Help.Count > 0) {
+          Stack(gap: 2, label: "People and help") {
+            Text("What it put to people, and the help it asked for", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Stack(gap: 0, bg: Colors.Surface, borderW: 1, border: Colors.Border, rounded: Radius.Lg) {
+              foreach (var p in view.Proposals) { InspectedProposalCard(p); }
+              foreach (var h in view.Help) { InspectedHelpCard(h); }
+            }
+          }
+        }
+
+        if (view.Tree.Count > 1) {
+          Stack(gap: 2, label: "Handed on") {
+            Text("The work it is part of", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Stack(gap: 1) {
+              foreach (var piece in view.Tree) {
+                Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap, pl: piece.Depth > 2 ? 12 : piece.Depth * 4, label: "Piece " + piece.Name) {
+                  if (piece.Depth > 0) { Text("↳", fontSize: FontSize.Body, color: Colors.TextMuted); }
+                  if (piece.This || piece.Href == "") { Text(piece.Name + (piece.Skill == "" ? "" : ", " + piece.Skill), fontSize: FontSize.Body, fontWeight: piece.This ? FontWeight.Semibold : FontWeight.Regular); }
+                  if (!piece.This && piece.Href != "") { TextLink(piece.Name + (piece.Skill == "" ? "" : ", " + piece.Skill), to: piece.Href); }
+                  Badge(piece.Status.Label, tone: ToneOfWork(piece.Status));
+                  Text(piece.Cost, fontSize: FontSize.Caption, fontFamily: Font.Mono, color: Colors.TextMuted);
+                  if (piece.This) { Badge("This one", tone: Tone.Primary); }
+                }
+              }
+            }
+          }
+        }
+
+        Stack(gap: 2, label: "Steps") {
+          Row(gap: 3, align: Align.Center, wrap: Wrapping.Wrap) {
+            Text(view.Steps.Count == 1 ? "One step" : view.Steps.Count.ToString() + " steps, in order", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+            Spacer();
+            Tabs {
+              Tab("All", selected: only == "", onPress: All);
+              Tab("Model", selected: only == "model", onPress: Models);
+              Tab("Tools", selected: only == "tool", onPress: ToolsOnly);
+              Tab("People", selected: only == "person", onPress: People);
+              Tab("Problems", selected: only == "problem", onPress: Problems);
+            }
+          }
+          if (view.Tree.Count > 1) {
+            Row { Checkbox("Every piece of the work, not only this one", value: whole); }
+          }
+          Stack(gap: 0) {
+            foreach (var s in view.Steps) {
+              if (StepShown(s, only, whole, view.Task)) { InspectedStepLine(s, marked: step > 0 && s.Seq == step, showWho: view.Tree.Count > 1); }
+            }
+            if (view.Steps.Count(s => StepShown(s, only, whole, view.Task)) == 0) {
+              Text(only == "problem" ? "Nothing went wrong in it." : "No step of that kind.", fontSize: FontSize.Body, color: Colors.TextMuted, py: 2);
+            }
+          }
+        }
+
+        Stack(gap: 3, label: "What it may do") {
+          Text("What it had been told, and what it may do", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          Stack(gap: 2, label: "What it was told") {
+            Text(view.RanWith, fontSize: FontSize.Body, color: Colors.TextSecondary, lineHeight: "1.5", maxW: "68ch");
+            if (view.Sent.Count > 0) {
+              Stack(gap: 1, pl: 4, borderLW: 2, border: Colors.Border) {
+                foreach (var said in view.Sent) { Text(said, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch"); }
+              }
+            }
+            if (view.Since.Count > 0) {
+              Stack(gap: 1, pl: 4, borderLW: 2, border: Colors.Primary.Muted, label: "Told since") {
+                Text("Told since, and not part of this work:", fontSize: FontSize.Label, color: Colors.TextMuted);
+                foreach (var said in view.Since) { Text(said, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch"); }
+              }
+            }
+          }
+          if (view.Tools.Count > 0) {
+            Stack(gap: 1, label: "Its tools") {
+              foreach (var tool in view.Tools) {
+                Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+                  Text(tool.Label, fontSize: FontSize.Body, minW: "min(100%, 16rem)");
+                  Badge(tool.Leave.Label, tone: ToneOfLeave(tool.Leave));
+                  Text(tool.Does, fontSize: FontSize.Caption, color: Colors.TextMuted);
+                }
+              }
+            }
+          }
+        }
+
+        Stack(gap: 1, label: "The record") {
+          Text("The record", fontSize: FontSize.Subhead, fontWeight: FontWeight.Semibold);
+          Row(gap: 2, align: Align.Center, wrap: Wrapping.Wrap) {
+            Badge(view.Intact ? "Checks" : "Does not check", tone: view.Intact ? Tone.Success : Tone.Danger);
+            Text(view.Record, fontSize: FontSize.Body, lineHeight: "1.5", maxW: "66ch");
+          }
+          Text("Each line carries the hash of the one before it, so a line changed, removed or slipped in afterwards is found.", fontSize: FontSize.Caption, color: Colors.TextMuted, lineHeight: "1.5", maxW: "66ch");
+        }
+
+        AgentWorkPanel(view.Task);
+      }
+    }
+  }
+}
+
+/// Whether a step is among those the reader asked for.
+bool StepShown(InspectedStep step, string only, bool whole, Guid task) {
+  if (!whole && step.Task != task) { return false; }
+  if (only == "problem") { return step.Problem; }
+  return only == "" || step.Group == only;
+}

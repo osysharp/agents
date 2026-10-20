@@ -1,0 +1,34 @@
+// Osysharp.Agents.Inspector — one piece of an agent's work, readable by a person who was not there.
+//
+//     /// On the page that shows a piece of an agent's work:
+//     WorkInspector(task);
+//
+// What was asked, by whom and for whom, and as which account it ran; what it was given and what it handed back; what
+// it may do alone and what it proposes; what people had told it when it ran, and what they have told it since; every
+// step in order — each model call with the model, why that one and what it cost, each tool with its arguments as a
+// person reads them and what it answered, each proposal and who decided, each question and its answer, each wait and
+// how long it lasted; the work it handed on, as a tree; what it spent against what it may; whether its record still
+// checks; and what has been erased, shown as erased.
+//
+// ⚑ IT CHANGES NOTHING, AND IT WIDENS NOTHING. Everything is read as whoever is looking, under the rules
+//   `Osysharp.Agents` declares: whoever the work was for and whoever gave it read it with what it said; whoever
+//   supervises reads that each step happened, and not what it said; whoever audits reads all of it. A piece of work
+//   that is not the reader's says so, and shows nothing.
+//
+// ⚑ OTHER KITS ADD TO IT. `AgentWorkPanel` is a slot under the record — "Correct this" from
+//   `Osysharp.Agents.Teaching` goes there in three lines — and `AgentWorkOrigin` one beside where the work came from,
+//   which `Osysharp.Agents.Processes` fills with the process run the work is a step of.
+package Osysharp.Agents.Inspector {
+  version     "1.2.0";
+  minPlatform "0.14.0";
+  summary     "one page for a piece of an AI agent's work, for a person who was not there: what was asked, by whom, for whom and as which account; the brief and the result; what the agent may do alone and what it proposes; the instruction set it ran with and what has changed since; every step in order with models, reasons, arguments as a person reads them, answers, proposals and who decided, questions and answers, waits and how long; delegated work as a tree; cost per step and in all against its limit; whether the record's chain still checks; and what was erased, shown as erased. Read-only, filterable, and each step has a link.";
+
+  model "model/**/*.osy";
+  tests "tests";
+  use Osysharp.Agents@1;
+  use Osysharp.Llm@2;
+  use Osysharp.Identity@0;
+  use Osysharp.Workflow;
+  use Osysharp.Observability;
+  use Osysharp.Ui;
+}
