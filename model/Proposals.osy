@@ -83,6 +83,8 @@ public entity AgentProposal {
     // Whoever it is put to, whoever the work is for and whoever gave it; whoever supervises or audits reads all.
     allow read when IsAuthenticated where DecideBy == user || Task.Requester == user || Task.StartedBy == user;
     allow read when SupervisesAgents || AuditsAgents || DecidesAgentProposals || TeachesAgents;
+    // Whoever erases what a piece of work said, or takes a person off the proposals put to them, reads them.
+    allow read when ErasesAgentRecords;
     allow create when UsesAgents;
     deny create except via ProposeAgentAction;
     allow update when IsAuthenticated where DecideBy == user || Task.Requester == user;
@@ -319,7 +321,8 @@ ProposalDecision DecideAgentProposal(Guid id, bool approved, string reason, Guid
   // SECURITY-INVARIANT(agents-an-approved-proposal-runs-as-the-approver): the tool runs as the agent ON BEHALF OF
   // whoever approved — both must be allowed, by the app's own rules — and never as the app or as the person who first
   // asked. Guarded by tests/autonomy.test.osy `an_approved_proposal_runs_as_the_approver`.
-  var actor = Principal.Single(p => p.Id == proposal.Task.Actor.Id);
+  // The agent's account by its key off the receipt — the approver need not be able to read it.
+  var actor = proposal.Task.Actor;
   var approver = Principal.Single(p => p.Id == by!.Value);
   var task = AgentTask.Single(t => t.Id == proposal.Task.Id);
   // Read before the switch of who is acting: inside it, the proposal is read as the agent and the approver may.

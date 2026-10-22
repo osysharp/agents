@@ -17,7 +17,7 @@ app.Llm = new LlmSetup {
 
 app.Agents = new AgentsSetup {
   Agents = [new Inspector(), new Sorter(), new Trainee(), new Clerk(), new Porter(), new Understudy(),
-            new Foreman(), new Usher(), new Director(), new Yardmaster(), new Steward(), new Warden()],
+            new Foreman(), new Usher(), new Director(), new Yardmaster(), new Steward(), new Warden(), new Gatekeeper()],
   TaskBudget = 0.05m,
   Guards = [new Embargo()],
 };

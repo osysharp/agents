@@ -111,6 +111,10 @@ public entity AgentStandingRule {
     // A rule is read by whoever it covers — a rule for anybody's work, by anybody who gives agents work.
     allow read when UsesAgents where For == null || For == user || GrantedBy == user;
     allow read when SupervisesAgents || AuditsAgents;
+    // Whoever takes a person off the rules they gave, or erases the rules for a person's work, reads them.
+    allow read when ErasesAgentRecords;
+    // …and changes them only through the two functions the denies below name: whose rule it was, and that it was erased.
+    allow update when ErasesAgentRecords;
     allow create when WidensAgentAutonomy;
     allow update when WidensAgentAutonomy where GrantedBy == user;
     allow update when SupervisesAgents;

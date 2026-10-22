@@ -1,0 +1,73 @@
+// Osysharp.Agents in an app of many tenants: a person gives an agent work though they may read neither the agent's own
+// account nor the person who answers for it (model/tenancy.osy).
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Packhouse;
+
+/// The yard, and Vera — kept from the growers — answering for the gatekeeper.
+[TestFixture]
+void Gate() {
+  Yard();
+  var vera = new Person { Email = "vera@packhouse.example", DisplayName = "Vera", Unlisted = true };
+  new AgentSeat { Agent = "Packhouse.Gatekeeper", Sponsor = vera };
+}
+
+[Test(Gate)]
+[runas(Ada)]
+void work_is_done_for_somebody_who_may_read_neither_the_agents_account_nor_its_sponsor() {
+  // What the grower may read: neither the agent's account nor Vera.
+  Assert.Equal(0, Person.Count(p => p.Email == "gatekeeper@packhouse.example" || p.Email == "vera@packhouse.example"));
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(Weigh), "{\"crate\":\"" + crate.Id.ToString() + "\"}"),
+    Says.HandBack(new Grade { Score = 8, Finding = "Twelve and a half kilos: sound." }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = GradeAtTheGate(crate);
+
+  // It is sponsored, so it runs; its tool runs as its own account; and the receipt names that account and her.
+  Assert.True(outcome.Done);
+  Assert.Equal(8, outcome.Result.Score);
+  Assert.Equal(["Weigh"], Trajectory.Of(outcome.Task));
+  var receipt = AgentTask.Single(t => t.Id == outcome.Task);
+  Assert.Equal(Actor.Of<Gatekeeper>().Id, receipt.Actor.Id);
+  Assert.Equal(Ada.Id, receipt.Requester!.Id);
+  // The meter says what each call was for in words a person reads.
+  var task = "task:" + outcome.Task.ToString();
+  runas (Dana) { Assert.Equal("grade crate", ModelCall.First(c => c.Scopes.Contains(task)).Purpose); }
+}
+
+/// The gate, with Mo minding crate A-1 and Lu minding A-2.
+[TestFixture]
+void Minders() {
+  Gate();
+  new Person { Email = "mo@packhouse.example", DisplayName = "Mo", Minds = "A-1" };
+  new Person { Email = "lu@packhouse.example", DisplayName = "Lu", Minds = "A-2" };
+}
+
+[Test(Minders)]
+void a_receipt_is_read_by_whoever_reads_what_it_is_charged_to_and_nobody_else() {
+  var script = AgentScript.Of(
+    Says.HandBack(new Grade { Score = 8, Finding = "Sound." }),
+    Says.HandBack(new Grade { Score = 3, Finding = "Short." }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  runas (Ada) {
+    GradeAtTheGate(Crate.Single(c => c.Code == "A-1"));
+    GradeAtTheGate(Crate.Single(c => c.Code == "A-2"));
+  }
+  // Mo reads the receipt of the work on his crate — its figures, not its words — and Lu only hers.
+  runas (Person.Single(p => p.Email == "mo@packhouse.example")) {
+    var receipt = AgentTask.Single();
+    Assert.Contains("crate:A-1", receipt.ChargedTo);
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Null(receipt.Result);
+  }
+  runas (Person.Single(p => p.Email == "lu@packhouse.example")) {
+    Assert.Equal(1, AgentTask.Count());
+    Assert.Equal(0, AgentTask.Count(t => t.ChargedTo.Contains("crate:A-1")));
+  }
+  // Ben, another grower, reads neither.
+  runas (Ben) { Assert.Equal(0, AgentTask.Count()); }
+}

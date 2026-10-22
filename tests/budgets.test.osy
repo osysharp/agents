@@ -104,7 +104,7 @@ void what_a_receipt_says_was_spent_is_what_the_meter_says() {
     Assert.Equal(0.00215m, SpentOn("task:" + task.ToString()));
     Assert.Equal(0.00215m, SpentOn("agent:Packhouse.Inspector"));
     Assert.Equal(0.00215m, SpentOn("skill:Packhouse.GradeCrate"));
-    Assert.Equal(2, ModelCall.Count(c => c.Purpose == "GradeCrate" && c.Requester == Ada.Id));
+    Assert.Equal(2, ModelCall.Count(c => c.Purpose == "grade crate" && c.Requester == Ada.Id));
   }
 }
 
@@ -134,7 +134,7 @@ void work_charged_to_something_of_the_callers_is_counted_there_call_by_call() {
   }
   runas (Dana) {
     Assert.Equal(0.00215m, SpentOn("delivery:D-7"));
-    Assert.Contains("delivery:D-7", ModelCall.First(c => c.Purpose == "GradeCrate").Scopes);
+    Assert.Contains("delivery:D-7", ModelCall.First(c => c.Purpose == "grade crate").Scopes);
   }
 }
 

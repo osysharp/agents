@@ -33,8 +33,13 @@ policy AgentsMayConsult => !Person.Any(p => p == user && p.NoSecondOpinions);
 /// Somebody at the packhouse — and the agents' own accounts.
 entity Person : Principal {
   bool NoSecondOpinions = false;
+  /// An account kept from the growers — an agent's, or the person answering for it (tenancy.osy).
+  bool Unlisted = false;
+  /// The one crate somebody minds — whose agent work, and only that, they read the receipts of (tenancy.osy).
+  [MaxLength(20)] string Minds = "";
   security {
     allow read when IsAuthenticated || IsAuthenticator;
+    deny read when IsGrower where Unlisted && Id != user.Id;
     allow create when IsAuthenticator;
   }
 }

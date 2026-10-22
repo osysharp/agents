@@ -102,6 +102,56 @@ void pausing_and_sponsoring_are_for_who_the_app_names_and_each_is_written_down()
   }
 }
 
+/// ⭐ TAKING A PERSON OFF HOW THEY OVERSAW THE AGENTS. What still waits on them is said first — an agent they sponsor
+/// is theirs to hand on — and then the records clerk takes them off the changes they made: what was done, when and
+/// why stays, and the record no longer says who.
+[Test(YardAtNight)]
+void a_person_is_taken_off_how_they_oversaw_the_agents_and_what_they_did_stays() {
+  TestClock.Set(new DateTime(2031, 4, 7, 22, 0, 0, DateTimeKind.Utc));
+  runas (Nell) {
+    PauseAgent(NightInspector, "It graded forty crates as short in ten minutes.");
+    UnitOfWork.Commit();
+  }
+  runas (Dana) {
+    ResumeAgent(NightInspector, "The scale had been knocked. It is fixed.");
+    SponsorAgent(NightInspector, Bo);
+    UnitOfWork.Commit();
+    // The new sponsor answers for the agent now, so he is to be replaced before he is taken off it.
+    Assert.Equal("they sponsor Inspector: name another sponsor first", WhatWaitsOnThem(Bo));
+    // Whoever paused it is owed nothing.
+    Assert.Equal("", WhatWaitsOnThem(Nell));
+  }
+  // Only whoever erases the agents' records takes a person off them.
+  runas (Dana) { Assert.Denied(() => ForgetWhoOversawAgents(Nell)); }
+  runas (Rita) {
+    Assert.Equal(1, ForgetWhoOversawAgents(Nell));
+    UnitOfWork.Commit();
+  }
+  runas (Dana) {
+    var paused = SeatChangesOf(NightInspector).Single(c => c.What == AgentSeatChangeKind.Paused);
+    Assert.Null(paused.By);
+    Assert.Equal("It graded forty crates as short in ten minutes.", paused.Why);
+    Assert.Equal(new DateTime(2031, 4, 7, 22, 0, 0, DateTimeKind.Utc), paused.At);
+    // The others' changes still say who made them.
+    Assert.Equal(Dana.Id, SeatChangesOf(NightInspector).Single(c => c.What == AgentSeatChangeKind.Resumed).By!.Id);
+    // The lead lets the clerk flag crates alone, and later leaves: she is taken off that rule and her changes too.
+    AllowAlone("Packhouse.Clerk", Actions.Of(FlagCrate));
+    UnitOfWork.Commit();
+  }
+  runas (Rita) {
+    // Two changes to the inspector's place (resumed, a sponsor named) and the rule she gave.
+    Assert.Equal(3, ForgetWhoOversawAgents(Dana));
+    UnitOfWork.Commit();
+  }
+  runas (Dana) {
+    var rule = AgentStandingRule.Single();
+    Assert.Null(rule.GrantedBy);
+    Assert.Null(rule.RevokedAt);
+    Assert.Equal(Bo.Id, SeatChangesOf(NightInspector).Single(c => c.What == AgentSeatChangeKind.Sponsored).Sponsor!.Id);
+    Assert.Null(SeatChangesOf(NightInspector).Single(c => c.What == AgentSeatChangeKind.Sponsored).By);
+  }
+}
+
 /// ⭐ EVERY RECEIPT, AND NOT ITS WORDS. The bookkeeper reads the receipt of every piece of work — which agent, for
 /// whom, where it stands, what it cost — and nothing the work said: not what it was about, not what it handed back.
 /// Another grower reads none of it. The lead and the auditor read it all, as before.

@@ -188,7 +188,7 @@ AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillN
   var task = OpenAgentTask(new AgentTaskOpening {
     Agent = agent.Name, Skill = skillName, SkillVersion = skillName == "" ? "" : skill.Version, Cause = cause,
     InstructionSet = told.Set, InstructionsSent = string.Join("\n", told.Ids), InstructionsHash = told.Hash,
-    Actor = agent.Actor.Id, Requester = person, About = about, Given = given, LimitMicros = limit,
+    Actor = agent.Actor, Requester = person, About = about, Given = given, LimitMicros = limit,
     ChargedTo = charged, RetryOf = retryOf, Attempt = attempt, Parent = above == null ? null : above!.Task,
     // Given in a workflow's run, it is a step of that process: the receipt says which. (Work handed on by other work
     // takes the run of the work above it, where the receipt is opened.)
@@ -371,7 +371,8 @@ LlmRequest RequestOf(AgentRun run, ModelNeeds needs) {
 LlmCall CallOf(AgentRun run, ModelNeeds needs) {
   return new LlmCall {
     Model = needs.Model, Kind = needs.Kind, Step = LlmStep.Act, Latency = needs.Latency, MinQuality = needs.MinQuality,
-    Scopes = run.Scopes, Limits = run.Limits, Purpose = run.Skill == "" ? "ask" : BareName(run.Skill),
+    Scopes = run.Scopes, Limits = run.Limits, // What the call was for, in words a person reads on the meter: "grade crate", not `GradeCrate`.
+    Purpose = run.Skill == "" ? "ask" : Words(BareName(run.Skill)).ToLower(),
     // The run the work belongs to is among its scopes already (`Opened`); the run this call happens to be made in is
     // not what it is charged to.
     ChargedToItsRun = false,
@@ -611,7 +612,8 @@ ActionResult RunAsAgent(AgentRun run, string action, string argumentsJson) {
   var values = Actions.ValuesFromJson(action, argumentsJson);
   var cause = "agent-task:" + run.Task.ToString();
   var task = AgentTask.Single(t => t.Id == run.Task);
-  var actor = Principal.Single(p => p.Id == run.Actor);
+  // The account it runs as, by its key off the receipt — never read again as the caller, who need not see it.
+  var actor = task.Actor;
   if (run.Person == null) {
     runas (Actor.From(actor), scope: task) { return Actions.Run(action, values, cause: cause); }
   }

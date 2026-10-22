@@ -19,9 +19,11 @@ void the_catalogue_lists_every_skill_of_every_agent_the_app_lists() {
     "Packhouse.Foreman/Packhouse.TakeInDelivery", "Packhouse.Foreman/Packhouse.DescribeDelivery", "Packhouse.Foreman/Packhouse.CountDelivery",
     "Packhouse.Usher/Packhouse.TakeInDelivery", "Packhouse.Director/Packhouse.RunTheYard", "Packhouse.Yardmaster/Packhouse.RunTheYard",
     "Packhouse.Steward/Packhouse.WalkDelivery", "Packhouse.Warden/Packhouse.SettleForQuality",
+    "Packhouse.Gatekeeper/Packhouse.GradeCrate",
   ], all.Select(s => s.Agent + "/" + s.Skill).ToList());
   Assert.Equal(["Packhouse.Inspector", "Packhouse.Sorter", "Packhouse.Trainee", "Packhouse.Clerk", "Packhouse.Porter", "Packhouse.Understudy",
-                "Packhouse.Foreman", "Packhouse.Usher", "Packhouse.Director", "Packhouse.Yardmaster", "Packhouse.Steward", "Packhouse.Warden"], Agents.Names());
+                "Packhouse.Foreman", "Packhouse.Usher", "Packhouse.Director", "Packhouse.Yardmaster", "Packhouse.Steward", "Packhouse.Warden",
+                "Packhouse.Gatekeeper"], Agents.Names());
   // What each agent may hand on, and to whom — nothing, unless its class says.
   Assert.Equal(0, Delegations.Of("Packhouse.Inspector").Count);
   Assert.Equal(["Inspector: Grade crate", "Clerk: Settle crate", "Inspector: Quick look", "Porter: Count crates", "Foreman: Describe delivery"],

@@ -1,0 +1,26 @@
+// An app of many tenants — organisations, shops, teams — keeps each one's people from the others, and an agent's own
+// account belongs to none of them; neither, often, does whoever answers for it. So a person may give an agent work
+// while able to read neither its account nor its sponsor. The packhouse's `Person.Unlisted` is that shape: an
+// unlisted account is readable by itself and the lead, and by no grower.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+
+/// Grades a crate at the gate — an agent whose own account a grower may not read, sponsored by somebody a grower may
+/// not read either.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Gatekeeper : Agent {
+  public static Person Principal => new Person { Email = "gatekeeper@packhouse.example", DisplayName = "Gatekeeper", Unlisted = true };
+  public override string Purpose => "You grade each crate at the gate.";
+  public override List<SkillBase> Skills => [new GradeCrate()];
+  public override Permits May => Permits.ChangesAlone();
+}
+
+/// Have the gatekeeper grade a crate, for whoever asks — charged to the crate.
+public AgentOutcome<Grade> GradeAtTheGate(Crate crate) {
+  return await Agents.Of<Gatekeeper>().On("crate:" + crate.Code).Do(new GradeCrate(), crate, about: "Crate " + crate.Code);
+}
+
+/// Whoever minds a crate reads the receipts of the work charged to it — and of no other.
+policy ReadsAgentWorkOf(string chargedTo) => Person.Any(p => p == user && p.Minds != "" && chargedTo.Contains("crate:" + p.Minds));

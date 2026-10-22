@@ -44,12 +44,17 @@ public workflow AgentWaitFlow {
   event Wake();
 
   state Waiting {
-    // Decided before the wait was there to hear of it: it looks once as it starts.
-    enter {
-      if (WaitIsOver(this.Item)) {
+    // Decided before the wait was there to hear of it: it looks once, on a clock due at once, so going on with the
+    // work (a model call) happens after the commit that made the wait — never inside it. An `enter` would run in
+    // that commit, and whoever parked the work would wait on the model. The clock is spent once it has fired, so a
+    // wait that is not over yet just stays, until `Wake`.
+    Expire { Within = TimeSpan.Zero; Accrues = false; }
+    on Expire {
+      when (WaitIsOver(this.Item)) {
         ContinueAgentWork(this.Item);
         goto Over;
       }
+      default { }
     }
     on Wake {
       when (WaitIsOver(this.Item)) {

@@ -60,6 +60,9 @@ public entity AgentTask {
   [Immutable] AgentTask? Parent;
   [Immutable, Index] AgentTask? Root;
   [Immutable] int Depth = 0;
+  /// Its place among the pieces of work the work above it handed on, from 1, in the order they were handed on — what
+  /// tells two pieces handed on in the same instant apart, so a tree reads the same way every time. 0: it is the top.
+  [Immutable] int Sequence = 0;
   /// Every piece of work above it, from the nearest up — the agent and the skill of each, by their full names, as
   /// `Agent|Skill` on a line of its own. Written as the work is opened, from the receipt above it. "": it is the top.
   [Immutable, MaxLength(4000)] string Lineage = "";
@@ -128,6 +131,11 @@ public entity AgentTask {
     // colleague, or finance reads the words with the cost. Guarded by tests/roles.test.osy
     // `every_receipt_is_read_by_who_the_app_names_and_its_words_are_not`.
     allow read when ReadsAllAgentWork || DecidesAgentProposals || ErasesAgentRecords;
+    // SECURITY-INVARIANT(agents-a-receipt-is-read-by-what-it-is-charged-to): a reader the app admits by
+    // `ReadsAgentWorkOf` reads a receipt only when the app's answer for THAT work's own `ChargedTo` says so, and its
+    // figures only (the deny below). Failure mode: one tenant reads another's agent work. Guarded by
+    // tests/tenancy.test.osy `a_receipt_is_read_by_whoever_reads_what_it_is_charged_to_and_nobody_else`.
+    allow read when IsAuthenticated where ReadsAgentWorkOf(ChargedTo);
     // SECURITY-INVARIANT(agents-whoever-teaches-reads-the-work-with-what-it-said): whoever the app's `TeachesAgents`
     // admits reads every piece of work WITH its words — its receipt here, its record, its proposals and its questions
     // by the same policy on each — because judging whether an agent did the right thing, and correcting it, needs
@@ -268,7 +276,8 @@ public class AgentTaskOpening {
   public string InstructionsSent = "";
   public string InstructionsHash = "";
   public AgentTaskCause Cause = AgentTaskCause.Call;
-  public Guid Actor;
+  /// The agent's own account, as `Actor.Of` hands it: held by its key, so the caller needs no right to read it.
+  public Principal Actor;
   public Guid? Requester;
   public Guid? Parent;
   public string About = "";
@@ -297,7 +306,9 @@ internal Guid OpenAgentTask(AgentTaskOpening opening) {
   if (seat.Paused) {
     throw new AgentPaused(seat.PausedWhy == "" ? $"{bare} is paused." : $"{bare} is paused: {seat.PausedWhy}");
   }
-  var actor = Principal.Single(p => p.Id == opening.Actor);
+  // The agent's account belongs to no part of the app a caller is in — no organisation, no team — so it is never
+  // read again here, as the caller: the opening holds it, as `Actor.Of` gave it.
+  var actor = opening.Actor;
   var requester = opening.Requester == null ? null : Principal.FirstOrDefault(p => p.Id == opening.Requester);
   // Read here, from the session, and never taken from the caller: who gave the work is not something to be told.
   var me = Security.CurrentUserId;
@@ -308,6 +319,7 @@ internal Guid OpenAgentTask(AgentTaskOpening opening) {
   // `nobody_borrows_a_colleagues_rights_through_an_agent`.
   var parent = opening.Parent == null ? null : AgentTask.FirstOrDefault(t => t.Id == opening.Parent);
   var runStep = 0;
+  var sequence = parent == null ? 0 : AgentTask.Count(t => t.Parent == parent) + 1;
   if (parent != null) { runStep = parent!.RunStep; }
   else if (opening.Run != null) { runStep = AgentTask.Count(t => t.Run == opening.Run && t.Parent == null) + 1; }
   if (opening.Parent != null) {
@@ -332,7 +344,7 @@ internal Guid OpenAgentTask(AgentTaskOpening opening) {
     Agent = opening.Agent, Skill = opening.Skill, SkillVersion = opening.SkillVersion, Cause = opening.Cause,
     InstructionSet = opening.InstructionSet, InstructionsSent = opening.InstructionsSent, InstructionsHash = opening.InstructionsHash,
     Actor = actor, Requester = requester, StartedBy = startedBy, Parent = parent, Root = parent == null ? null : (parent.Root ?? parent),
-    Depth = parent == null ? 0 : parent.Depth + 1, About = Clipped(opening.About, 300), Given = opening.Given,
+    Depth = parent == null ? 0 : parent.Depth + 1, Sequence = sequence, About = Clipped(opening.About, 300), Given = opening.Given,
     Lineage = parent == null ? "" : Clipped(parent.Agent + "|" + parent.Skill + (parent.Lineage == "" ? "" : "\n" + parent.Lineage), 4000),
     LimitMicros = opening.LimitMicros, ChargedTo = Clipped(opening.ChargedTo, 1000), Attempt = opening.Attempt,
     // Work handed on belongs to the step that handed it on, wherever it is opened.

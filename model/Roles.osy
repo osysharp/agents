@@ -8,6 +8,8 @@
 //   SponsorsAgents              name the person accountable for an agent                       whoever supervises
 //   PausesAgents                pause an agent, and let it work again                          whoever supervises
 //   ReadsAllAgentWork           read the receipt of every piece of work — not what it said     whoever supervises or audits
+//   ReadsAgentWorkOf(chargedTo) read the receipt of work charged to these scopes — not what    nobody
+//                               it said; the per-tenant answer (an organisation's own auditor)
 //   DecidesAgentProposals       decide a proposal that was not put to them                     whoever supervises
 //   WidensAgentAutonomy         "from now on, alone" for their own work (Gate.osy)             nobody
 //   TeachesAgents               make an instruction active, retire one, roll back; read        nobody
@@ -46,6 +48,13 @@ virtual policy PausesAgents => SupervisesAgents;
 ///   reading a word of the work. (Whoever teaches reads the work with its words, by `TeachesAgents` itself.)
 virtual policy ReadsAllAgentWork => SupervisesAgents || AuditsAgents;
 
+/// ⭐ WHO READS THE RECEIPTS OF WORK CHARGED TO PARTICULAR SCOPES — a piece of work at a time, by what its caller
+/// charged it to (`AgentTask.ChargedTo`, one scope a line: `Agents.Of<T>().On("report:" + report.Id)`). It is the
+/// answer for an app of many tenants, where `ReadsAllAgentWork` — one answer for the whole app — would show one
+/// organisation another's work: `policy ReadsAgentWorkOf(string chargedTo) => Report.Any(r => chargedTo.Contains("report:"
+/// + r.Id.ToString()) && …);`. Figures, not words, exactly as `ReadsAllAgentWork`. Nobody, until the app says.
+virtual policy ReadsAgentWorkOf(string chargedTo) => false;
+
 /// ⭐ WHO DECIDES A PROPOSAL THAT WAS NOT PUT TO THEM. A proposal is put to the person the work is for — to the
 /// agent's sponsor when it is for nobody — and that person decides it. This says who else may: whoever supervises
 /// the agents, until the app says otherwise (`policy DecidesAgentProposals => SupervisesAgents || IsFinance;`).
@@ -77,6 +86,8 @@ public entity AgentSeatChange {
 
   security {
     allow read when UsesAgents || SupervisesAgents || AuditsAgents || SponsorsAgents || PausesAgents || TeachesAgents || ReadsAllAgentWork;
+    // Whoever takes a person off these reads them: what they may change they must be able to find.
+    allow read when ErasesAgentRecords;
     allow create when SupervisesAgents || SponsorsAgents || PausesAgents;
     deny create except via NoteSeatChange;
     // Never changed — except that a person is taken off it, when they ask to be.

@@ -457,7 +457,7 @@ ChildWork? StartChild(AgentRun run, Agent definition, LlmContentBlock asked) {
   var room = RoomOf(run);
   if (room <= 0) { NotHandedOn(run, asked, $"{bare} has nothing left to hand work on with: its own limit is spent."); return null; }
 
-  var account = to!.Agent == "" ? Principal.Single(p => p.Id == run.Actor) : to!.Account;
+  var account = to!.Agent == "" ? AgentTask.Single(t => t.Id == run.Task).Actor : to!.Account;
   if (account == null) { NotHandedOn(run, asked, $"{BareName(agent)} has no account to do it as."); return null; }
   var given = input;
   if (!TakesAnObject(to!.Skill)) {
@@ -765,11 +765,11 @@ public class WorkNode {
 /// Read as whoever asks: a person sees the tree of the work they asked for, whoever supervises or audits sees any.
 public class WorkTree {
   /// Every piece of the work `task` is part of, the top first and each piece followed by what it handed on, in the
-  /// order it was handed on.
+  /// order it was handed on — by `Sequence`, never by the clock, which reads the same for two pieces of one instant.
   public static List<WorkNode> Of(AgentTask task) {
     var root = task.Root ?? task;
     List<AgentTask> all = [root];
-    foreach (var under in AgentTask.Where(t => t.Root == root).OrderBy(t => t.StartedAt).ToList()) { all.Add(under); }
+    foreach (var under in AgentTask.Where(t => t.Root == root).OrderBy(t => t.Sequence).ThenBy(t => t.StartedAt).ToList()) { all.Add(under); }
     List<WorkNode> nodes = [];
     Place(root, all, nodes);
     return nodes;
@@ -784,7 +784,7 @@ public class WorkTree {
 
   /// The pieces `task` handed on itself, in the order it handed them on.
   public static List<AgentTask> HandedOnBy(AgentTask task) {
-    return AgentTask.Where(t => t.Parent == task).OrderBy(t => t.StartedAt).ToList();
+    return AgentTask.Where(t => t.Parent == task).OrderBy(t => t.Sequence).ThenBy(t => t.StartedAt).ToList();
   }
 
   static long Place(AgentTask piece, List<AgentTask> all, List<WorkNode> nodes) {

@@ -945,6 +945,50 @@ void calling_off_work_that_was_abandoned_closes_it_and_everything_under_it() {
   }
 }
 
+/// Two pieces handed on side by side, in one instant of the clock, keep the order they were handed on: each records
+/// its place (`Sequence`), and the tree and `HandedOnBy` read it — not the clock, which says the same for both.
+[Test(Yard)]
+void pieces_handed_on_in_one_instant_keep_the_order_they_were_handed_on() {
+  TestClock.Set(new DateTime(2031, 5, 5, 9, 0, 0, DateTimeKind.Utc));
+  var top = AYardWhoseProcessDied();
+  runas (Ada) {
+    var foreman = AgentTask.Single(t => t.Parent != null && t.Parent!.Id == top);
+    var pieces = WorkTree.HandedOnBy(foreman);
+    Assert.Equal(pieces[0].StartedAt, pieces[1].StartedAt);
+    Assert.True(pieces[0].Agent.EndsWith("Inspector"));
+    Assert.True(pieces[1].Agent.EndsWith("Clerk"));
+    Assert.Equal([1, 2], pieces.Select(p => p.Sequence).ToList());
+    Assert.Equal(1, foreman.Sequence);
+    Assert.Equal(0, AgentTask.Single(t => t.Id == top).Sequence);
+  }
+}
+
+/// …and that order is the work's own, not the database's. The inspector's row is written again after the clerk's, so
+/// the database now hands the rows back clerk first; `HandedOnBy`, the trajectory and the tree still read the
+/// inspector first, because it was handed on first. (By the clock alone both pieces say 09:00 and the database
+/// picks — which is how the release kit stage read HumanRequests' qualifying tree as Finance, Terms, Safety.)
+/// The first assertion is the one that makes the rest mean something: rows that come back in the order they were
+/// written would pass a reader that never ordered them at all.
+[Test(Yard)]
+void the_tree_keeps_the_order_work_was_handed_on_whatever_order_the_rows_come_back_in() {
+  TestClock.Set(new DateTime(2031, 5, 5, 9, 0, 0, DateTimeKind.Utc));
+  var top = AYardWhoseProcessDied();
+  runas (Ada) {
+    // Ada asks the inspector to stop at its next step: its receipt is written on, after the clerk's, and it is still
+    // under way until it takes that step.
+    StopAgentTask(AgentTask.Single(t => t.Agent == "Packhouse.Inspector"), "Not this crate.");
+    UnitOfWork.Commit();
+  }
+  runas (Ada) {
+    var foreman = AgentTask.Single(t => t.Parent != null && t.Parent!.Id == top);
+    // What makes this test mean anything: asked in no order, the database now hands the clerk back first.
+    Assert.Equal(["Packhouse.Clerk", "Packhouse.Inspector"], AgentTask.Where(t => t.Parent == foreman).ToList().Select(t => t.Agent).ToList());
+    Assert.Equal(["Inspector", "Clerk"], Trajectory.HandedOn(foreman.Id));
+    Assert.Equal(["Director · Run the yard: Working", "  Foreman · Take in delivery: Working", "    Inspector · Grade crate: Working", "    Clerk · Settle crate: Waiting"],
+      Trajectory.Tree(top));
+  }
+}
+
 /// What stands for a process that stalls: three quarters of an hour pass with nothing written, and whoever
 /// supervises the agents closes what was abandoned. Once.
 void StallUntilTheWorkIsClosed() {
