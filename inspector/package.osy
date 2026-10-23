@@ -19,8 +19,8 @@
 //   `Osysharp.Agents.Teaching` goes there in three lines — and `AgentWorkOrigin` one beside where the work came from,
 //   which `Osysharp.Agents.Processes` fills with the process run the work is a step of.
 package Osysharp.Agents.Inspector {
-  version     "1.2.0";
-  minPlatform "0.14.0";
+  version     "1.3.0";
+  minPlatform "0.15.0";
   summary     "one page for a piece of an AI agent's work, for a person who was not there: what was asked, by whom, for whom and as which account; the brief and the result; what the agent may do alone and what it proposes; the instruction set it ran with and what has changed since; every step in order with models, reasons, arguments as a person reads them, answers, proposals and who decided, questions and answers, waits and how long; delegated work as a tree; cost per step and in all against its limit; whether the record's chain still checks; and what was erased, shown as erased. Read-only, filterable, and each step has a link.";
 
   model "model/**/*.osy";

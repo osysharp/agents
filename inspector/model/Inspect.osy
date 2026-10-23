@@ -354,7 +354,7 @@ public WorkInspection? InspectAgentWork(Guid task) {
   // The tree it belongs to.
   var root = t!.Root ?? t!;
   List<AgentTask> pieces = [root];
-  foreach (var piece in AgentTask.Where(x => x.Root == root).OrderBy(x => x.StartedAt).Take(500).ToList()) { pieces.Add(piece); }
+  foreach (var piece in AgentTask.Where(x => x.Root == root).OrderBy(x => x.StartedAt).ThenBy(x => x.Sequence).Take(500).ToList()) { pieces.Add(piece); }
   Dictionary<Guid, AgentTask> byId = new Dictionary<Guid, AgentTask>();
   foreach (var piece in pieces) { byId[piece.Id] = piece; }
   foreach (var piece in InTreeOrder(pieces)) {

@@ -9,7 +9,7 @@ using Osysharp.Agents.Testing;
 using Osysharp.Agents.Inspector;
 using Station;
 
-[TestFixture]
+[TestFixture, DevSeed("A weather station whose bulletin an agent drafts")]
 void Skerry() {
   var ilse = new Person { Email = "ilse@skerrypoint.example", DisplayName = "Ilse Varga" };
   var bram = new Person { Email = "bram@skerrypoint.example", DisplayName = "Bram Okoro" };
