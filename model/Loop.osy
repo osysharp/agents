@@ -188,7 +188,7 @@ AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillN
   var task = OpenAgentTask(new AgentTaskOpening {
     Agent = agent.Name, Skill = skillName, SkillVersion = skillName == "" ? "" : skill.Version, Cause = cause,
     InstructionSet = told.Set, InstructionsSent = string.Join("\n", told.Ids), InstructionsHash = told.Hash,
-    Actor = agent.Actor, Requester = person, About = about, Given = given, LimitMicros = limit,
+    Actor = agent.Actor.Id, Account = agent.Actor, Requester = person, About = about, Given = given, LimitMicros = limit,
     ChargedTo = charged, RetryOf = retryOf, Attempt = attempt, Parent = above == null ? null : above!.Task,
     // Given in a workflow's run, it is a step of that process: the receipt says which. (Work handed on by other work
     // takes the run of the work above it, where the receipt is opened.)

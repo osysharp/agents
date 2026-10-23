@@ -276,8 +276,11 @@ public class AgentTaskOpening {
   public string InstructionsSent = "";
   public string InstructionsHash = "";
   public AgentTaskCause Cause = AgentTaskCause.Call;
+  /// The agent's account by its id. Read as the caller when `Account` is not given — so a caller who may not read the
+  /// account (an agent belongs to no organisation or team of the app) gives `Account` instead.
+  public Guid Actor;
   /// The agent's own account, as `Actor.Of` hands it: held by its key, so the caller needs no right to read it.
-  public Principal Actor;
+  public Principal? Account;
   public Guid? Requester;
   public Guid? Parent;
   public string About = "";
@@ -306,9 +309,10 @@ internal Guid OpenAgentTask(AgentTaskOpening opening) {
   if (seat.Paused) {
     throw new AgentPaused(seat.PausedWhy == "" ? $"{bare} is paused." : $"{bare} is paused: {seat.PausedWhy}");
   }
-  // The agent's account belongs to no part of the app a caller is in — no organisation, no team — so it is never
-  // read again here, as the caller: the opening holds it, as `Actor.Of` gave it.
-  var actor = opening.Actor;
+  // The agent's account belongs to no part of the app a caller is in — no organisation, no team — so when the opening
+  // holds it, as `Actor.Of` gave it, it is never read again here as the caller. Only an opening that names it by id
+  // alone is read, as before.
+  var actor = opening.Account ?? Principal.Single(p => p.Id == opening.Actor);
   var requester = opening.Requester == null ? null : Principal.FirstOrDefault(p => p.Id == opening.Requester);
   // Read here, from the session, and never taken from the caller: who gave the work is not something to be told.
   var me = Security.CurrentUserId;
