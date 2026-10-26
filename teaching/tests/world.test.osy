@@ -7,7 +7,7 @@ using Osysharp.Agents.Testing;
 using Osysharp.Agents.Teaching;
 using Museum;
 
-[TestFixture]
+[TestFixture, DevSeed("A museum whose captioner is taught by its registrar")]
 void Rooms() {
   var ines = new Person { Email = "ines@tidewater.example", DisplayName = "Ines Okafor" };
   var june = new Person { Email = "june@tidewater.example", DisplayName = "June Park" };

@@ -87,3 +87,81 @@ osy test kits/agents-teaching/tests --pixels   # the same in a real browser, pho
 - Source: [`kits/agents-teaching`](.) — `model/Views.osy` (what the screens read and send), `model/ui/Correct.osy`
   (`CorrectThis`, `WorkTeaching`), `model/ui/Instructions.osy` (`AgentInstructions`)
 - Uses [`Osysharp.Agents`](../agents) (corrections, instructions, instruction sets) and `Osysharp.Ui`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Teaching;
+using Museum;
+
+[Test(Rooms)]
+void a_piece_of_work_is_shown_to_those_it_is_for_and_corrected_by_them() {
+  Guid task = Guid.Empty;
+  runas (Ines) {
+    task = LabelFor("1887.4", "first");
+    var view = WorkTeachingOf(task)!;
+    Assert.True(view.MayCorrect);
+    Assert.True(view.Ended);
+    Assert.Equal("Captioner", view.Name);
+    Assert.Equal("write label", view.Skill);
+    Assert.Equal("Label for 1887.4, Brass sextant", view.About);
+    Assert.Equal("A brass sextant with a silvered scale, made by Thomas Reid of Leith circa 1850.", view.Result);
+    Assert.Equal(9, view.Steps.Count);
+    Assert.Equal("Captioner was given write label: Label for 1887.4, Brass sextant.", view.Steps[0].Said);
+    // A step is corrected by its place in the record.
+    SendCorrection(task, new CorrectionForm { Wrong = "It copied the entry.", Right = "Say it for a visitor.", Because = "Nobody reads a catalogue aloud.", Step = 6 });
+    UnitOfWork.Commit();
+    var corrected = WorkTeachingOf(task)!.Corrections.Single();
+    Assert.StartsWith("Step 6: ", corrected.About);
+    // Nothing was proposed: she did not ask for it.
+    Assert.Equal(0, InstructionBoardOf(TheCaptioner).Proposed.Count);
+  }
+  // Another curator's work is not June's to see, and so not hers to correct.
+  runas (June) {
+    Assert.Null(WorkTeachingOf(task));
+    Assert.Throws<AgentRefused>(() => SendCorrection(task, new CorrectionForm { Wrong = "x", Right = "y", Because = "z" }));
+  }
+}
+```
+
+From [`tests/walk.test.osy`](tests/walk.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Teaching;
+using Museum;
+
+[Test(Rooms)]
+void work_that_is_not_yours_says_so() {
+  var task = TheSextantIsLabelled();
+  Ui.Viewport(390, 844);
+  Ui.SignInAs(June);
+  Ui.Visit("/work/" + task);
+  Assert.Visible("This piece of work is not yours to see");
+  Assert.Hidden("Correct this");
+  Assert.NoOverflow();
+  Ui.Shot("work-not-yours-phone-light");
+}
+```
+
+From [`tests/ui.test.osy`](tests/ui.test.osy).
+
+## Learn more
+
+- [The Osysharp.Agents.Teaching reference](https://osysharp.com/reference/agent/kit-agents-teaching/)
+- [Osysharp.Agents.Teaching in the package catalogue](https://osysharp.com/packages/#osysharp-agents-teaching)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
