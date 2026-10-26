@@ -105,7 +105,7 @@ public entity AgentTaskParking {
 }
 
 /// Stop the work where it stands: its state is kept, the receipt says it is waiting and on what, and a wait is made.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal void ParkAgentTask(Guid task, string stateJson, string waitingOn, Guid? proposal, Guid? question, bool onWork = false) {
   var t = AgentTask.Single(x => x.Id == task);
   var parking = AgentTaskParking.FirstOrDefault(p => p.Task == t);
@@ -120,7 +120,7 @@ internal void ParkAgentTask(Guid task, string stateJson, string waitingOn, Guid?
 }
 
 /// Take the kept state of a piece of work, for going on with it.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal string UnparkAgentTask(Guid task) {
   var t = AgentTask.Single(x => x.Id == task);
   var parking = AgentTaskParking.FirstOrDefault(p => p.Task == t);
@@ -173,7 +173,7 @@ SkillBase SkillOfRun(Agent definition, AgentRun run) {
 }
 
 /// A proposal nobody decided before its work ended.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal void WithdrawProposal(Guid id) {
   SettleAgentProposal(id, ProposalStatus.Withdrawn, null, "", null, "The work it belonged to was called off.");
 }
@@ -286,7 +286,7 @@ internal void CallOffWorkNobodyAwaits(AgentTask task, string why) {
 bool StillGoing(AgentTask task) { return task.Status == AgentTaskStatus.Working || task.Status == AgentTaskStatus.Waiting; }
 
 /// The row a caller waits on for a piece of work.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal Guid WorkWaitOf(Guid task) {
   var t = AgentTask.Single(x => x.Id == task);
   var there = AgentWorkWait.FirstOrDefault(w => w.Task == t);
@@ -319,7 +319,7 @@ public async Task<AgentTaskStatus> WorkEnds(Guid task) {
 }
 
 /// A receipt's status as it is stored now.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal AgentTaskStatus ReceiptStatus(Guid task) { return AgentTask.Single(t => t.Id == task).Status; }
 
 /// What a finished receipt holds, read where it is stored.
@@ -330,7 +330,7 @@ public class ReceiptEnd {
   public long SpentMicros = 0;
 }
 
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal ReceiptEnd ReceiptEndOf(Guid task) {
   var t = AgentTask.Single(x => x.Id == task);
   return new ReceiptEnd { Status = t.Status, Outcome = t.Outcome, ResultJson = t.Result ?? "", SpentMicros = t.SpentMicros };

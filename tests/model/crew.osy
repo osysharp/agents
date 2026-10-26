@@ -151,7 +151,7 @@ public AgentOutcome<DeliveryNote> TakeInOn(string growerEmail, string delivery, 
 
 /// Note something from inside a model's answer — in a unit of work of its own, so it is there whichever piece of
 /// work, on whichever thread, the model was answering for.
-[Server, OwnUnitOfWork]
+[Server, CommitsAlone]
 public void NoteApart(string what, string about) { new Heard { What = what, About = about }; }
 
 /// A model that takes a moment to answer: it notes that it was asked, waits, and notes that it answered — so a test

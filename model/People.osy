@@ -49,7 +49,7 @@ Guid? PersonToAsk(AgentRun run) {
 }
 
 /// The agent's sponsor, read where it is stored.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal Guid? SponsorOf(string agent) {
   var seat = SeatOf(agent);
   if (seat == null || seat!.Sponsor == null) { return null; }
@@ -57,7 +57,7 @@ internal Guid? SponsorOf(string agent) {
 }
 
 /// Put a question to a person and record that it waits. Answers the row's id.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal Guid AskAgentQuestion(HelpRecord record, Guid person) {
   var me = Security.CurrentUserId;
   var help = new AgentHelp {

@@ -290,7 +290,7 @@ public class WorkInstruction {
 }
 
 /// An agent's own proposal, written by the loop when the model asks for `suggest_instruction`. Answers its id.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal Guid ProposeInstructionFromWork(WorkInstruction said) {
   var words = CheckedDraft(new InstructionDraft { Agent = said.Agent, Skill = said.Skill, Guidance = said.Guidance, Why = said.Why });
   var made = new AgentInstruction {
@@ -655,7 +655,7 @@ string ToldHeading() {
 /// everything the agent does, for this skill, for what the work is charged to, for the person it is for — said in
 /// that order, the most specific last, and within each by when it was made active. Never more than `TeachingSetup`
 /// allows: past it the least specific are left out, and the work's record says how many.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal InstructionsToWork InstructionsFor(string agent, string skill, Guid? person, List<string> scopes) {
   var told = new InstructionsToWork();
   var last = AgentInstructionSet.Where(s => s.Agent == agent).OrderByDescending(s => s.Number).FirstOrDefault();

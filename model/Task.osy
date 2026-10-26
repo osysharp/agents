@@ -298,7 +298,7 @@ public class AgentTaskOpening {
 }
 
 /// ⭐ OPEN THE RECEIPT. Refused — before anything is written — when the agent has no sponsor or is paused.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal Guid OpenAgentTask(AgentTaskOpening opening) {
   var seat = SeatOf(opening.Agent);
   var bare = BareName(opening.Agent);
@@ -374,7 +374,7 @@ public class AgentTaskUse {
 }
 
 /// Count what a step used onto its receipt.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal void SettleAgentTask(Guid id, AgentTaskUse use) {
   var task = AgentTask.Single(t => t.Id == id);
   task.SpentMicros = task.SpentMicros + use.Micros;
@@ -387,7 +387,7 @@ internal void SettleAgentTask(Guid id, AgentTaskUse use) {
 }
 
 /// Close the receipt: how it ended, and what it handed back.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal void CloseAgentTask(Guid id, AgentTaskStatus status, string outcome, string? resultJson, bool lastAttempt = true) {
   var task = AgentTask.Single(t => t.Id == id);
   if (task.Status != AgentTaskStatus.Working && task.Status != AgentTaskStatus.Waiting) { return; }
@@ -424,7 +424,7 @@ internal void MarkAgentTaskWorking(Guid id) {
 }
 
 /// Whether somebody has asked for the work to stop — read from what is stored now, not from what this run remembers.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal string? StopAskedOf(Guid id) {
   var task = AgentTask.Single(t => t.Id == id);
   if (!task.StopAsked) { return null; }
@@ -441,7 +441,7 @@ class ReceiptNow {
 
 /// How a piece of work stands where it is stored — read each turn by the process doing it, which is how that process
 /// hears what happened to the work meanwhile: that somebody called it off, or that it was closed.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal ReceiptNow ReceiptAsStored(Guid id) {
   var task = AgentTask.Single(t => t.Id == id);
   return new ReceiptNow {

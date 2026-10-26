@@ -126,7 +126,7 @@ public class TraceEntry {
 }
 
 /// ⭐ APPEND ONE LINE to the chain of `root`, for the piece of work `task`.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal void AppendAgentTrace(Guid root, Guid task, TraceEntry entry) {
   // One at a time per chain: whoever arrives second waits here for the first to be stored, then reads its hash.
   AgentTraceHead.Where(h => h.Root == root).Update(h => { h.Turn = h.Turn + 1; });

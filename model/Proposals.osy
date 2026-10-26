@@ -148,7 +148,7 @@ public string ProposalFingerprint(string agent, string skill, string skillVersio
 }
 
 /// Put a proposal to a person. Answers its id.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal Guid ProposeAgentAction(ProposalDraft draft) {
   var proposal = new AgentProposal {
     Task = AgentTask.Single(t => t.Id == draft.Task), Agent = draft.Agent, Skill = draft.Skill, SkillVersion = draft.SkillVersion,

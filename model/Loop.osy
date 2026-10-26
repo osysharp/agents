@@ -648,7 +648,7 @@ bool StuckParks(AgentRun run) {
 }
 
 /// A person's name, by their id.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal string PrincipalNameOf(Guid id) {
   var p = Principal.FirstOrDefault(x => x.Id == id);
   return p == null ? "a person" : NameOfPrincipal(p!);

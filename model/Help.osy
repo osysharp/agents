@@ -134,7 +134,7 @@ public class HelpRecord {
 }
 
 /// Record one request for help, with its answer. Answers the row's id.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal Guid RecordAgentHelp(HelpRecord record) {
   var me = Security.CurrentUserId;
   var help = new AgentHelp {

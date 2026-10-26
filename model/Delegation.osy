@@ -194,7 +194,7 @@ void PlaceUnder(AgentRun run, WorkAbove above) {
 
 /// The work above a piece of work, from the nearest up — read from its own receipt, where it was written as the
 /// work was opened and cannot be changed. A level with no agent: the receipt could not be read.
-[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+[Server, Authorize(IsAuthenticated), CommitsAlone]
 internal List<WorkLevel> LevelsAbove(Guid task) {
   List<WorkLevel> levels = [];
   var receipt = AgentTask.FirstOrDefault(t => t.Id == task);
@@ -385,7 +385,7 @@ string BriefAs(AgentRun run, Principal account, SkillBase skill, string inputJso
 }
 
 /// What a piece of work is about, as its receipt says.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal ReceiptAbove ReceiptAboveOf(Guid task) {
   var t = AgentTask.Single(x => x.Id == task);
   return new ReceiptAbove { About = t.About, ChargedTo = t.ChargedTo, WaitingOn = t.WaitingOn };
@@ -607,7 +607,7 @@ void PieceCameBack(AgentRun run, string toolUseId, Guid child, string agent, str
 
 /// What a piece of work had found: what its tools answered, the last few — for the work above it when it did not
 /// finish.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal string FoundBy(Guid task) {
   List<string> found = [];
   foreach (var line in TraceEvent.Where(e => e.Task.Id == task && e.Kind == TraceKind.ToolResult).OrderByDescending(e => e.Seq).Take(4).ToList()) {
@@ -674,7 +674,7 @@ void CallOffWorkUnder(Guid task, string why) {
 }
 
 /// Mark every piece of work under `under` that has not ended as called off. Answers the ones that are waiting.
-[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+[Server, Authorize(IsAuthenticated), CommitsAlone]
 internal List<Guid> CallOffAgentWork(Guid under, string why) {
   List<Guid> waiting = [];
   var top = AgentTask.FirstOrDefault(t => t.Id == under);
@@ -710,7 +710,7 @@ void TellWaits(Guid task) {
 // ── the tree, read back ─────────────────────────────────────────────────────────────────────────────────────────────
 
 /// What a piece of work and everything under it spent on models, in millionths of a US dollar.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal long TreeMicrosOf(Guid task) {
   var top = AgentTask.FirstOrDefault(t => t.Id == task);
   if (top == null) { return 0; }

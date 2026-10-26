@@ -176,7 +176,7 @@ public void RevokeStandingRule(AgentStandingRule rule, string why = "") {
 }
 
 /// Count one use of a standing rule: a tool ran alone because of it.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal void NoteStandingRuleUsed(Guid rule) {
   var row = AgentStandingRule.FirstOrDefault(r => r.Id == rule);
   if (row == null) { return; }
@@ -238,7 +238,7 @@ GateVerdict GateFor(AgentRun run, Agent definition, ActionInfo tool) {
 
 /// The standing rule that covers a tool for work done for `person`, if one stands. Read where it is stored, so a
 /// rule taken back a moment ago no longer counts.
-[Server, Authorize(UsesAgents), OwnUnitOfWork]
+[Server, Authorize(UsesAgents), CommitsAlone]
 internal Guid? StandingRuleFor(string agent, string skill, string action, Guid? person) {
   foreach (var rule in AgentStandingRule.Where(r => r.Agent == agent && r.Action == action && r.RevokedAt == null).Take(50).ToList()) {
     if (rule.Skill != "" && rule.Skill != skill) { continue; }
