@@ -238,7 +238,7 @@ workflow Onboarding {
 }
 
 /// Whether the supplier is cleared, as it is stored now — after whatever a person approved meanwhile.
-[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+[Server, Authorize(IsAuthenticated), CommitsAlone]
 internal bool ClearedNow(Guid id) { return Supplier.Single(s => s.Id == id).Cleared; }
 
 /// Ask the company — which has no account — for its details.

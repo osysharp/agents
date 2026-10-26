@@ -49,7 +49,7 @@ public sealed class WorkHandedToAgent { public AgentHandover Handover; }
 [Event("Item back from an agent")]
 public sealed class WorkBackFromAgent { public AgentHandover Handover; }
 
-[Server, Authorize(WorksInbox), OwnUnitOfWork]
+[Server, Authorize(WorksInbox), CommitsAlone]
 internal Guid NoteAgentHandover(Guid item, string agent, Guid task) {
   var me = Security.CurrentUserId;
   if (me == null) { throw new AgentRefused("An item is handed to an agent by a person: nobody is signed in."); }
