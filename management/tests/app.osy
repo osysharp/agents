@@ -9,9 +9,9 @@ app FilmArchive {
   use Osysharp.Agents@1;
   use Osysharp.Agents.Testing@1;
   use Osysharp.Agents.Teaching@1;
-  use Osysharp.Agents.Inspector@1;
+  use Osysharp.Agents.Inspector@2;
   use Osysharp.Agents.HumanRequests@1;
-  use Osysharp.Agents.Management@1;
+  use Osysharp.Agents.Management@2;
   use Osysharp.HumanRequests@1;
   use Osysharp.WorkQueues@1;
   use Osysharp.Llm@2;

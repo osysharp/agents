@@ -111,7 +111,7 @@ component ListSkeleton(string label) {
 /// A line of work, as every list of work shows it: what it is about, who is doing what for whom, when, what it
 /// cost, and where it stands.
 [Composable]
-public component WorkRow(WorkLine line, string at = "/agents", bool first = false, bool showAgent = true) {
+internal component WorkRow(WorkLine line, string at = "/agents", bool first = false, bool showAgent = true) {
   // A piece another piece handed on carries the same "about" as the work at the top: it is told apart by its job.
   live var what = line.Parent != null && line.Skill != "" ? line.Skill + (line.About == "" ? "" : " (" + line.About + ")")
                 : line.About != "" ? line.About : (line.Skill != "" ? line.Skill : "A question");

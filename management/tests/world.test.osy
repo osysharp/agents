@@ -14,7 +14,7 @@ using Osysharp.Agents.Management;
 using Osysharp.Workflow;
 using Archive;
 
-[TestFixture]
+[TestFixture, DevSeed("An archive whose agents answer to its head of collections")]
 void Vaults() {
   var maeve   = new Person { Email = "maeve@lanternstreet.example",   DisplayName = "Maeve Okonkwo" };
   var jonas   = new Person { Email = "jonas@lanternstreet.example",   DisplayName = "Jonas Reiter" };

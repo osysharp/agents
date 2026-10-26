@@ -20,15 +20,15 @@
 // ⚑ EVERY FIGURE IS READ FROM THE RECORDS: the receipts of the work, the meter's count against each limit, the
 //   corrections people made. Nothing on these screens asks a model anything.
 package Osysharp.Agents.Management {
-  version     "1.2.0";
-  minPlatform "0.14.0";
+  version     "2.0.0";
+  minPlatform "0.17.0";
   summary     "the screens a person runs an app's AI agents from: every agent with who answers for it, what it does alone, proposes and never does, its skills, the specialists it hands work to, what it has spent of its limits, how often people corrected it, and Pause and Resume with the reason; all the agents' work, filtered by agent, state, person, time and what it was charged to, each piece with its tree, what it waits for, its steps and Stop; everybody the agents are waiting on, for how long; every standing rule with who gave it, how often it has been used and Take back; what was spent by agent, skill, person and charge against each limit, and what a limit stopped; and who may do what.";
 
   model "model/**/*.osy";
   tests "tests";
   use Osysharp.Agents@1;
   use Osysharp.Agents.Teaching@1;
-  use Osysharp.Agents.Inspector@1;
+  use Osysharp.Agents.Inspector@2;
   use Osysharp.Agents.HumanRequests@1;
   use Osysharp.HumanRequests@1;
   use Osysharp.WorkQueues@1;

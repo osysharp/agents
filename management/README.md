@@ -5,7 +5,7 @@ standing rules that let them do more alone, what they cost, and who may do what.
 
 ```osy
 use Osysharp.Agents@1;
-use Osysharp.Agents.Management@1;
+use Osysharp.Agents.Management@2;
 
 // Three routes, and all of it is there. A request opens in the inbox.
 [Route("/agents")]                [Authorize(UsesAgents)] component Agents()                              { render { AgentsManagement(request: r => "/inbox/open/i/" + r); } }
@@ -111,7 +111,7 @@ osy test kits/agents-management/tests --pixels   # the same in a real browser, p
 
 ## Source and package
 
-- Package: `Osysharp.Agents.Management` — `use Osysharp.Agents.Management@1;`
+- Package: `Osysharp.Agents.Management` — `use Osysharp.Agents.Management@2;`
 - Source: [`kits/agents-management`](.) — `model/Agents.osy`, `Work.osy`, `Controls.osy`, `Waiting.osy`,
   `Autonomy.osy`, `Spending.osy`, `Roles.osy` (what the screens read and send), `model/ui/Shell.osy`
   (`AgentsManagement`), `ui/Agents.osy`, `ui/Work.osy`, `ui/Screens.osy`
@@ -119,3 +119,8 @@ osy test kits/agents-management/tests --pixels   # the same in a real browser, p
   [`Osysharp.Agents.Teaching`](../agents-teaching) (an agent's instructions), [`Osysharp.Agents.HumanRequests`](../agents-human-requests)
   and [`Osysharp.HumanRequests`](../human-requests) (who is waited on; handing work to a person),
   `Osysharp.WorkQueues`, `Osysharp.Llm` and `Osysharp.Ui`.
+
+## Changes
+
+- 2.0.0: `WorkRow` is internal to the kit. It was never meant as part of its surface, and `Osysharp.Assignments` has a
+  control of the same name. Pin `@2`, which uses `Osysharp.Agents.Inspector@2`.
