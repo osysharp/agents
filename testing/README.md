@@ -67,3 +67,96 @@ osy test kits/agents-testing/tests
 - Package: `Osysharp.Agents.Testing` — `tests use Osysharp.Agents.Testing@1;`
 - Source: [`kits/agents-testing`](.) — `model/Script.osy`
 - Uses [`Osysharp.Agents`](../agents) and the scripted model of [`Osysharp.Llm`](../llm).
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Lighthouse;
+
+[Test(Rock)]
+[runas(Kit)]
+void a_script_answers_turn_by_turn_and_the_trajectory_is_what_the_agent_did() {
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(CountLog), "{}"),
+    Says.Tool(Actions.Of(FileLog), "{}"),
+    Says.HandBack(new Report { Ships = 1, Weather = "Fog from noon." }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = FileToday();
+
+  Assert.True(outcome.Done);
+  Assert.Equal(1, outcome.Result.Ships);
+  Assert.Equal("Fog from noon.", outcome.Result.Weather);
+  Assert.Equal(["CountLog", "FileLog"], Trajectory.Of(outcome.Task));
+  Assert.True(Trajectory.Called(outcome.Task, Actions.Of(FileLog)));
+  Assert.False(Trajectory.Called(outcome.Task, Actions.Of(DouseLamp)));
+  // The tools really ran.
+  Assert.Equal(2, LogEntry.Count(e => e.Filed));
+}
+```
+
+From [`tests/script.test.osy`](tests/script.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Lighthouse;
+
+[Test(Rock)]
+[runas(Kit)]
+void the_tokens_a_script_says_were_used_are_what_the_work_cost() {
+  var script = AgentScript.Of(Says.Tool(Actions.Of(CountLog), "{}", 1000, 100), Says.HandBack(new Report { Ships = 1 }, 2000, 200));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = FileToday();
+
+  // 1000 + 5×100 and 2000 + 5×200 millionths of a dollar, at the lamp's price.
+  Assert.Equal(4500, Trajectory.Cost(outcome.Task));
+  Assert.Equal(4500, outcome.CostMicros);
+  Assert.Equal(["Lamp", "Lamp"], Trajectory.Models(outcome.Task));
+}
+```
+
+From [`tests/script.test.osy`](tests/script.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Lighthouse;
+
+[Test(Rock)]
+[runas(Kit)]
+void a_result_of_the_wrong_shape_and_then_a_good_one() {
+  var script = AgentScript.Of(Says.HandBackJson("{\"Ships\":\"several\"}"), Says.HandBack(new Report { Ships = 3 }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+
+  var outcome = FileToday();
+
+  Assert.True(outcome.Done);
+  Assert.Equal(3, outcome.Result.Ships);
+  Assert.Equal(["Started", "ModelCall", "SentBack", "ModelCall", "Ended"], Trajectory.Kinds(outcome.Task));
+}
+```
+
+From [`tests/script.test.osy`](tests/script.test.osy).
+
+## Learn more
+
+- [The Osysharp.Agents.Testing reference](https://osysharp.com/reference/agent/kit-agents-testing/)
+- [Osysharp.Agents.Testing in the package catalogue](https://osysharp.com/packages/#osysharp-agents-testing)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
