@@ -303,7 +303,7 @@ workflow Qualification {
 }
 
 /// Whether the supplier is approved, as it is stored now — after whatever a person decided meanwhile.
-[Server, Authorize(IsAuthenticated), OwnUnitOfWork]
+[Server, Authorize(IsAuthenticated), CommitsAlone]
 internal bool ApprovedNow(Guid id) { return Supplier.Single(s => s.Id == id).Approved; }
 
 /// The qualification of a supplier, for the people who follow it.

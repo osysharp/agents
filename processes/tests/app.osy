@@ -9,7 +9,7 @@ app Procurement {
   tests "**/*.test.osy";
   use Osysharp.Agents@1;
   use Osysharp.Agents.Testing@1;
-  use Osysharp.Agents.Inspector@1;
+  use Osysharp.Agents.Inspector@2;
   use Osysharp.Agents.Teaching@1;
   use Osysharp.Agents.Processes@1;
   use Osysharp.Processes@1;
