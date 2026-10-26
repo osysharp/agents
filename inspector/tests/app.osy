@@ -7,7 +7,7 @@ app Station {
   tests "**/*.test.osy";
   use Osysharp.Agents@1;
   use Osysharp.Agents.Testing@1;
-  use Osysharp.Agents.Inspector@1;
+  use Osysharp.Agents.Inspector@2;
   use Osysharp.Llm@2;
   use Osysharp.Identity@0;
   use Osysharp.Observability;

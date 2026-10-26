@@ -4,7 +4,7 @@ One piece of an AI agent's work, on one page, readable by a person who was not t
 
 ```osy
 use Osysharp.Agents@1;
-use Osysharp.Agents.Inspector@1;
+use Osysharp.Agents.Inspector@2;
 
 app.AgentInspector = new AgentInspectorSetup { WorkPage = "/work/{task}/{step}" };
 
@@ -81,7 +81,12 @@ osy test kits/agents-inspector/tests --pixels   # the same in a real browser, ph
 
 ## Source and package
 
-- Package: `Osysharp.Agents.Inspector` — `use Osysharp.Agents.Inspector@1;`
+- Package: `Osysharp.Agents.Inspector` — `use Osysharp.Agents.Inspector@2;`
 - Source: [`kits/agents-inspector`](.) — `model/Inspect.osy` (what the page reads), `model/ui/Work.osy` (the page)
 - Uses [`Osysharp.Agents`](../agents) (receipts, records, proposals, help, instructions), [`Osysharp.Llm`](../llm)
   and `Osysharp.Ui`.
+
+## Changes
+
+- 2.0.0: `Fact` is internal to the kit. It was never meant as part of its surface, and its name is the same as the
+  `Osysharp.Ui` control `Fact`, which an app reaches for instead. Pin `@2`.

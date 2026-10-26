@@ -42,7 +42,7 @@ Tone ToneOfProposal(ProposalStatus status) {
 
 /// A fact with its caption above it.
 [Composable]
-component Fact(string caption, string value, bool mono = false) {
+internal component Fact(string caption, string value, bool mono = false) {
   render {
     Stack(gap: 1, minW: "9rem") {
       Text(caption, fontSize: FontSize.Caption, color: Colors.TextMuted);
