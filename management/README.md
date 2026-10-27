@@ -124,3 +124,134 @@ osy test kits/agents-management/tests --pixels   # the same in a real browser, p
 
 - 2.0.0: `WorkRow` is internal to the kit. It was never meant as part of its surface, and `Osysharp.Assignments` has a
   control of the same name. Pin `@2`, which uses `Osysharp.Agents.Inspector@2`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Management;
+using Osysharp.Workflow;
+using Archive;
+
+[Test(VaultsWithConservators)]
+void a_proposal_its_skill_sends_to_a_queue_is_shown_where_it_went() {
+  Guid task = Guid.Empty;
+  runas (Jonas) {
+    var reel = Reel.Single(r => r.Number == "0412");
+    var script = AgentScript.Of(
+      Says.Tool("Nitrate that smells sharp is decomposing.", Actions.Of(QuarantineReel), ReelAnd(reel, "why", "Decomposing nitrate.")),
+      Says.HandBack(new ConditionReport()));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var outcome = Check(reel);
+    task = outcome.Task;
+    Assert.True(outcome.Waiting);
+    Background.Settle();
+    // Not in the inbox of the archivist who asked.
+    Assert.Equal(0, Requests.Mine().Count);
+  }
+  runas (Maeve) {
+    // The agent's page: the tool it proposes, and where what it proposes is put.
+    var profile = AgentProfileOf(TheChecker)!;
+    Assert.Equal(["Quarantine the reel → the Conservation queue"], profile.Proposes.Select(t => t.Label + " → " + t.PutTo).ToList());
+    // Who is waited on: the queue, by its name — as a line and as the one "person" counted.
+    var board = WaitingBoardOf();
+    Assert.Equal(["Condition checker proposes: Quarantine the reel → the Conservation queue"], board.Lines.Select(l => l.Title + " → " + l.Who).ToList());
+    Assert.Equal(["the Conservation queue: 1"], board.People.Select(p => p.Name + ": " + p.Count.ToString()).ToList());
+    // The piece of work's own page.
+    var work = InspectAgentWork(task)!;
+    Assert.StartsWith("Waiting for the Conservation queue since ", work.Proposals[0].Decided);
+    Assert.StartsWith("Waiting on a decision from the Conservation queue", work.Waiting);
+  }
+}
+```
+
+From [`tests/boards.test.osy`](tests/boards.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Management;
+using Osysharp.Workflow;
+using Archive;
+
+[Test(Vaults)]
+void who_holds_a_role_is_told_only_to_those_in_charge() {
+  runas (Priya) {
+    var refused = Assert.Throws<AgentRefused>(() => WhoHolds("AuditsAgents"));
+    Assert.Equal("Who holds a role is told to whoever supervises or audits the agents.", refused.Message);
+    Assert.False(RolesBoardOf().MayAskWho);
+  }
+  runas (Desmond) { Assert.Throws<AgentRefused>(() => WhoHolds("SupervisesAgents")); }
+  runas (Calla) { Assert.Throws<AgentRefused>(() => WhoHolds("TeachesAgents")); }
+  runas (Maeve) {
+    Assert.True(RolesBoardOf().MayAskWho);
+    Assert.Equal(["Maeve Okonkwo"], WhoHolds("SupervisesAgents"));
+    Assert.Equal(["Maeve Okonkwo"], WhoHolds("PausesAgents"));
+    Assert.Equal(["Calla Whitlock"], WhoHolds("TeachesAgents"));
+    Assert.Equal(["Ingrid Solberg"], WhoHolds("AuditsAgents"));
+    Assert.Equal(["Jonas Reiter", "Maeve Okonkwo", "Priya Nair"], WhoHolds("WidensAgentAutonomy"));
+    // Everybody who gives the agents work.
+    Assert.Equal(["Jonas Reiter", "Maeve Okonkwo", "Priya Nair"], WhoHolds("UsesAgents"));
+    Assert.Equal(0, WhoHolds("NoSuchPolicy").Count);
+  }
+  runas (Ingrid) { Assert.Equal(["Desmond Achebe", "Ingrid Solberg", "Maeve Okonkwo"], WhoHolds("ReadsAllAgentWork")); }
+  // What the table says of each person is what the policies say.
+  runas (Calla) {
+    var mine = RolesBoardOf();
+    Assert.True(mine.InCharge.Single(r => r.Policy == "TeachesAgents").You);
+    Assert.False(mine.InCharge.Single(r => r.Policy == "SupervisesAgents").You);
+    Assert.False(mine.InCharge.Single(r => r.Policy == "PausesAgents").You);
+    Assert.Equal("Maeve Okonkwo", mine.Sponsors.Single(s => s.Name == "Registrar").Sponsor);
+  }
+}
+```
+
+From [`tests/roles.test.osy`](tests/roles.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Agents.Management;
+using Osysharp.Workflow;
+using Archive;
+
+[Test(VaultsWhereAnAgentHoldsARole)]
+void an_agents_own_account_is_not_listed_as_holding_a_role() {
+  runas (Maeve) {
+    // Positive control: the policy does admit the account.
+    Assert.True(Security.Authorize(Actor.Of<Transcriber>(), AuditsAgents));
+    Assert.Equal(["Ingrid Solberg"], WhoHolds("AuditsAgents"));
+  }
+}
+```
+
+From [`tests/roles.test.osy`](tests/roles.test.osy).
+
+## Learn more
+
+- [The Osysharp.Agents.Management reference](https://osysharp.com/reference/agent/kit-agents-management/)
+- [Osysharp.Agents.Management in the package catalogue](https://osysharp.com/packages/#osysharp-agents-management)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
