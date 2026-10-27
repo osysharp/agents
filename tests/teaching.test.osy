@@ -466,3 +466,67 @@ void whoever_teaches_reads_the_work_with_what_it_said_and_nobody_else_gains_by_i
     Assert.True(VerifyTrace(receipt).Intact);
   }
 }
+
+[TestFixture]
+void SchoolWithAStranger() {
+  School();
+  // Gus has an account at the packhouse and nothing else: no role, no crate, no part in any work.
+  new Person { Email = "gus@packhouse.example", DisplayName = "Gus" };
+}
+
+principal Gus => Person.Single(p => p.Email == "gus@packhouse.example");
+
+/// ⭐ SOMEBODY THE APP GRANTED NOTHING READS NOTHING OF ITS AGENTS — not which agents answer to whom, not a skill's
+/// work, not what anyone taught them. Being signed in is not a grant. SECURITY-INVARIANT(agents-being-signed-in-reads-nothing).
+///
+/// The C# baseline once measured the opposite: a signed-in user with no roles read every `Skill` row — the
+/// tool it wraps, the roles that gate it and the secret it calls with — because a policy injected to stop WRITES took
+/// the table off deny-by-default. A skill is a class now and has no rows; this is the same question asked of every
+/// table the kit keeps. The ones this work writes are shown to HAVE rows first, read by the lead: a count of 0 on an
+/// empty table proves nothing, which is how an earlier probe missed `Agent`, `Runbook` and `AgentTemplate`. The tables it
+/// does not write (proposals, questions, waits, standing rules) are asked anyway, so a new grant on one is read here.
+[Test(SchoolWithAStranger)]
+void somebody_granted_nothing_reads_no_skill_and_no_record_of_what_the_agents_did_or_were_taught() {
+  Guid task;
+  runas (Ada) {
+    task = GradeNoting("A-1", "graded");
+    var corrected = Correct(task);
+    UnitOfWork.Commit();
+    Propose(corrected.Id, ShortRule());
+    UnitOfWork.Commit();
+  }
+  runas (Tess) { Teach("Weigh every crate twice."); }
+  // There is something to read: the lead reads all of it.
+  runas (Dana) {
+    Assert.True(AgentSeat.Count() > 0);
+    Assert.True(AgentTask.Count() > 0);
+    Assert.True(TraceEvent.Count() > 0);
+    Assert.True(AgentCorrection.Count() > 0);
+    Assert.True(AgentInstruction.Count() > 1);
+    Assert.True(AgentInstructionSet.Count() > 0);
+    Assert.True(AgentInstructionSource.Count() > 0);
+    Assert.True(AgentTraceHead.Count() > 0);
+  }
+  runas (Gus) {
+    Assert.Equal(0, AgentSeat.Count());
+    Assert.Equal(0, AgentSeatChange.Count());
+    Assert.Equal(0, AgentTask.Count());
+    Assert.Equal(0, TraceEvent.Count());
+    Assert.Equal(0, AgentTraceHead.Count());
+    Assert.Equal(0, AgentCorrection.Count());
+    Assert.Equal(0, AgentInstruction.Count());
+    Assert.Equal(0, AgentInstructionSource.Count());
+    Assert.Equal(0, AgentProposal.Count());
+    Assert.Equal(0, AgentHelp.Count());
+    Assert.Equal(0, AgentWait.Count());
+    Assert.Equal(0, AgentStandingRule.Count());
+    Assert.Equal(0, AgentTaskParking.Count());
+    Assert.Equal(0, AgentWorkWait.Count());
+    Assert.Equal(0, AgentWorkWatch.Count());
+    // The one table every signed-in person reads, by declaration: THAT an agent's instructions changed, and when. It
+    // holds none of their words, and who changed it and why are not his to read.
+    var set = AgentInstructionSet.OrderBy(s => s.Number).Last();
+    Assert.Null(set.By);
+    Assert.True(set.Why == null || set.Why == "");
+  }
+}

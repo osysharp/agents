@@ -26,6 +26,14 @@
 // ⚑ WHO READS WHAT WORK SAID: whoever it was for and whoever gave it; whoever audits; whoever TEACHES — nobody can
 //   judge or correct work they cannot read — and a supervisor on the receipt (not on the record's content).
 //   `TeachesAgents` is one answer for the whole app: a teacher teaches every agent, and so reads every agent's work.
+//
+// ⛔ SECURITY-INVARIANT(agents-being-signed-in-reads-nothing): no table of this package is read by somebody for being
+//   signed in alone. Every `allow read` names one of the policies above, or reads only what is the reader's own
+//   (`where … == user`); the one exception is `AgentInstructionSet`, whose rows say THAT an agent's instructions
+//   changed and when — none of their words — and which masks who changed them and why. A skill is a class and keeps
+//   no rows: what it is told, the tools it holds and what they call with are read only by the app's own code. Ledger
+//   F35 is what this rule's absence did on the C# baseline. Guarded by `kits/agents/tests/teaching.test.osy`
+//   `somebody_granted_nothing_reads_no_skill_and_no_record_of_what_the_agents_did_or_were_taught`.
 namespace Osysharp.Agents;
 
 using Osysharp.Identity;

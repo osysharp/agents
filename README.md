@@ -354,3 +354,129 @@ it at once; and a process that comes back after its work was closed does nothing
   and who it works for) and `Osysharp.Observability` (an agent's changes are always on the change trail).
 - Testing: [`Osysharp.Agents.Testing`](../agents-testing).
 - Screens for teaching: [`Osysharp.Agents.Teaching`](../agents-teaching) — "Correct this" and an agent's Instructions page.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+[Test(YardWithAReader)]
+void a_piece_that_was_handed_on_is_not_tried_again_by_itself() {
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    // The inspector's result never fits what its skill promises, so its piece fails; the foreman is told, and goes on.
+    var cast = AgentCast.Of()
+      .Plays<Foreman>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(crate.Id)), Says.HandBack(new DeliveryNote { Summary = "A-1 could not be graded." })))
+      .Plays<Inspector>(AgentScript.Of(Says.HandBackJson("{\"Score\":\"high\"}"), Says.HandBackJson("{\"Score\":\"high\"}"), Says.HandBackJson("{\"Score\":\"high\"}"), Says.HandBackJson("{\"Score\":\"high\"}")));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    Assert.True(TakeIn("ada@packhouse.example").Done);
+    var piece = AgentTask.Single(t => t.Parent != null);
+    Assert.Equal(AgentTaskStatus.Failed, piece.Status);
+    var refused = Assert.Throws<AgentRefused>(() => RetryAgentWork(piece));
+    Assert.StartsWith("It was handed on by another piece of work", refused.Message);
+  }
+}
+```
+
+From [`tests/again.test.osy`](tests/again.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+[Test(Yard)]
+void a_rejected_proposal_gives_the_agent_the_reason() {
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool("It looks bruised.", Actions.Of(FlagCrate), FlagArgs(crate, "bruised")),
+      Says.HandBack(new Grade { Score = 8, Finding = "Sound after all." }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    var task = Settle(crate).Task;
+
+    // A no needs its reason: the agent goes on from it.
+    Assert.Throws<ValidationException>(() => RejectAgentProposal(AgentProposal.Single(), " "));
+    var decision = RejectAgentProposal(AgentProposal.Single(), "That is the variety's colour, not a bruise.");
+    Assert.Equal(ProposalStatus.Rejected, decision.Status);
+    GoOn(task);
+
+    // Nothing was flagged, and the model was told no and why — as what its tool answered.
+    Assert.Equal("", Crate.Single(c => c.Code == "A-1").Flag);
+    var told = Heard.Single(h => h.What == "result").About;
+    Assert.StartsWith("error: ", told);
+    Assert.Contains("Their reason: That is the variety", told);
+    var receipt = AgentTask.Single();
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Contains("Sound after all.", receipt.Result!);
+    // A tool that did not run is not counted as run.
+    Assert.Equal(0, receipt.ToolCalls);
+    Assert.Contains("Ada said no to FlagCrate: That is the variety's colour, not a bruise.", Trajectory.Said(task));
+    Assert.Equal("That is the variety's colour, not a bruise.", AgentProposal.Single().Reason);
+  }
+}
+```
+
+From [`tests/autonomy.test.osy`](tests/autonomy.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Packhouse;
+
+[Test(Yard)]
+[runas(Ada)]
+void a_piece_of_work_is_stopped_when_its_money_runs_out_and_keeps_what_it_did() {
+  // A quick look may spend 12000. Two calls at 4000 each leave 4000 — less than a third call reserves.
+  var a1 = Crate.Single(c => c.Code == "A-1");
+  var a2 = Crate.Single(c => c.Code == "A-2");
+  var script = AgentScript.Of(
+    Says.Tool(Actions.Of(FlagCrate), "{\"crate\":\"" + a1.Id.ToString() + "\",\"flag\":\"bruised\"}", 1000, 600),
+    Says.Tool(Actions.Of(Weigh), "{\"crate\":\"" + a2.Id.ToString() + "\"}", 1000, 600),
+    Says.HandBack(new Grade { Score = 5 }));
+  ScriptedAnswer.Stub((model, request) => { new Heard { What = "asked", About = model }; return script.Answer(model, request); });
+
+  var outcome = Glance(a1);
+
+  Assert.Equal(AgentTaskStatus.Stopped, outcome.Status);
+  Assert.StartsWith("Its money ran out: There is no room left in the limit set for task:", outcome.Problem);
+  Assert.Contains("($0.01). Nothing was sent.", outcome.Problem);
+  // The model heard two calls, not three.
+  Assert.Equal(2, Heard.Count(h => h.What == "asked"));
+  var receipt = AgentTask.Single();
+  Assert.Equal(12000, receipt.LimitMicros);
+  Assert.Equal(8000, receipt.SpentMicros);
+  Assert.Equal(2, receipt.ModelCalls);
+  // What it had done stays done, and its record is whole.
+  Assert.Equal("bruised", Crate.Single(c => c.Code == "A-1").Flag);
+  Assert.True(VerifyTrace(receipt).Intact);
+  Assert.Equal("Ended", Trajectory.Kinds(receipt.Id)[Trajectory.Kinds(receipt.Id).Count - 1]);
+  Background.Settle();
+  Assert.Equal(1, Heard.Count(h => h.What == "stopped"));
+}
+```
+
+From [`tests/budgets.test.osy`](tests/budgets.test.osy).
+
+## Learn more
+
+- [The Osysharp.Agents reference](https://osysharp.com/reference/agent/kit-agents/)
+- [Osysharp.Agents in the package catalogue](https://osysharp.com/packages/#osysharp-agents)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).

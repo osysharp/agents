@@ -25,7 +25,7 @@
 //     policy SupervisesAgents => IsLead;       // sponsors, pauses and stops them; reads every run
 //     policy AuditsAgents     => IsAuditor;    // reads every run with its content
 package Osysharp.Agents {
-  version     "1.11.0";
+  version     "1.12.0";
   minPlatform "0.17.0";
   summary     "AI agents as typed classes: skills with a typed input and a checked, typed result; tools that are the app's own actions, run as the agent and never past the person it works for; a hard budget per piece of work; a receipt and a tamper-evident record of every step; a gate that says what it does alone, what it proposes to a person first and what it never does; a ladder of help — a more capable model first, then a person, whom the work waits for; corrections people make of its work, drawn into instructions that reach it only once a person has made them active, in numbered sets a piece of work records and an agent can be put back to; and handing typed pieces of its work on to other agents — several at once — each with its own receipt under the one that handed it on, done for the same person, never doing alone what any piece of work above it must propose, and spending out of what is left above it.";
 
