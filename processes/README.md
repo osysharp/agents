@@ -114,3 +114,128 @@ osy test kits/agents-processes/tests --pixels   # the same in a real browser, ph
 - Source: [`kits/agents-processes`](.) — `model/Bridge.osy`, `model/ui/Steps.osy`
 - Uses [`Osysharp.Agents`](../agents), [`Osysharp.Agents.Inspector`](../agents-inspector),
   [`Osysharp.Processes`](../processes) and `Osysharp.Ui`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.Agents.Processes;
+using Procurement;
+
+[Test(Halden)]
+void a_simulated_process_reaches_approved() {
+  TestClock.Set(new DateTime(2031, 9, 1, 8, 0, 0, DateTimeKind.Utc));
+  TheAgentsAnswer();
+  Guid supplier = Guid.Empty;
+  runas (Jonas) { supplier = BrightwaterIsAskedFor(); }
+  // A person is simulated by doing what she would: the lead reads the proposal a day later and says yes.
+  TestClock.Advance(TimeSpan.FromDays(1));
+  runas (Mara) {
+    var step = StepAt(supplier, "Deciding");
+    ApproveAgentProposal(AgentProposal.Single(p => p.Task == step));
+    GoOnWith(step.Id, supplier);
+
+    Assert.Equal(SupplierStage.Approved, Supplier.Single(s => s.Id == supplier).Stage);
+    // Where it went, what was proposed on the way, and what it cost.
+    Assert.Equal(["CheckDocuments", "AssessRisk", "SettleTerms"], ProcessTrail.Skills(supplier));
+    Assert.Equal(["Screening", "Assessing", "Deciding"], ProcessTrail.States(supplier));
+    Assert.Equal(["Done", "Done", "Done"], ProcessTrail.Ended(supplier));
+    Assert.Equal(["ApproveSupplier"], ProcessTrail.Proposed(supplier));
+    Assert.True(ProcessTrail.Cost(supplier) <= 20000);            // two cents
+    Assert.Equal(9, ModelCall.Count(c => c.Outcome == ModelCallOutcome.Served));
+  }
+}
+```
+
+From [`tests/walk.test.osy`](tests/walk.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.Agents.Processes;
+using Procurement;
+
+[Test(Halden)]
+void a_supplier_with_a_document_missing_ends_where_the_first_step_sends_it() {
+  TheAgentsAnswer(documentsComplete: false);
+  runas (Jonas) {
+    var supplier = BrightwaterIsAskedFor(withInsurance: false);
+    var s = Supplier.Single(x => x.Id == supplier);
+    Assert.Equal(SupplierStage.Incomplete, s.Stage);
+    Assert.Equal("proof of insurance", s.Missing);
+    Assert.Equal(["CheckDocuments"], ProcessTrail.Skills(supplier));
+    Assert.Equal(ProcessStatus.Stopped, ProcessRunOf(RunOf(supplier).Id)!.Card.Status);
+  }
+}
+```
+
+From [`tests/walk.test.osy`](tests/walk.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Osysharp.Processes;
+using Osysharp.Agents.Processes;
+using Procurement;
+
+[Test(Halden)]
+void the_run_and_the_work_are_found_from_each_other() {
+  var supplier = TheBrightwaterCase();
+  runas (Mara) {
+    var run = RunOf(supplier);
+    var step = StepAt(supplier, "Deciding");
+    // The receipt says which run it is a step of…
+    Assert.Equal(run.Run, step.Run);
+    Assert.Equal("Qualification", step.RunWorkflow);
+    Assert.Equal(supplier, step.RunItem);
+    // …the work's own page says it in words, and leads to the run…
+    var seen = InspectAgentWork(step.Id)!;
+    Assert.Equal("Qualification", seen.Process);
+    Assert.Equal("Deciding", seen.ProcessState);
+    var origin = ProcessRunOfWork(step.Id)!;
+    Assert.Equal(run.Id, origin.Run);
+    Assert.Equal("/qualifications/" + run.Id.ToString(), origin.Href);
+    Assert.Equal("Brightwater Castings", origin.Title);
+    Assert.Equal("Approved", origin.StateLabel);
+    // …and the run's page leads to the work.
+    var work = AgentWorkInRun(run.Id);
+    Assert.Equal("/work/" + step.Id.ToString() + "/0", work.Steps.Last().Href);
+  }
+  // Somebody with no business in the office finds neither.
+  runas (Rafi) {
+    Assert.Equal(0, AgentWorkInRun(Guid.NewGuid()).Steps.Count);
+    Assert.Equal(0, AgentTask.Count());
+    Assert.Equal(0, ProcessRun.Count());
+  }
+}
+```
+
+From [`tests/walk.test.osy`](tests/walk.test.osy).
+
+## Learn more
+
+- [The Osysharp.Agents.Processes reference](https://osysharp.com/reference/agent/kit-agents-processes/)
+- [Osysharp.Agents.Processes in the package catalogue](https://osysharp.com/packages/#osysharp-agents-processes)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
