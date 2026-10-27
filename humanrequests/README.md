@@ -96,3 +96,117 @@ them wide and on a phone, light and dark). No model is called: its one model is 
 - Source: [`kits/agents-human-requests`](.) — Osy#, readable and forkable.
 - Package: `Osysharp.Agents.HumanRequests` · completes `Osysharp.Agents` and `Osysharp.HumanRequests`.
 - Reference: `osy docs agent-requests` · `osy docs agent-autonomy` · `osy docs agent-people`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Workflow;
+using Purchasing;
+
+[Test(Office)]
+void approving_in_the_inbox_runs_it_as_whoever_approved() {
+  // Noor is a buyer: she may not clear a supplier. She has the vetter vet the dairy; its proposal comes to her.
+  Guid task;
+  runas (Noor) {
+    var dairy = Dairy();
+    var script = AgentScript.Of(
+      Says.Tool("It is registered and active.", Actions.Of(ClearSupplier), ClearArgs(dairy, 30)),
+      Says.HandBack(new Vetting { Recommend = true, Finding = "Proposed; not cleared." }));
+    ScriptedAnswer.Stub((model, request) => { NoteAsked(model, request); return script.Answer(model, request); });
+    task = Vet(dairy).Task;
+    Background.Settle();
+    var approval = MyRequest();
+    // She cannot be shown "do this alone from now on": that is the lead's to say.
+    Assert.False(ProposalCardOf(AgentProposal.Single().Id)!.MayAllowAlone);
+    AnswerRequest(approval, RequestAnswer.Approve());
+    GoOn(task);
+    // Her yes ran it as her — and she may not. Nothing was cleared; the proposal says so, and so was the agent told.
+    Assert.False(Dairy().Cleared);
+    Assert.Equal(ProposalStatus.Failed, AgentProposal.Single().Status);
+    Assert.StartsWith("It was approved, and could not be done:", ProposalCardOf(AgentProposal.Single().Id)!.Outcome);
+    Assert.Equal(1, Heard.Count(h => h.What == "result" && h.About.StartsWith("error: ")));
+  }
+}
+```
+
+From [`tests/onboarding.test.osy`](tests/onboarding.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Workflow;
+using Purchasing;
+
+[Test(OfficeWithFinance)]
+void whoever_the_work_is_for_does_not_decide_it_from_the_queue_she_works() {
+  Guid task = Guid.Empty;
+  runas (Ilse) {
+    var dairy = Dairy();
+    var script = SettlingTheDairy(dairy);
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    task = SettleTermsOf(dairy).Task;
+    Background.Settle();
+    // She works the queue, so she sees the request — and it says it is not hers to answer.
+    var waiting = HumanRequest.Single();
+    var refused = Assert.Throws<RequestRefused>(() => AnswerRequest(waiting, RequestAnswer.Approve()));
+    Assert.Equal("This decides something that was asked for you, so it is not yours to answer. It waits for the people of Finance.", refused.Message);
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+    Assert.Equal(0, Dairy().AgreedPaymentDays);
+  }
+  runas (Rosa) { Assert.True(AnswerRequest(HumanRequest.Single(), RequestAnswer.Reject("We pay this dairy in 14 days.")).Applied); }
+  runas (Tariq) { GoOn(task); }
+  runas (Ilse) {
+    Assert.Equal(ProposalStatus.Rejected, AgentProposal.Single().Status);
+    Assert.Equal(Rosa.Id, AgentProposal.Single().DecidedBy!.Id);
+    Assert.Equal(0, Dairy().AgreedPaymentDays);
+  }
+}
+```
+
+From [`tests/routing.test.osy`](tests/routing.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.WorkQueues;
+using Osysharp.HumanRequests;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.HumanRequests;
+using Osysharp.Workflow;
+using Purchasing;
+
+[Test(Office)]
+void signing_in_takes_the_right_code_and_nothing_else() {
+  Assert.NotEqual("", SignInWithCode("noor@crumbandcrust.example", "1111"));
+  Assert.Equal("", SignInWithCode("noor@crumbandcrust.example", "9999"));
+  Assert.Equal("", SignInWithCode("nobody@crumbandcrust.example", "1111"));
+}
+```
+
+From [`tests/ui.test.osy`](tests/ui.test.osy).
+
+## Learn more
+
+- [The Osysharp.Agents.HumanRequests reference](https://osysharp.com/reference/agent/kit-agents-human-requests/)
+- [Osysharp.Agents.HumanRequests in the package catalogue](https://osysharp.com/packages/#osysharp-agents-humanrequests)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
