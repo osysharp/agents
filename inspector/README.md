@@ -90,3 +90,108 @@ osy test kits/agents-inspector/tests --pixels   # the same in a real browser, ph
 
 - 2.0.0: `Fact` is internal to the kit. It was never meant as part of its surface, and its name is the same as the
   `Osysharp.Ui` control `Fact`, which an app reaches for instead. Pin `@2`.
+
+## Examples
+
+Taken from this package's own tests, which compile and run on every release.
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Station;
+
+[Test(Skerry)]
+void work_that_waits_says_on_whom_and_since_when() {
+  TestClock.Set(new DateTime(2031, 11, 9, 6, 0, 0, DateTimeKind.Utc));
+  var script = AgentScript.Of(Says.AskPerson("Has the harbour master closed the north quay?"));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  Guid task = Guid.Empty;
+  runas (Ilse) { task = Draft("9 November").Task; }
+  TestClock.Advance(TimeSpan.FromHours(26));
+  runas (Ilse) {
+    var seen = InspectAgentWork(task)!;
+    Assert.Equal(AgentTaskStatus.Waiting, seen.Status);
+    Assert.False(seen.Ended);
+    Assert.Equal("Waiting on an answer from Ilse Varga, for 1 day 2 hours so far.", seen.Waiting);
+    Assert.Equal("No answer yet, since 9 Nov 2031, 06:00.", seen.Help.Single().Came);
+    Assert.True(seen.Steps.Last().StillWaiting);
+    Assert.Equal("1 day 2 hours", seen.Steps.Last().Took);
+    Assert.Equal("", seen.Result);
+  }
+}
+```
+
+From [`tests/inspect.test.osy`](tests/inspect.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Station;
+
+[Test(Skerry)]
+void each_reader_is_shown_what_the_agents_kit_lets_them_read_and_no_more() {
+  var task = TheBulletinOfTheNinth();
+  // Another meteorologist uses the agents, and this work was not his.
+  runas (Bram) { Assert.Null(InspectAgentWork(task)); }
+  // An observer has no part in the agents at all.
+  runas (Odd) { Assert.Null(InspectAgentWork(task)); }
+  // The chief supervises and audits: all of it, with what it said.
+  runas (Anouk) {
+    var seen = InspectAgentWork(task)!;
+    Assert.False(seen.Steps.Any(s => s.Kept));
+    Assert.Equal("24 m/s", seen.Steps.Single(s => s.Kind == TraceKind.ToolResult).Content);
+    Assert.Equal("Has the harbour master closed the north quay?", seen.Help.Single().Question);
+  }
+  // Nobody signed in reads nothing.
+  Assert.Throws<NotAuthorized>(() => InspectAgentWork(task));
+}
+```
+
+From [`tests/inspect.test.osy`](tests/inspect.test.osy).
+
+```osy
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+using Osysharp.Agents;
+using Osysharp.Agents.Testing;
+using Osysharp.Agents.Inspector;
+using Station;
+
+[Test(Skerry)]
+void something_the_agent_was_only_asked_is_inspected_like_any_work() {
+  ScriptedAnswer.Stub((model, request) => Scripted.Text("A gale from the north-west by noon.", 200, 20));
+  Guid task = Guid.Empty;
+  runas (Ilse) { task = AskForecaster("What does the afternoon look like?").Task; }
+  runas (Ilse) {
+    var seen = InspectAgentWork(task)!;
+    Assert.Equal("", seen.Skill);
+    Assert.Equal("What does the afternoon look like?", seen.Brief);
+    Assert.Equal("A gale from the north-west by noon.", seen.Result);
+    Assert.Equal(0, seen.Tools.Count);
+    Assert.Equal(["Started", "ModelCall", "Ended"], seen.Steps.Select(s => s.Kind.Name).ToList());
+    Assert.Equal("A gale from the north-west by noon.", seen.Steps[1].Content);
+  }
+}
+```
+
+From [`tests/inspect.test.osy`](tests/inspect.test.osy).
+
+## Learn more
+
+- [The Osysharp.Agents.Inspector reference](https://osysharp.com/reference/agent/kit-agents-inspector/)
+- [Osysharp.Agents.Inspector in the package catalogue](https://osysharp.com/packages/#osysharp-agents-inspector)
+- [The Osy# reference](https://osysharp.com/reference/) — the language, the runtime and every kit
+- [`llms-full.txt`](https://osysharp.com/llms-full.txt) — the whole reference and specification as one Markdown file, for a coding agent
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE).
