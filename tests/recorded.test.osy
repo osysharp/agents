@@ -1,0 +1,241 @@
+// Osysharp.Agents — work done outside the kit's loop, recorded as an agent's: the receipt says the instruction set
+// it ran under, read when it is written and never told; an outcome the app sees afterwards corrects it with nobody
+// signed in, is counted, and makes nothing active; corrections of one kind that recur propose one instruction drawn
+// from them; and an agent put back to an earlier set is put back for recorded work too.
+//
+// The fixture, the helpers and the packhouse's teacher (Tess) are in teaching.test.osy.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+string GradedSeven() { return "{\"Score\":7,\"Finding\":\"Sound.\"}"; }
+
+/// A crate graded by hand at the bench, recorded as the inspector's grading, for whoever is signed in.
+Guid GradedByHand(string code) {
+  return RecordAgentWork(TheInspector, TheGrading, "Crate " + code, "Crate", GradedSeven(), "Graded 7 at the bench.");
+}
+
+/// A correction of the inspector's work by whoever is signed in, of a kind.
+AgentCorrection CorrectAs(Guid task, string kind, string right) {
+  return CorrectAgentWork(AgentTask.Single(t => t.Id == task), new Correction {
+    Wrong = "It gave a short crate a 7.", Right = right, Because = "A short crate cannot be sold as a full one.", Kind = kind,
+  });
+}
+
+/// A buyer sent a crate back: the packhouse's own code corrects the work from it, as the app.
+void SentBack(Guid task, string kind, string right) {
+  runas (Ada) { BuyerSentBack(task, kind, right); UnitOfWork.Commit(); }
+  Background.Settle();
+}
+
+// ── recorded work ───────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void recorded_work_carries_the_set_it_ran_under_and_the_next_carries_the_new_one() {
+  Guid first;
+  runas (Ada) {
+    // Nobody has taught the inspector anything: it is told nothing beyond its declaration.
+    var before = GuidanceFor(TheInspector, TheGrading);
+    Assert.Equal(0, before.Set);
+    Assert.Equal("", before.Text);
+    var work = BeginAgentWork(TheInspector, TheGrading, about: "Crate A-2", given: "Crate");
+    first = work.Task;
+    Assert.Equal("", work.Guidance);
+    Assert.Equal(AgentTaskStatus.Working, AgentTask.Single(t => t.Id == first).Status);
+    FinishAgentWork(first, GradedSeven(), "Graded 7 at the bench.");
+    UnitOfWork.Commit();
+
+    var receipt = AgentTask.Single(t => t.Id == first);
+    Assert.Equal(AgentTaskCause.Recorded, receipt.Cause);
+    Assert.Equal(AgentTaskStatus.Done, receipt.Status);
+    Assert.Equal(TheGrading, receipt.Skill);
+    Assert.Equal("Crate A-2", receipt.About);
+    Assert.Equal(0, receipt.InstructionSet);
+    Assert.Equal("", receipt.InstructionsSent);
+    Assert.Equal("", receipt.InstructionsHash);
+    // Who gave the work is read from the session; it ran as the inspector's own account.
+    Assert.Equal(Ada.Id, receipt.StartedBy!.Id);
+    Assert.Equal(Ada.Id, receipt.Requester!.Id);
+    Assert.Equal(Actor.Of<Inspector>().Id, receipt.Actor.Id);
+    Assert.Contains("\"Score\":7", receipt.Result!);
+    Assert.Equal("Graded 7 at the bench.", receipt.Outcome);
+    // Its record: given, and ended — chained like any other.
+    var lines = TraceOf(receipt);
+    Assert.Equal(2, lines.Count);
+    Assert.Contains("done outside the kit and recorded", lines[0].Summary);
+    Assert.True(VerifyTrace(receipt).Intact);
+  }
+
+  AgentInstruction rule;
+  runas (Tess) { rule = Teach(ShortRule(), TheGrading); }
+
+  runas (Ada) {
+    // What it is told now, word for word…
+    var now = GuidanceFor(TheInspector, TheGrading);
+    Assert.Equal(1, now.Set);
+    Assert.Equal(Heading() + "\n1. " + ShortRule(), now.Text);
+    // …is what the next recorded work is sent, and what its receipt says it ran with.
+    var work = BeginAgentWork(TheInspector, TheGrading, about: "Crate A-1");
+    Assert.Equal(1, work.InstructionSet);
+    Assert.Equal(now.Text, work.Guidance);
+    Assert.Equal(Crypto.Sha256Hex(now.Text), work.GuidanceHash);
+    FinishAgentWork(work.Task, GradedSeven(), "Graded 7.");
+    var second = GradedByHand("A-1");
+    UnitOfWork.Commit();
+    foreach (var id in [work.Task, second]) {
+      var receipt = AgentTask.Single(t => t.Id == id);
+      Assert.Equal(1, receipt.InstructionSet);
+      Assert.Equal(rule.Id.ToString(), receipt.InstructionsSent);
+      Assert.Equal(work.GuidanceHash, receipt.InstructionsHash);
+      Assert.Equal("It ran under instruction set 1, sent 1 instruction.", InstructionsOf(receipt).Words);
+    }
+    // The first still says what IT ran with.
+    Assert.Equal(0, AgentTask.Single(t => t.Id == first).InstructionSet);
+
+    // Recorded work is refused as the kit's own is: an agent nobody answers for, a skill it does not hold.
+    Assert.Throws<AgentNotSponsored>(() => RecordAgentWork("Packhouse.Trainee", TheGrading, "", "", null, "Done."));
+    Assert.Throws<SkillNotHeld>(() => RecordAgentWork(TheInspector, "Packhouse.SettleCrate", "", "", null, "Done."));
+    // Work the kit's loop did is closed by the loop, and recorded work once.
+    var graded = GradeNoting("A-1", "graded");
+    Assert.Throws<AgentRefused>(() => FinishAgentWork(graded, GradedSeven(), "Graded."));
+    Assert.Throws<AgentRefused>(() => FinishAgentWork(second, GradedSeven(), "Again."));
+  }
+  // Recorded work is closed by whoever began it: somebody else does not.
+  Guid open;
+  runas (Ada) { open = BeginAgentWork(TheInspector, TheGrading).Task; UnitOfWork.Commit(); }
+  runas (Ben) { Assert.Throws<ValidationException>(() => FinishAgentWork(open, GradedSeven(), "Mine now.")); }
+}
+
+// ── outcomes ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void an_outcome_corrects_the_work_with_nobody_signed_in_and_activates_nothing() {
+  AgentInstruction rule;
+  runas (Tess) { rule = Teach(ShortRule(), TheGrading); }
+  Guid task;
+  runas (Ada) { task = GradedByHand("A-2"); UnitOfWork.Commit(); }
+
+  SentBack(task, "sent-back", "Weigh every crate before grading it.");
+
+  // It ran as the app, where nobody is signed in — and the correction is nobody's: an outcome's.
+  Assert.Equal("by nobody", Heard.Single(h => h.What == "outcome").About);
+  runas (Tess) {
+    var made = AgentCorrection.Single();
+    Assert.Null(made.By);
+    Assert.Equal(CorrectionSource.Outcome, made.Source);
+    Assert.Equal("sent-back", made.Kind);
+    Assert.Equal(task, made.Task!.Id);
+    Assert.Equal(TheGrading, made.Skill);
+    // It knows what the work had been told, so it counts against that instruction.
+    Assert.Equal(1, made.InstructionSet);
+    Assert.Equal(rule.Id.ToString(), made.Sent);
+    var effect = EffectOf(rule);
+    Assert.Equal(1, effect.WorkSince);
+    Assert.Equal(1, effect.CorrectedSince);
+    // Nothing the inspector is told has changed, and one correction proposes nothing.
+    Assert.Equal(1, InstructionSetOf(TheInspector));
+    Assert.Equal(1, AgentInstruction.Count());
+    Assert.Equal(0, Heard.Count(h => h.What == "recurring"));
+  }
+  // A person signed in may correct from an outcome too — and the correction is still nobody's.
+  runas (Ada) {
+    var mine = CorrectAgentWorkFromOutcome(AgentTask.Single(t => t.Id == task), new Correction {
+      Wrong = "Sent back.", Right = "Weigh first.", Because = "The buyer said it was short.",
+    }, "sent-back");
+    Assert.Null(mine.By);
+    Assert.Throws<ValidationException>(() => CorrectAgentWorkFromOutcome(AgentTask.Single(t => t.Id == task), new Correction {
+      Wrong = "Sent back.", Right = "Weigh first.", Because = "Short.",
+    }, " "));
+  }
+}
+
+// ── corrections that recur ──────────────────────────────────────────────────────────────────────────────────────────
+
+[Test(School)]
+void the_third_correction_of_one_kind_proposes_one_instruction_and_a_fourth_does_not() {
+  List<Guid> tasks = [];
+  runas (Ada) {
+    foreach (var code in ["A-1", "A-2", "A-1", "A-2", "A-1"]) { tasks.Add(GradedByHand(code)); }
+    UnitOfWork.Commit();
+  }
+  // Two of a kind — one an outcome's, one a person's — and one of another kind: nothing yet.
+  SentBack(tasks[0], "sent-back", "Weigh every crate before grading it.");
+  runas (Ada) { CorrectAs(tasks[1], "sent-back", "A crate under 10 kg is a 4 at most."); UnitOfWork.Commit(); }
+  Background.Settle();
+  SentBack(tasks[2], "late", "Grade within the hour.");
+  runas (Tess) { Assert.Equal(0, AgentInstruction.Count()); }
+
+  // The third of the kind proposes one, drawn from those three.
+  SentBack(tasks[3], "sent-back", "Say the weight in the finding.");
+  AgentInstruction proposed;
+  runas (Tess) {
+    proposed = AgentInstruction.Single();
+    Assert.Equal(InstructionState.Proposed, proposed.State);
+    Assert.Equal(TheGrading, proposed.Skill);
+    Assert.Equal(3, proposed.DrawnFrom);
+    Assert.Null(proposed.ProposedBy);
+    Assert.Equal("Weigh every crate before grading it. A crate under 10 kg is a 4 at most. Say the weight in the finding.", proposed.Guidance);
+    Assert.Contains("3 corrections of the kind \"sent-back\" recurred", proposed.Why);
+    var from = SourcesOf(proposed);
+    Assert.Equal(3, from.Count);
+    foreach (var c in from) { Assert.Equal("sent-back", c.Kind); }
+    Assert.Equal(tasks[0], from[0].Task!.Id);
+    Assert.Equal(tasks[1], from[1].Task!.Id);
+    Assert.Equal(tasks[3], from[2].Task!.Id);
+  }
+  // The packhouse's own code tried to make it active, and was refused: nothing changed what the inspector is told.
+  Assert.Contains("nobody is signed in", Heard.Single(h => h.What == "recurring").About);
+  runas (Tess) { Assert.Equal(0, InstructionSetOf(TheInspector)); }
+
+  // A fourth of the kind proposes no second.
+  SentBack(tasks[4], "sent-back", "Weigh every crate before grading it.");
+  runas (Tess) {
+    Assert.Equal(1, AgentInstruction.Count());
+    Assert.Equal(5, AgentCorrection.Count());
+  }
+}
+
+[Test(School)]
+void rollback_after_a_recurring_proposal_restores_the_earlier_set_for_recorded_work() {
+  AgentInstruction rule;
+  runas (Tess) { rule = Teach(ShortRule(), TheGrading); }
+  Guid before;
+  List<Guid> tasks = [];
+  runas (Ada) {
+    before = GradedByHand("A-1");
+    foreach (var code in ["A-1", "A-2", "A-1"]) { tasks.Add(GradedByHand(code)); }
+    UnitOfWork.Commit();
+  }
+  foreach (var t in tasks) { SentBack(t, "sent-back", "Weigh every crate before grading it."); }
+
+  // Whoever teaches reads what recurring corrections proposed, and makes it active: set 2.
+  runas (Tess) {
+    var proposed = AgentInstruction.Single(i => i.State == InstructionState.Proposed);
+    Assert.Equal(2, ActivateAgentInstruction(proposed, "The buyers are right.").Number);
+    UnitOfWork.Commit();
+  }
+  Guid taught;
+  runas (Ada) { taught = GradedByHand("A-2"); UnitOfWork.Commit(); }
+  runas (Tess) {
+    var receipt = AgentTask.Single(t => t.Id == taught);
+    Assert.Equal(2, receipt.InstructionSet);
+    Assert.Equal(2, receipt.InstructionsSent.Split("\n").Length);
+    // It was not what the buyers wanted after all: put back to set 1.
+    Assert.Equal(3, RollBackAgentInstructions(TheInspector, 1, "Weighing at the bench slowed the line.").Number);
+    UnitOfWork.Commit();
+  }
+  Guid after;
+  runas (Ada) { after = GradedByHand("A-1"); UnitOfWork.Commit(); }
+  runas (Tess) {
+    var was = AgentTask.Single(t => t.Id == before);
+    var now = AgentTask.Single(t => t.Id == after);
+    Assert.Equal(3, now.InstructionSet);
+    // Recorded work after the rollback is sent exactly what it was sent under set 1.
+    Assert.Equal(rule.Id.ToString(), now.InstructionsSent);
+    Assert.Equal(was.InstructionsHash, now.InstructionsHash);
+    Assert.Equal(InstructionSetNumbered(TheInspector, 1)!.Hash, InstructionSetHashNow(TheInspector));
+  }
+}

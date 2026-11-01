@@ -24,6 +24,10 @@ public class TeachingSetup {
   /// The model that words an instruction from corrections (`DraftAgentInstruction`), by the app's name for it.
   /// "": the app's router decides.
   public string DraftsWith = "";
+  /// How many corrections of one kind (`AgentCorrection.Kind`) of one agent's work, not yet drawn into an instruction,
+  /// propose one drawn from them all — proposed, never active. While it waits for a person no second is proposed for
+  /// that kind. 0: never.
+  public int ProposeAfter = 3;
 }
 
 /// Where an instruction stands. ⚠ Appended, never inserted: an enum is stored by position.
@@ -95,14 +99,14 @@ public entity AgentInstruction {
     allow create when IsAuthenticated;
     allow update when TeachesAgents || ErasesAgentRecords;
     // SECURITY-INVARIANT(agents-an-instruction-is-active-only-after-a-person): an instruction is made by the kit's
-    // two proposing functions — always `Proposed` — and its `State` is written by the five functions below and nothing
+    // three proposing functions — always `Proposed` — and its `State` is written by the five functions below and nothing
     // else. Of those only `ActivateAgentInstruction` and `RollBackAgentInstructions` write `Active`, and both ask
     // `RequireTeacher` first: a signed-in person, not an agent's own account, whom `TeachesAgents` admits. A name
     // added to either list, or a grant in place of the deny, lets guidance reach every later run of an agent unread —
     // the memory-poisoning hole this closes. Guarded by tests/teaching.test.osy
     // `an_instruction_is_active_only_after_a_person`, `nobody_writes_an_instruction_active_past_the_kit`,
     // `an_agent_cannot_activate_an_instruction_even_for_a_teacher`, `code_running_as_the_app_cannot_activate_one`.
-    deny create except via ProposeAgentInstruction, ProposeInstructionFromWork;
+    deny create except via ProposeAgentInstruction, ProposeInstructionFromWork, ProposeFromRecurringCorrections;
     deny update State except via ActivateAgentInstruction, RejectAgentInstruction, RetireAgentInstruction, RollBackAgentInstructions, EraseAgentInstruction, WithholdAgentInstruction;
     deny update ActiveSince except via ActivateAgentInstruction, RollBackAgentInstructions;
     // Who decided and when, written with the decision; a person is taken off it only by `ForgetWhoTaughtAgents`.
@@ -130,7 +134,7 @@ public entity AgentInstructionSource {
     allow read when IsAuthenticated where Instruction.ProposedBy == user;
     allow read when TeachesAgents || SupervisesAgents || AuditsAgents || ErasesAgentRecords;
     allow create when IsAuthenticated;
-    deny create except via ProposeAgentInstruction;
+    deny create except via ProposeAgentInstruction, ProposeFromRecurringCorrections;
     deny update;
     deny delete;
   }
@@ -297,6 +301,49 @@ internal Guid ProposeInstructionFromWork(WorkInstruction said) {
     Agent = said.Agent, Skill = said.Skill, Guidance = words.Guidance, Why = words.Why,
     ProposedByAgent = said.Agent, LearnedIn = AgentTask.FirstOrDefault(t => t.Id == said.Task),
   };
+  Raise(new AgentInstructionProposed { Instruction = made });
+  return made.Id;
+}
+
+/// Corrections of one kind recur: heard as the app, once each correction is stored, whoever — or whatever — made it.
+[On] void ProposeWhenCorrectionsRecur(AgentWorkCorrected e) {
+  if (e.Correction.Kind == "" || e.Correction.WithdrawnAt != null) { return; }
+  ProposeFromRecurringCorrections(e.Correction.Agent, e.Correction.Kind);
+}
+
+/// ⭐ WHAT CORRECTIONS THAT RECUR PROPOSE. When `TeachingSetup.ProposeAfter` corrections of one kind of an agent's
+/// work count — not taken back, not yet drawn into any instruction — one instruction is proposed, drawn from them all:
+/// what each said right looks like, as its guidance, and why they recurred. Nothing is proposed while one drawn from
+/// that kind still waits for a person. Answers its id; null — nothing was proposed.
+///
+/// ⚑ PROPOSED, NEVER MORE: nobody is signed in where it runs, and `ActivateAgentInstruction` is a teacher's alone.
+[Server, Authorize(UsesAgents)]
+internal Guid? ProposeFromRecurringCorrections(string agent, string kind) {
+  var after = App.Setting<TeachingSetup>().ProposeAfter;
+  if (after <= 0 || kind == "") { return null; }
+  List<string> drawn = [];
+  foreach (var s in AgentInstructionSource.Where(x => x.Correction.Agent == agent && x.Correction.Kind == kind).Take(5000).ToList()) {
+    if (s.Instruction.State == InstructionState.Proposed) { return null; }
+    drawn.Add(s.Correction.Id.ToString());
+  }
+  List<AgentCorrection> open = [];
+  foreach (var c in AgentCorrection.Where(x => x.Agent == agent && x.Kind == kind && x.WithdrawnAt == null && x.ErasedAt == null).OrderBy(x => x.At).Take(1000).ToList()) {
+    if (!drawn.Contains(c.Id.ToString())) { open.Add(c); }
+  }
+  if (open.Count < after) { return null; }
+  // What right looks like, as each said it — each said once, oldest first; the skill, when they share one.
+  var skill = open[0].Skill;
+  List<string> rights = [];
+  foreach (var c in open) {
+    if (c.Skill != skill) { skill = ""; }
+    if (!rights.Contains(c.Right)) { rights.Add(c.Right); }
+  }
+  var words = CheckedDraft(new InstructionDraft {
+    Agent = agent, Skill = skill, Guidance = Clipped(string.Join(" ", rights), 600),
+    Why = $"{open.Count} corrections of the kind \"{kind}\" recurred and none had been drawn into an instruction. The latest said why: {open[open.Count - 1].Because}",
+  });
+  var made = new AgentInstruction { Agent = agent, Skill = skill, Guidance = words.Guidance, Why = words.Why, DrawnFrom = open.Count };
+  foreach (var c in open) { new AgentInstructionSource { Instruction = made, Correction = c }; }
   Raise(new AgentInstructionProposed { Instruction = made });
   return made.Id;
 }

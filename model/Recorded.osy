@@ -1,0 +1,124 @@
+// Recorded work — a piece of an agent's work done OUTSIDE the kit's loop: by a person's session, a process of the
+// app's own, another system the app drives. The app records it as the agent's, and from then on it is a piece of the
+// agent's work like any other: one receipt and its record, the instruction set it ran under, corrections on it, and
+// what those corrections teach.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+
+/// What a piece of recorded work was opened with, and is to be sent — what `BeginAgentWork` answers.
+///
+/// ⚑ SEND `Guidance` AS IT IS. It is what the receipt says the work ran with (`AgentTask.InstructionsHash` is its
+///   SHA-256); a worker sent anything else did work the record does not describe.
+public class RecordedWorkStart {
+  /// The receipt.
+  public Guid Task;
+  /// The agent's instruction set as the work started; the instructions the work is sent, by their ids in the order
+  /// they are said; the text to send, word for word ("" — none); and its SHA-256 ("" — none).
+  public int InstructionSet = 0;
+  public List<string> Instructions = [];
+  public string Guidance = "";
+  public string GuidanceHash = "";
+}
+
+/// The skill of an agent a piece of recorded work is on: null for "" (the agent as a whole), refused when the agent
+/// does not hold it.
+SkillBase? RecordedSkill(Agent definition, string agent, string skill) {
+  if (skill == "") { return null; }
+  foreach (var s in definition.Skills) { if (SkillNameOf(s) == skill) { return s; } }
+  throw new SkillNotHeld($"{BareName(agent)} does not hold the skill {BareName(skill)}. Work is recorded as the agent's only "
+    + $"for a skill its class lists: `public override List<SkillBase> Skills => [new {BareName(skill)}()];`");
+}
+
+/// What recorded work is charged to, for the instructions that apply to it: the agent, and the skill.
+List<string> RecordedScopes(string agent, string skill) {
+  List<string> scopes = ["agent:" + agent];
+  if (skill != "") { scopes.Add("skill:" + skill); }
+  return scopes;
+}
+
+/// ⭐ WHAT AN AGENT IS TOLD NOW, for a skill ("" — the agent as a whole), for work done for whoever is signed in: its
+/// instruction set, the active instructions that apply, and their text exactly as a piece of work is sent it.
+///
+/// For a look before the work. Work that is recorded takes what it is sent from `BeginAgentWork`, read in the same
+/// instant its receipt is written: an instruction made active in between would otherwise be in one and not the other.
+[Server, Authorize(UsesAgents)]
+public InstructionsToWork GuidanceFor(string agent, string skill = "") {
+  RecordedSkill(Definition(agent), agent, skill);
+  return InstructionsFor(agent, skill, Security.CurrentUserId, RecordedScopes(agent, skill));
+}
+
+/// ⭐ OPEN A PIECE OF WORK DONE OUTSIDE THE KIT'S LOOP, as the agent's: its receipt (`Cause` = `Recorded`) with the
+/// instruction set it starts under, read here and never taken from the caller, and the text the worker is to be sent.
+/// Close it with `FinishAgentWork` when the work is done.
+///
+///     var work = BeginAgentWork(Agents.Of<Classifier>().Name, typeof(Classify).FullName, about: "Ticket 4411");
+///     var answer = RunElsewhere(work.Guidance, ticket);            // the worker is sent exactly what is recorded
+///     FinishAgentWork(work.Task, JsonSerializer.Serialize(answer), "Classified as billing.");
+///
+/// Refused — before anything is written — when the agent has no sponsor or is paused, exactly as `Do` is. Done for
+/// whoever is signed in; nobody when the app's own code records it.
+[Server, Authorize(UsesAgents)]
+public RecordedWorkStart BeginAgentWork(string agent, string skill, string about = "", string given = "") {
+  var definition = Definition(agent);
+  var held = RecordedSkill(definition, agent, skill);
+  var person = Security.CurrentUserId;
+  // SECURITY-INVARIANT(agents-recorded-work-says-what-it-was-sent): the set, the ids and the hash on the receipt are
+  // read here, from the agent's active instructions, in the call that writes the receipt — and the text answered is
+  // that same reading. Taking any of them from the caller lets a record claim guidance the work was never sent, and
+  // corrections then teach against the wrong set. Guarded by tests/recorded.test.osy
+  // `recorded_work_carries_the_set_it_ran_under_and_the_next_carries_the_new_one`.
+  var told = InstructionsFor(agent, skill, person, RecordedScopes(agent, skill));
+  var inRun = Workflow.Current;
+  var task = OpenAgentTask(new AgentTaskOpening {
+    Agent = agent, Skill = skill, SkillVersion = held == null ? "" : held!.Version, Cause = AgentTaskCause.Recorded,
+    InstructionSet = told.Set, InstructionsSent = string.Join("\n", told.Ids), InstructionsHash = told.Hash,
+    Account = Actor.Of(definition.GetType()), Requester = person, About = about, Given = given,
+    Run = inRun?.Id, RunWorkflow = inRun == null ? "" : inRun.Workflow, RunState = inRun == null ? "" : inRun.State,
+    RunItem = inRun?.Item, RunStarter = inRun?.Starter,
+  });
+  AppendAgentTrace(task, task, new TraceEntry {
+    Kind = TraceKind.Started,
+    Summary = $"{BareName(agent)} was given {(skill == "" ? "work" : Words(BareName(skill)).ToLower())}" + (about == "" ? "" : $": {about}")
+      + ", done outside the kit and recorded." + ToldWords(told),
+  });
+  return new RecordedWorkStart { Task = task, InstructionSet = told.Set, Instructions = told.Ids, Guidance = told.Text, GuidanceHash = told.Hash };
+}
+
+/// ⭐ CLOSE A PIECE OF RECORDED WORK: what it handed back (JSON of the skill's result, or the words of an answer) and
+/// how it ended, in a sentence. `failed`: it could not finish. For whoever began it — the app's own code for work the
+/// app's own code began — and whoever supervises the agents. Work the kit's loop did is closed by the loop alone.
+[Server, Authorize(UsesAgents)]
+public void FinishAgentWork(Guid task, string? resultJson, string outcome, bool failed = false) {
+  var receipt = AgentTask.FirstOrDefault(t => t.Id == task);
+  if (receipt == null) { throw new ValidationException("There is no such piece of work, or it is not yours to read."); }
+  if (receipt!.Cause != AgentTaskCause.Recorded) {
+    throw new AgentRefused("This piece of work was done by the kit, and the kit closes it. Only work recorded with `BeginAgentWork` is closed here.");
+  }
+  if (receipt!.Status != AgentTaskStatus.Working) { throw new AgentRefused($"This piece of work has ended: {receipt!.Status.Label.ToLower()}."); }
+  var me = Security.CurrentUserId;
+  var began = receipt!.StartedBy == null ? null : receipt!.StartedBy!.Id;
+  if (me != began) {
+    var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+    if (person == null || !Security.Authorize(person!, SupervisesAgents)) {
+      throw new AgentRefused("Recorded work is closed by whoever began it, or by whoever supervises the agents.");
+    }
+  }
+  var status = failed ? AgentTaskStatus.Failed : AgentTaskStatus.Done;
+  AppendAgentTrace(receipt!.Root == null ? task : receipt!.Root!.Id, task, new TraceEntry {
+    Kind = TraceKind.Ended, Summary = $"{status.Label}. {outcome}", PayloadJson = failed ? null : resultJson,
+  });
+  CloseAgentTask(task, status, outcome, failed ? null : resultJson);
+}
+
+/// ⭐ RECORD A PIECE OF WORK DONE OUTSIDE THE KIT'S LOOP, in one step — `BeginAgentWork` and `FinishAgentWork` at once,
+/// for work that was over before the app came to record it. Answers its receipt.
+///
+/// ⚑ IT RAN UNDER THE SET ACTIVE NOW. Work that was sent its guidance earlier opens with `BeginAgentWork` when it
+///   starts, so the receipt says what it was really sent.
+[Server, Authorize(UsesAgents)]
+public Guid RecordAgentWork(string agent, string skill, string about, string given, string? resultJson, string outcome, bool failed = false) {
+  var work = BeginAgentWork(agent, skill, about, given);
+  FinishAgentWork(work.Task, resultJson, outcome, failed);
+  return work.Task;
+}

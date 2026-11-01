@@ -25,13 +25,23 @@ public enum CorrectionSeverity {
   [Label("Serious")] Serious,
 }
 
+/// Who a correction is from. ⚠ Appended, never inserted.
+public enum CorrectionSource {
+  /// A person who saw the work said what was wrong (`CorrectAgentWork`).
+  [Label("A person")] Person,
+  /// Something that happened to the work afterwards showed it — a retry with a stronger model, a review that sent it
+  /// back, a conflict — and the app's own code said so (`CorrectAgentWorkFromOutcome`).
+  [Label("An outcome")] Outcome,
+}
+
 /// ⭐ ONE CORRECTION: on which piece of work and which part of it, what was wrong, what right looks like, why — and
 /// who says so.
 ///
 /// ⚑ A CORRECTION TEACHES NOTHING BY ITSELF. It is what an instruction is drawn from (`ProposeAgentInstruction`,
 ///   `DraftAgentInstruction`), and an instruction reaches the agent only once a person has made it active.
 ///
-/// Made only by `CorrectAgentWork`; what it says is never changed afterwards, only taken back or erased.
+/// Made only by `CorrectAgentWork` and `CorrectAgentWorkFromOutcome`; what it says is never changed afterwards, only
+/// taken back or erased.
 public entity AgentCorrection {
   /// The piece of work it corrects. Nobody: that work's record has since been deleted (`ForgetAgentWork`) — its
   /// words went with the record, and the correction is kept as a count: that this agent's work was corrected, when,
@@ -64,8 +74,12 @@ public entity AgentCorrection {
   /// An instruction the work HAD been sent and did not follow, when whoever corrects says so.
   [Immutable] AgentInstruction? Despite;
 
-  /// Who corrected it. Nobody: they have been taken off it.
+  /// Who corrected it. Nobody: they have been taken off it — or an outcome did (`Source`).
   [Classification(Personal.Identity)] Principal? By;
+  /// A person, or an outcome the app saw; and what kind of mistake it was, in the app's own words — `retry-stronger`,
+  /// `review-returned` — which is what corrections that recur are counted by (`TeachingSetup.ProposeAfter`). "": unsaid.
+  [Immutable] CorrectionSource Source = CorrectionSource.Person;
+  [Immutable, MaxLength(100), Index] string Kind = "";
   [Immutable] DateTime At = DateTime.UtcNow;
   /// It was taken back — a correction that was itself mistaken — and no longer counts.
   DateTime? WithdrawnAt;
@@ -78,8 +92,13 @@ public entity AgentCorrection {
     // Whoever wrote it; whoever the work was for and whoever gave it; and everybody in charge of the agents.
     allow read when IsAuthenticated where By == user || Task.Requester == user || Task.StartedBy == user;
     allow read when SupervisesAgents || AuditsAgents || TeachesAgents || ErasesAgentRecords;
-    allow create when IsAuthenticated;
-    deny create except via CorrectAgentWork;
+    allow create when IsAuthenticated || UsesAgents;
+    // SECURITY-INVARIANT(agents-an-outcome-corrects-but-never-teaches): a correction is made by these two functions
+    // alone. The second is for the app's own code, with nobody signed in, and makes a correction BY nobody: it is
+    // counted (`EffectOf`) and may lead to a PROPOSED instruction, never to an active one — making one active is
+    // `RequireTeacher`'s, which refuses code running as the app. Guarded by tests/recorded.test.osy
+    // `an_outcome_corrects_the_work_with_nobody_signed_in_and_activates_nothing`.
+    deny create except via CorrectAgentWork, CorrectAgentWorkFromOutcome;
     allow update when IsAuthenticated where By == user;
     allow update when SupervisesAgents || TeachesAgents || ErasesAgentRecords;
     deny update WithdrawnAt, WithdrawnWhy except via WithdrawAgentCorrection;
@@ -111,6 +130,8 @@ public class Correction {
   public Guid? Proposal;
   /// An instruction the work had been sent and did not follow.
   public Guid? Despite;
+  /// What kind of mistake it was, in the app's own words — what recurring corrections are counted by. "": unsaid.
+  public string Kind = "";
 }
 
 /// A piece of an agent's work was corrected.
@@ -165,6 +186,51 @@ public AgentCorrection CorrectAgentWork(AgentTask task, Correction correction) {
     Wrong = Clipped(correction.Wrong.Trim(), 2000), Right = Clipped(correction.Right.Trim(), 2000),
     Because = Clipped(correction.Because.Trim(), 2000), CorrectedOutput = correction.CorrectedOutput,
     Severity = correction.Severity, InstructionSet = task.InstructionSet, Sent = task.InstructionsSent, Despite = despite, By = person,
+    Source = CorrectionSource.Person, Kind = Clipped(correction.Kind.Trim(), 100),
+  };
+  Raise(new AgentWorkCorrected { Correction = made });
+  return made;
+}
+
+/// ⭐ CORRECT A PIECE OF WORK FROM WHAT HAPPENED TO IT AFTERWARDS — the app's own code saw the outcome: the work was
+/// tried again with a stronger model, a review sent it back, what it made conflicted. `outcome` names the kind of
+/// mistake in the app's words (`"retry-stronger"`), and corrections of one kind that recur propose an instruction
+/// (`TeachingSetup.ProposeAfter`). Answers the correction.
+///
+///     CorrectAgentWorkFromOutcome(task, new Correction {
+///       Wrong = "It classified the change as small.", Right = "A change to the schema is never small.",
+///       Because = "It had to be retried with the stronger model.",
+///     }, outcome: "retry-stronger");
+///
+/// By nobody — it is an outcome's, not a person's — so it may be called where nobody is signed in. A person who is
+/// signed in corrects this way only work they may read.
+///
+/// ⚑ IT TEACHES NOTHING BY ITSELF, like any correction: an instruction it leads to is proposed, and active only once
+///   a person who teaches the agents has made it so.
+[Server, Authorize(UsesAgents)]
+public AgentCorrection CorrectAgentWorkFromOutcome(AgentTask task, Correction correction, string outcome) {
+  if (outcome.Trim() == "") { throw new ValidationException("Say what the outcome was, as a kind the app counts by: retry-stronger, review-returned."); }
+  if (correction.Wrong.Trim() == "") { throw new ValidationException("Say what was wrong."); }
+  if (correction.Right.Trim() == "") { throw new ValidationException("Say what it should have been."); }
+  if (correction.Because.Trim() == "") { throw new ValidationException("Say why: what the outcome showed."); }
+  if (correction.Proposal != null || correction.Step > 0) {
+    throw new ValidationException("An outcome corrects the work as a whole, not one step or proposal of it.");
+  }
+  // Read as the caller: a person signed in corrects only work they may read.
+  if (Security.CurrentUserId != null && !AgentTask.Any(t => t.Id == task.Id)) {
+    throw new AgentRefused("This piece of work is not yours to correct.");
+  }
+  AgentInstruction? despite = null;
+  if (correction.Despite != null) {
+    despite = AgentInstruction.FirstOrDefault(i => i.Id == correction.Despite);
+    if (despite == null || despite!.Agent != task.Agent) { throw new ValidationException("That instruction is not one of this agent's."); }
+  }
+  var made = new AgentCorrection {
+    Task = task, Agent = task.Agent, Skill = task.Skill, About = CorrectionAbout.Result,
+    Wrong = Clipped(correction.Wrong.Trim(), 2000), Right = Clipped(correction.Right.Trim(), 2000),
+    Because = Clipped(correction.Because.Trim(), 2000), CorrectedOutput = correction.CorrectedOutput,
+    Severity = correction.Severity, InstructionSet = task.InstructionSet, Sent = task.InstructionsSent, Despite = despite,
+    Source = CorrectionSource.Outcome, Kind = Clipped(outcome.Trim(), 100),
   };
   Raise(new AgentWorkCorrected { Correction = made });
   return made;

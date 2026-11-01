@@ -1,0 +1,35 @@
+// Work done outside the kit, recorded as the inspector's: crates graded by hand at the bench, and buyers who send a
+// crate back afterwards — an outcome the packhouse's own code hears, with nobody signed in, and corrects the work from.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+
+/// A buyer sent back a crate whose grading was a piece of the inspector's work — `Kind` is why, in the packhouse's
+/// words, and `Right` what the grading should have done.
+[Event("Crate sent back")]
+public sealed class CrateSentBack { public Guid Task; public string Kind; public string Right; }
+
+/// Somebody at the desk says a buyer sent a crate back. The packhouse's own code hears it, as the app.
+public void BuyerSentBack(Guid task, string kind, string right) { Raise(new CrateSentBack { Task = task, Kind = kind, Right = right }); }
+
+/// The packhouse's own code corrects the work from the outcome — nobody is signed in where it runs — and notes whose
+/// the correction is.
+[On] void CorrectFromSentBack(CrateSentBack e) {
+  var task = AgentTask.Single(t => t.Id == e.Task);
+  var made = CorrectAgentWorkFromOutcome(task, new Correction {
+    Wrong = "The buyer sent the crate back.", Right = e.Right, Because = "A crate the buyer sends back was graded wrong.",
+  }, e.Kind);
+  new Heard { What = "outcome", About = made.By == null ? "by nobody" : "by " + made.By!.Id.ToString() };
+}
+
+/// …and tries to make active whatever corrections that recur propose, noting what it is told.
+[On] void AdoptWhatRecurs(AgentInstructionProposed e) {
+  if (!e.Instruction.Why.Contains("recurred")) { return; }
+  try {
+    ActivateAgentInstruction(e.Instruction, "Adopted by the packhouse's own code.");
+    new Heard { What = "recurring", About = "active" };
+  } catch (Exception x) {
+    new Heard { What = "recurring", About = x.Message };
+  }
+}

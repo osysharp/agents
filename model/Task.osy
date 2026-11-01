@@ -9,6 +9,9 @@ public enum AgentTaskCause {
   [Label("Called")] Call,
   /// Somebody asked it something: `Ask` or `Stream`.
   [Label("Asked")] Chat,
+  /// It was done outside the kit's loop — by a person's session, a process of the app's own, another system — and the
+  /// app recorded it as the agent's work (`RecordAgentWork`, `BeginAgentWork`).
+  [Label("Recorded")] Recorded,
 }
 
 /// Where a piece of work stands. ⚠ Appended, never inserted.
@@ -28,7 +31,8 @@ public enum AgentTaskStatus {
 }
 
 /// ⭐ THE RECEIPT of one piece of work: the agent and the skill, who asked and as whom it ran, what it cost and how
-/// it ended. Every `Do`, `Ask` and `Stream` makes exactly one; nobody writes one by hand.
+/// it ended. Every `Do`, `Ask` and `Stream` makes exactly one, and so does every piece of work done elsewhere that
+/// the app records as the agent's (`RecordAgentWork`); nobody writes one by hand.
 ///
 /// Made and changed only by this package's own functions. An app reads it — and adds what its own work needs to it
 /// (`partial entity AgentTask { ExpenseReport? Report; }`).
