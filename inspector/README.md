@@ -3,8 +3,8 @@
 One piece of an AI agent's work, on one page, readable by a person who was not there.
 
 ```osy
-use Osysharp.Agents@1;
-use Osysharp.Agents.Inspector@2;
+use Osysharp.Agents@2;
+use Osysharp.Agents.Inspector@3;
 
 app.AgentInspector = new AgentInspectorSetup { WorkPage = "/work/{task}/{step}" };
 
@@ -81,7 +81,7 @@ osy test kits/agents-inspector/tests --pixels   # the same in a real browser, ph
 
 ## Source and package
 
-- Package: `Osysharp.Agents.Inspector` — `use Osysharp.Agents.Inspector@2;`
+- Package: `Osysharp.Agents.Inspector` — `use Osysharp.Agents.Inspector@3;`
 - Source: [`kits/agents-inspector`](.) — `model/Inspect.osy` (what the page reads), `model/ui/Work.osy` (the page)
 - Uses [`Osysharp.Agents`](../agents) (receipts, records, proposals, help, instructions), [`Osysharp.Llm`](../llm)
   and `Osysharp.Ui`.
