@@ -67,7 +67,7 @@ void PutProposal(AgentProposed e) {
   var toQueue = p.DecideQueue != "";
   if (p.Status != ProposalStatus.Waiting || (p.DecideBy == null && !toQueue)) { return; }
   var setup = App.Setting<AgentRequestsSetup>();
-  PutRequest(new NewRequest {
+  var request = PutRequest(new NewRequest {
     Kind = RequestKind.Approval, To = toQueue ? null : p.DecideBy, Queue = toQueue ? p.DecideQueue : setup.Queue,
     // A proposal its skill sends elsewhere is not decided by the person the work is for, though they work that queue.
     NotBy = p.Routed ? p.Task.Requester : null,
@@ -82,6 +82,8 @@ void PutProposal(AgentProposed e) {
     AskedByName = AskerWords(p.Agent, p.AskedThrough), AskedByAgent = true,
     Within = setup.DecideWithin, ExpireAfter = setup.GiveUpAfter, Hours = HoursOf(setup),
   });
+  // Its answer is given in this request, and nowhere else: a `GivenAnswer` rolls up to the request it was given in.
+  AwaitProposalAnswerIn(p, request);
 }
 
 /// What a proposal would do, as facts for a request: what it does, for whom the work is, each argument as the skill
@@ -134,14 +136,17 @@ void CarryAnswer(HumanRequestAnswered e) {
   if (r.SubjectType == ProposalSubject) {
     var proposal = AgentProposal.FirstOrDefault(p => p.Id == r.SubjectId);
     if (proposal == null || proposal!.Status != ProposalStatus.Waiting) { return; }
-    // SECURITY-INVARIANT(agents-an-inbox-yes-is-the-answerers): the decision carried to the proposal names the person
-    // the request recorded as having answered — never whoever asked, and never the app — so the tool runs as them.
-    // Guarded by tests/proposals.test.osy `approving_in_the_inbox_runs_it_as_whoever_approved`.
+    // SECURITY-INVARIANT(agents-an-inbox-yes-is-the-answerers): the decision carried to the proposal is the platform's
+    // record of the answer — `GivenAnswer`, made in the answerer's own request, whose `[CreatedBy]` is them — never a
+    // person named here, never whoever asked, and never the app; so the tool runs as them. An answer through a link
+    // records nobody, and a yes from nobody decides nothing. Guarded by
+    // tests/onboarding.test.osy `approving_in_the_inbox_runs_it_as_whoever_approved`.
+    var given = GivenAnswer.FirstOrDefault(g => g.Request == r);
     if (r.Choice == ApproveKey()) {
-      if (r.AnsweredBy == null) { return; }
-      RelayProposalDecision(proposal!, true, "", r.AnsweredBy);
+      if (given == null || given!.AnsweredBy == null) { return; }
+      RelayProposalDecision(proposal!, true, "", given);
     } else {
-      RelayProposalDecision(proposal!, false, r.Comment, r.AnsweredBy);
+      RelayProposalDecision(proposal!, false, r.Comment, given);
     }
     return;
   }
@@ -174,7 +179,7 @@ void WentUnanswered(HumanRequest r, string why) {
   if (r.SubjectId == null) { return; }
   if (r.SubjectType == ProposalSubject) {
     var proposal = AgentProposal.FirstOrDefault(p => p.Id == r.SubjectId);
-    if (proposal != null && proposal!.Status == ProposalStatus.Waiting) { RelayProposalDecision(proposal!, false, why, null); }
+    if (proposal != null && proposal!.Status == ProposalStatus.Waiting) { RelayProposalDecision(proposal!, false, why); }
   }
   if (r.SubjectType == QuestionSubject) {
     var question = AgentHelp.FirstOrDefault(h => h.Id == r.SubjectId);

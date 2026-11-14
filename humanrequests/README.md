@@ -8,9 +8,9 @@ An agent that may not do something alone proposes it. An agent that needs a pers
 bridge between them: nothing to wire.
 
 ```osy
-use Osysharp.Agents@1;
+use Osysharp.Agents@2;
 use Osysharp.HumanRequests@1;
-use Osysharp.Agents.HumanRequests@1;
+use Osysharp.Agents.HumanRequests@2;
 
 [Actor(Roles = [OfficeRole.Vetting])]
 public class Vetter : Agent {

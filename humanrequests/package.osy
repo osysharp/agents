@@ -5,7 +5,7 @@
 // with its options — and their answer goes back to the work that waits for it:
 //
 //     app Purchasing {
-//       use Osysharp.Agents@1;
+//       use Osysharp.Agents@2;
 //       use Osysharp.HumanRequests@1;        // …and this bridge is there: nothing to wire.
 //     }
 //
@@ -16,17 +16,17 @@
 //   item to the agent's own account and the work to the agent; when the work ends the item comes back to whoever
 //   handed it over, with what the agent found. `AgentDesk.TakeBack(item)` calls the work off and takes the item.
 package Osysharp.Agents.HumanRequests {
-  version     "1.5.0";
-  minPlatform "0.17.0";
+  version     "2.0.0";
+  minPlatform "0.19.0";
   summary     "an agent's proposals and questions as requests in the work queue of the person they are for: the proposal shown as the exact call, why, and what the agent had looked at; approve, reject with a reason, or approve and let it do this alone from now on; the answer carried back to the waiting work; an inbox item handed to an agent and taken back; work an agent gave up on put to its sponsor; and the tree of a piece of agent work on its page — who is doing what, where each piece stands, whom it waits for and what it cost.";
-  completes   Osysharp.Agents@1, Osysharp.HumanRequests@1;
+  completes   Osysharp.Agents@2, Osysharp.HumanRequests@1;
 
   model "model/**/*.osy";
   tests "tests";
   // Who handed an item to an agent.
   personal Identity;
   personal Content;
-  use Osysharp.Agents@1;
+  use Osysharp.Agents@2;
   use Osysharp.HumanRequests@1;
   use Osysharp.WorkQueues@1;
   use Osysharp.Llm@2;
