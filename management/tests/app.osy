@@ -6,12 +6,12 @@
 app FilmArchive {
   model "model/**/*.osy";
   tests "**/*.test.osy";
-  use Osysharp.Agents@1;
-  use Osysharp.Agents.Testing@1;
-  use Osysharp.Agents.Teaching@1;
-  use Osysharp.Agents.Inspector@2;
-  use Osysharp.Agents.HumanRequests@1;
-  use Osysharp.Agents.Management@2;
+  use Osysharp.Agents@2;
+  use Osysharp.Agents.Testing@2;
+  use Osysharp.Agents.Teaching@2;
+  use Osysharp.Agents.Inspector@3;
+  use Osysharp.Agents.HumanRequests@2;
+  use Osysharp.Agents.Management@3;
   use Osysharp.HumanRequests@1;
   use Osysharp.WorkQueues@1;
   use Osysharp.Llm@2;

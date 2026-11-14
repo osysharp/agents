@@ -4,8 +4,8 @@ The place a person runs an app's AI agents from: every agent, all their work, ev
 standing rules that let them do more alone, what they cost, and who may do what.
 
 ```osy
-use Osysharp.Agents@1;
-use Osysharp.Agents.Management@2;
+use Osysharp.Agents@2;
+use Osysharp.Agents.Management@3;
 
 // Three routes, and all of it is there. A request opens in the inbox.
 [Route("/agents")]                [Authorize(UsesAgents)] component Agents()                              { render { AgentsManagement(request: r => "/inbox/open/i/" + r); } }
@@ -111,7 +111,7 @@ osy test kits/agents-management/tests --pixels   # the same in a real browser, p
 
 ## Source and package
 
-- Package: `Osysharp.Agents.Management` — `use Osysharp.Agents.Management@2;`
+- Package: `Osysharp.Agents.Management` — `use Osysharp.Agents.Management@3;`
 - Source: [`kits/agents-management`](.) — `model/Agents.osy`, `Work.osy`, `Controls.osy`, `Waiting.osy`,
   `Autonomy.osy`, `Spending.osy`, `Roles.osy` (what the screens read and send), `model/ui/Shell.osy`
   (`AgentsManagement`), `ui/Agents.osy`, `ui/Work.osy`, `ui/Screens.osy`
@@ -123,7 +123,7 @@ osy test kits/agents-management/tests --pixels   # the same in a real browser, p
 ## Changes
 
 - 2.0.0: `WorkRow` is internal to the kit. It was never meant as part of its surface, and `Osysharp.Assignments` has a
-  control of the same name. Pin `@2`, which uses `Osysharp.Agents.Inspector@2`.
+  control of the same name. Pin `@3`, which uses `Osysharp.Agents.Inspector@3`.
 
 ## Examples
 
