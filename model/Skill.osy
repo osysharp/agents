@@ -48,6 +48,16 @@ public class SkillBase {
   /// proposed, the yes still runs the tool as whoever says it, and whoever the app's `DecidesAgentProposals` admits
   /// may still decide.
   public virtual ProposalRoute? DecidedBy(string action) { return null; }
+  /// ⭐ THE SAME, FOR ONE PROPOSAL — with the arguments the model gave the tool, as JSON — for a skill whose decider
+  /// is whoever holds a role on the record the proposal is about: a region's plan is its lead's to approve.
+  ///
+  ///     public override ProposalRoute? DecidedBy(string action, string argumentsJson) =>
+  ///       ProposalRoute.ToPerson(RegionIn(argumentsJson).Lead);
+  ///
+  /// It only says who is ASKED: the agent's work is not done for them, and a yes still runs the tool as whoever says
+  /// it. Where no proposal is in hand — the agent's own page — `argumentsJson` is "", and a skill that can only say
+  /// from the arguments throws: the page then says the skill names somebody. Unless overridden, `DecidedBy(action)`.
+  public virtual ProposalRoute? DecidedBy(string action, string argumentsJson) { return DecidedBy(action); }
 
   /// The type it is given and the type it hands back, by full name, and each one's JSON Schema.
   public virtual string Takes() { return ""; }
@@ -239,7 +249,7 @@ public class Skills {
       ProposalRoute? route = null;
       var named = false;
       if (leave == Leave.Propose || leave == Leave.ProposeEveryTime) {
-        try { route = skill.DecidedBy(tool.Name); } catch (Exception e) { named = true; }
+        try { route = skill.DecidedBy(tool.Name, ""); } catch (Exception e) { named = true; }
       }
       info.Tools.Add(new SkillToolInfo {
         Action = tool.Name, Label = tool.Label, Description = tool.Description, ReadsOnly = tool.Query,

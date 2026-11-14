@@ -401,17 +401,21 @@ void a_proposal_is_decided_only_through_the_kit_by_who_it_is_put_to() {
 [Test(Yard)]
 void nobody_borrows_a_colleagues_rights_through_an_agent() {
   // An agent's tools run for whoever the work is for. Ben is a grower; so is Ada. Ben may not touch Ada's crates —
-  // and he may not have the clerk do it "for Ada" either.
+  // and he may not have the clerk do it "for Ada" either — not even for a note she wrote.
+  Note bens;
+  Note adas;
+  runas (Ben) { bens = WriteNote(Crate.Single(c => c.Code == "B-1"), "Settle mine."); UnitOfWork.Commit(); }
+  runas (Ada) { adas = WriteNote(Crate.Single(c => c.Code == "A-1"), "Settle mine."); UnitOfWork.Commit(); }
   runas (Ben) {
     var script = AgentScript.Of(Says.HandBack(new Grade { Score = 5 }));
     ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
     var own = Crate.Single(c => c.Code == "B-1");
-    var refused = Assert.Throws<AgentRefused>(() => SettleFor(Ada, own));
+    var refused = Assert.Throws<AgentRefused>(() => SettleFor(Note.Single(n => n.Id == adas.Id), own));
     Assert.StartsWith("You may give Clerk work for yourself, not for somebody else", refused.Message);
     // Nothing was opened: no receipt, no call to a model.
     Assert.Equal(0, AgentTask.Count());
     // Naming himself is always his to do.
-    var mine = SettleFor(Ben, own);
+    var mine = SettleFor(Note.Single(n => n.Id == bens.Id), own);
     Assert.True(mine.Done);
     Assert.Equal(Ben.Id, AgentTask.Single().Requester!.Id);
   }
@@ -420,7 +424,7 @@ void nobody_borrows_a_colleagues_rights_through_an_agent() {
     var crate = Crate.Single(c => c.Code == "A-1");
     var script = AgentScript.Of(Says.HandBack(new Grade { Score = 6 }));
     ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
-    var outcome = SettleFor(Ada, crate);
+    var outcome = SettleFor(Note.Single(n => n.Id == adas.Id), crate);
     Assert.True(outcome.Done);
     var receipt = AgentTask.Single(t => t.Id == outcome.Task);
     Assert.Equal(Ada.Id, receipt.Requester!.Id);
@@ -494,4 +498,75 @@ void a_workflow_waits_with_the_work_and_goes_on_when_the_person_has_decided() {
     Assert.Equal("Short: the claim stands.", c.Finding);
     Assert.Equal("short", Crate.Single(x => x.Code == "A-2").Flag);
   }
+}
+
+/// A yes carried from somewhere else is judged for whoever MADE the answer, as the platform recorded them — no code
+/// names the person — and a yes nobody is recorded as giving decides nothing.
+[Test(Yard)]
+void a_relayed_yes_is_judged_for_whoever_made_the_answer() {
+  Guid proposal;
+  Guid bens;
+  // A note made with nobody signed in records no maker.
+  var slip = WriteSlip("The clerk's proposal");
+  var nobodys = AnswerOn(slip, "Unsigned.");
+  UnitOfWork.Commit();
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool("It is bruised.", Actions.Of(FlagCrate), FlagArgs(crate, "bruised")),
+      Says.HandBack(new Grade { Score = 5 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Assert.True(Settle(crate).Waiting);
+    proposal = AgentProposal.Single().Id;
+    PutProposalOn(AgentProposal.Single(), Slip.Single(x => x.Id == slip.Id));
+    UnitOfWork.Commit();
+    // A yes nobody is recorded as giving decides nothing.
+    RelayYes(AgentProposal.Single(), Note.Single(n => n.Id == nobodys.Id));
+    UnitOfWork.Commit();
+    Assert.StartsWith("A yes is somebody's:", Heard.Single(h => h.What == "relay refused").About);
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+  }
+  // Ben answers on the slip: the platform records him as the note's maker.
+  runas (Ben) { bens = AnswerOn(Slip.Single(x => x.Id == slip.Id), "Looks fine to me.").Id; UnitOfWork.Commit(); }
+  // Carried with Ben's note, the yes is Ben's: the tool runs for him, and he may not touch Ada's crate.
+  runas (Ada) {
+    RelayYes(AgentProposal.Single(), Note.Single(n => n.Id == bens));
+    UnitOfWork.Commit();
+    Assert.Equal("Failed", Heard.Single(h => h.What == "relayed").About);
+  }
+  runas (Dana) {
+    Assert.Equal("", Crate.Single(c => c.Code == "A-1").Flag);
+    Assert.Equal(Ben.Id, AgentProposal.Single(p => p.Id == proposal).DecidedBy!.Id);
+  }
+}
+
+[Test(Yard)]
+void an_answer_given_elsewhere_decides_nothing() {
+  var ours = WriteSlip("The clerk's proposal");
+  var theirs = WriteSlip("Something else Ben was asked");
+  UnitOfWork.Commit();
+  // Ben said yes on another slip — to something else entirely.
+  Guid elsewhere;
+  runas (Ben) { elsewhere = AnswerOn(Slip.Single(x => x.Id == theirs.Id), "Yes.").Id; UnitOfWork.Commit(); }
+  runas (Ada) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    var script = AgentScript.Of(
+      Says.Tool("It is bruised.", Actions.Of(FlagCrate), FlagArgs(crate, "bruised")),
+      Says.HandBack(new Grade { Score = 5 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    Assert.True(Settle(crate).Waiting);
+    // Put nowhere yet: no answer is this proposal's.
+    RelayYes(AgentProposal.Single(), Note.Single(n => n.Id == elsewhere));
+    UnitOfWork.Commit();
+    Assert.StartsWith("That answer was not given where this proposal was put", Heard.Single(h => h.What == "relay refused").About);
+    // Put on its own slip: Ben's yes on the other slip is still not its answer.
+    PutProposalOn(AgentProposal.Single(), Slip.Single(x => x.Id == ours.Id));
+    UnitOfWork.Commit();
+    RelayYes(AgentProposal.Single(), Note.Single(n => n.Id == elsewhere));
+    UnitOfWork.Commit();
+    Assert.Equal(2, Heard.Count(h => h.What == "relay refused" && h.About.StartsWith("That answer was not given where this proposal was put")));
+    Assert.Equal(0, Heard.Count(h => h.What == "relayed"));
+    Assert.Equal(ProposalStatus.Waiting, AgentProposal.Single().Status);
+  }
+  runas (Dana) { Assert.Equal("", Crate.Single(c => c.Code == "A-1").Flag); }
 }

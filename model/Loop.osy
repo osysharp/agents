@@ -170,7 +170,10 @@ AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillN
   var setup = App.Setting<AgentsSetup>();
   var dollars = skill.Budget ?? definition.Limits.PerTask ?? setup.TaskBudget;
   var limit = Micros(dollars);
-  var person = agent.ForSomebody ? (agent.Person == null ? null : agent.Person!.Id) : Security.CurrentUserId;
+  Guid? person = Security.CurrentUserId;
+  if (agent.ForSomebody) {
+    person = agent.Row != null ? Records.CreatedBy(agent.Row!) : agent.SameAs != null ? ActsForOf(agent.SameAs!) : null;
+  }
   var charged = string.Join("\n", agent.ChargedTo.Select(c => c.Scope));
   // Work handed on by another piece of work: for whoever THAT is for, with no more than it has left, charged where
   // it is charged — none of which is the caller's to say.
@@ -193,8 +196,9 @@ AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillN
     // Given in a workflow's run, it is a step of that process: the receipt says which. (Work handed on by other work
     // takes the run of the work above it, where the receipt is opened.)
     Run = inRun?.Id, RunWorkflow = inRun == null ? "" : inRun.Workflow, RunState = inRun == null ? "" : inRun.State,
-    RunItem = inRun?.Item, RunStarter = inRun?.Starter,
+    RunItem = inRun?.Item, RunStarter = inRun?.Starter, ForInBlock = above != null || agent.ForSomebody,
   });
+  if (above != null || agent.ForSomebody) { RecordWorkFor(task, agent, above); }
   var people = definition.People;
   var stop = skill.Stop;
   var run = new AgentRun {
@@ -542,7 +546,7 @@ LlmContentBlock RunTool(AgentRun run, SkillBase skill, LlmContentBlock asked) {
   if (gate.Leave != Leave.Alone) {
     // Where the skill sends what it proposes for this tool — else the person the work is for, or the sponsor.
     ProposalRoute? route = null;
-    try { route = run.Skill == "" ? null : skill.DecidedBy(tool!.Action); }
+    try { route = run.Skill == "" ? null : skill.DecidedBy(tool!.Action, input); }
     catch (Exception e) {
       // The skill names somebody who could not be found: it is put to nobody rather than to somebody else.
       Missed(run, $"{BareName(tool!.Action)} is proposed first, and whoever {BareName(run.Skill)} sends it to could not be found: {e.Message}");
@@ -606,6 +610,42 @@ LlmContentBlock RunTool(AgentRun run, SkillBase skill, LlmContentBlock asked) {
   return back;
 }
 
+/// Whom a piece of work is for, as its own record says — nobody when it records nobody.
+Guid? ActsForOf(Guid task) {
+  var record = AgentWorkFor.FirstOrDefault(w => w.Task == task);
+  return record == null ? null : record!.ActsFor;
+}
+
+/// Record whom a piece of work is for where its receipt could not: in a block acting for that person, as the agent,
+/// so the platform writes them (`AgentWorkFor.ActsFor`). Work that cannot be recorded so does not start.
+void RecordWorkFor(Guid task, AgentRef agent, WorkAbove? above) {
+  try {
+    if (above != null) {
+      // SECURITY-INVARIANT(agents-handed-on-work-is-for-whoever-the-work-above-is-for): handed-on work is for whoever
+      // the work above is for — as THAT work's own record says, read here, never what the work remembers.
+      var aboveFor = AgentWorkFor.FirstOrDefault(w => w.Task == above!.Task);
+      if (aboveFor == null || aboveFor!.ActsFor == null) {
+        runas (Actor.From(agent.Actor)) { MarkAgentWorkFor(task); }
+      } else {
+        runas (Actor.From(agent.Actor), onBehalfOf: aboveFor!.ActsFor) { MarkAgentWorkFor(task); }
+      }
+    } else if (agent.Row != null) {
+      runas (Actor.From(agent.Actor), onBehalfOf: Records.CreatedBy(agent.Row!)) { MarkAgentWorkFor(task); }
+    } else {
+      // Work tried again: for whoever the first piece of work was for — as ITS record says, read here.
+      var firstFor = agent.SameAs == null ? null : AgentWorkFor.FirstOrDefault(w => w.Task == agent.SameAs);
+      if (firstFor == null || firstFor!.ActsFor == null) {
+        runas (Actor.From(agent.Actor)) { MarkAgentWorkFor(task); }
+      } else {
+        runas (Actor.From(agent.Actor), onBehalfOf: firstFor!.ActsFor) { MarkAgentWorkFor(task); }
+      }
+    }
+  } catch (Exception e) {
+    CloseAgentTask(task, AgentTaskStatus.Failed, "It could not be started for whoever it is for: " + e.Message, null);
+    throw new AgentRefused($"{BareName(agent.Name)} cannot start this work for whoever it is for: {e.Message}");
+  }
+}
+
 /// ⭐ RUN ONE ACTION AS THE AGENT — its own account, and, when the work is for a person, never past what that person
 /// may do themselves. Every change it makes is recorded with the agent, the person and this piece of work.
 ActionResult RunAsAgent(AgentRun run, string action, string argumentsJson) {
@@ -614,11 +654,13 @@ ActionResult RunAsAgent(AgentRun run, string action, string argumentsJson) {
   var task = AgentTask.Single(t => t.Id == run.Task);
   // The account it runs as, by its key off the receipt — never read again as the caller, who need not see it.
   var actor = task.Actor;
-  if (run.Person == null) {
+  // For whom, as the platform recorded it when the work was opened — read again here, never what the work remembers.
+  // None recorded (work opened before it was): the agent alone.
+  var forWhom = AgentWorkFor.FirstOrDefault(w => w.Task == run.Task);
+  if (forWhom == null || forWhom!.ActsFor == null) {
     runas (Actor.From(actor), scope: task) { return Actions.Run(action, values, cause: cause); }
   }
-  var person = Principal.FirstOrDefault(p => p.Id == run.Person);
-  runas (Actor.From(actor), onBehalfOf: person, scope: task) { return Actions.Run(action, values, cause: cause); }
+  runas (Actor.From(actor), onBehalfOf: forWhom!.ActsFor, scope: task) { return Actions.Run(action, values, cause: cause); }
 }
 
 /// Stop the work where it stands, on a person: the record says so, its state is kept, and nothing more runs.

@@ -8,7 +8,7 @@ agent runs as an account of its own with the roles you gave it, and when it work
 more than that person could.
 
 ```osy
-use Osysharp.Agents@1;
+use Osysharp.Agents@2;
 
 /// Grades the fruit that arrives at the packhouse.
 [Actor(Roles = [PackhouseRole.Grader])]
@@ -67,8 +67,8 @@ It has no screens. It is the layer your pages, your processes and other packages
 |---|---|
 | **Agents** | `[Actor(Roles = […])] public class X : Agent` — a `Purpose`, standing `Instructions`, the `Skills` it holds, its `Limits`, and whom it `Consults`. Listed in `app.Agents`; `Agents.Of<X>()` answers one, ready for work. |
 | **Skills** | `Skill<TIn, TOut>` — `Description`, `Instructions`, `Tools`, `Brief(input)` (what the model is shown), `Check(result)` (what a schema cannot say), `Needs` (what the router decides from), `Stop` (turns, circles, how much conversation is kept), `Budget`, `Version`. `TOut` is a class, or `string` for prose. |
-| **Giving it work** | `Do(skill, input)` answers an `AgentOutcome<TOut>`: the typed `Result`, the `Status`, the receipt's id, the cost. `Ask(question)` answers in words with the tools of every skill it holds; `Stream(question)` hands the answer on as it arrives. `For(person)` does the work for somebody other than whoever is signed in. |
-| **In a process** | A step of a `workflow` is the same call. Nobody is signed in while a process runs, so the agent works with its own roles alone — or `For(person)`. |
+| **Giving it work** | `Do(skill, input)` answers an `AgentOutcome<TOut>`: the typed `Result`, the `Status`, the receipt's id, the cost. `Ask(question)` answers in words with the tools of every skill it holds; `Stream(question)` hands the answer on as it arrives. `For(row)` does the work for whoever made `row`, as the platform recorded them, rather than for whoever is signed in. |
+| **In a process** | A step of a `workflow` is the same call. Nobody is signed in while a process runs, so the agent works with its own roles alone — or `For(row)`, for whoever made the row the step is about. |
 | **Tools** | Run as the agent, on behalf of whoever asked: a read finds what both may read, a change needs both to be allowed. Every change is recorded with the agent, the person and the piece of work. |
 | **Money** | Each piece of work has a limit: the skill's `Budget`, else the agent's `Limits.PerTask`, else the app's `TaskBudget`. An agent's `Limits.Daily` binds everything it does. Budgets a manager sets with `SetBudget("agent", …)` or `("skill", …)` bind the same calls. All through [`Osysharp.Llm`](../llm). |
 | **The receipt** | `AgentTask`: agent, skill and its version, who asked, the account it ran as, status, what it spent and its limit, model calls, tool calls, turns, tokens, how it ended, what it handed back. Extensible: add your own fields with `partial entity AgentTask { … }`. |
@@ -349,7 +349,7 @@ it at once; and a process that comes back after its work was closed does nothing
 
 ## Source and package
 
-- Package: `Osysharp.Agents` — `use Osysharp.Agents@1;`
+- Package: `Osysharp.Agents` — `use Osysharp.Agents@2;`
 - Source: [`kits/agents`](.) — `model/Setup.osy` (policies, the app's setting), `Agent.osy` (agents, `Do` / `Ask` /
   `Stream` / `Decide`), `Skill.osy` (skills, the catalogue), `Loop.osy` (the loop, tools), `Task.osy` (the receipt,
   sponsors), `Trace.osy` (the record and its chain), `Delegation.osy` (handing work on: specialists, the tree, money down

@@ -257,3 +257,53 @@ void failed_work_is_tried_again_and_gives_up_once() {
   Assert.Equal(4, AgentTask.Count());
   Assert.Equal(1, Heard.Count(h => h.What == "gave up" && h.About.StartsWith("2: ")));
 }
+
+// ── whom the work is for, as the platform recorded it ───────────────────────────────────────────────────────────────
+
+/// `For(row)`: the work is for whoever made the row — the platform's record, never a person the code picked — and so
+/// it never does what they may not.
+[Test(Yard)]
+void work_for_a_row_acts_for_whoever_made_it() {
+  Note bens;
+  Note adas;
+  runas (Ben) { bens = WriteNote(Crate.Single(c => c.Code == "B-1"), "Have a look at A-1."); UnitOfWork.Commit(); }
+  runas (Ada) { adas = WriteNote(Crate.Single(c => c.Code == "A-1"), "Have a look at mine."); UnitOfWork.Commit(); }
+  runas (Dana) {
+    var crate = Crate.Single(c => c.Code == "A-1");
+    // For Ben's note the work is Ben's: the inspector may flag A-1, Ben may not, so it does not.
+    var script = AgentScript.Of(Says.Tool(Actions.Of(FlagCrate), FlagArgs(crate, "bruised")), Says.HandBack(new Grade { Score = 6 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var forBen = InspectForMaker(Note.Single(n => n.Id == bens.Id), crate);
+    Assert.Equal(Ben.Id, AgentWorkFor.Single(w => w.Task == forBen.Task).ActsFor);
+    Assert.Equal(Ben.Id, AgentTask.Single(t => t.Id == forBen.Task).Requester!.Id);
+    Assert.Equal("", Crate.Single(c => c.Code == "A-1").Flag);
+    // For Ada's note the work is Ada's, and she may.
+    var again = AgentScript.Of(Says.Tool(Actions.Of(FlagCrate), FlagArgs(crate, "bruised")), Says.HandBack(new Grade { Score = 6 }));
+    ScriptedAnswer.Stub((model, request) => again.Answer(model, request));
+    var forAda = InspectForMaker(Note.Single(n => n.Id == adas.Id), crate);
+    Assert.Equal(Ada.Id, AgentWorkFor.Single(w => w.Task == forAda.Task).ActsFor);
+    Assert.Equal("bruised", Crate.Single(c => c.Code == "A-1").Flag);
+  }
+}
+
+/// Work whose person is not recorded — opened where nobody is acted for, as work opened before this was recorded at
+/// all — acts as the agent alone: with its own roles, and for nobody.
+[Test(Yard)]
+void work_opened_before_its_person_was_recorded_acts_as_the_agent_alone() {
+  string theirs;
+  runas (Dana) { theirs = FlagArgs(Crate.Single(c => c.Code == "A-1"), "sound"); }
+  runas (Ben) {
+    // Ben starts the intake of his own crate; its step asks the inspector to flag Ada's — which Ben may not do.
+    var script = AgentScript.Of(Says.Tool(Actions.Of(FlagCrate), theirs), Says.HandBack(new Grade { Score = 8 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var crate = Crate.Single(c => c.Code == "B-1");
+    Workflow.Run(crate);
+    Workflow.Settle(crate);
+  }
+  runas (Dana) {
+    var receipt = AgentTask.Single();
+    Assert.Null(AgentWorkFor.Single(w => w.Task == receipt.Id).ActsFor);
+    // The agent alone may flag any crate: it did.
+    Assert.Equal("sound", Crate.Single(c => c.Code == "A-1").Flag);
+  }
+}

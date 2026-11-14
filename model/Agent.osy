@@ -167,19 +167,25 @@ public class AgentRef {
   public string Name = "";
   /// Its own account: the principal its tools run as.
   public Principal Actor;
-  /// Who the work is done for when the caller says (`For(person)`); otherwise whoever is signed in.
-  public Principal? Person;
+  /// Who the work is done for when the caller says — the row whose maker it is for (`For(row)`); otherwise whoever is
+  /// signed in.
+  public Entity? Row;
+  /// Work tried again (`RetryAgentWork`): for whoever the first piece of work was for, as ITS record says.
+  public Guid? SameAs;
   public bool ForSomebody = false;
   /// What the caller charges the work to beside the agent and the piece of work itself — see `On`.
   public List<LlmLimit> ChargedTo = [];
 
-  /// The same agent, working for `person` — and so never past what that person may do — rather than for whoever is
-  /// signed in. For work the app starts itself: a workflow acting for the customer who placed the order.
+  /// ⭐ THE SAME AGENT, WORKING FOR WHOEVER MADE `row` — and so never past what that person may do — rather than for
+  /// whoever is signed in. The person is the platform's own record of who made the row (its `[CreatedBy]` stamp,
+  /// `Records.CreatedBy(row)`), never one the code picks: for work the app starts itself — a workflow acting for the
+  /// customer who placed the order: `Agents.Of<Tracer>().For(order)`. A row whose type records no maker, or that
+  /// nobody made, is work for nobody: the agent alone.
   ///
   /// ⚑ A SIGNED-IN CALLER NAMES THEMSELVES, AND NOBODY ELSE — unless the app says they may:
   ///   `policy DirectsAgentsForOthers => IsLead;`. Otherwise the work is refused before anything runs.
-  public AgentRef For(Principal person) {
-    return new AgentRef { Name = Name, Actor = Actor, Person = person, ForSomebody = true, ChargedTo = ChargedTo };
+  public AgentRef For(Entity row) {
+    return new AgentRef { Name = Name, Actor = Actor, Row = row, ForSomebody = true, ChargedTo = ChargedTo };
   }
 
   /// ⭐ THE SAME AGENT, ITS WORK CHARGED TO SOMETHING OF THE CALLER'S — a case, an order, a project — and held to
@@ -200,7 +206,7 @@ public class AgentRef {
     List<LlmLimit> all = [];
     foreach (var c in ChargedTo) { if (c.Scope != charge.Scope) { all.Add(c); } }
     all.Add(charge);
-    return new AgentRef { Name = Name, Actor = Actor, Person = Person, ForSomebody = ForSomebody, ChargedTo = all };
+    return new AgentRef { Name = Name, Actor = Actor, Row = Row, SameAs = SameAs, ForSomebody = ForSomebody, ChargedTo = all };
   }
 
   /// ⭐ GIVE IT A PIECE OF WORK: a skill it holds, and the skill's input. Answers a task that ends when the work

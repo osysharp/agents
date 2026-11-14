@@ -106,6 +106,7 @@ public void AnonymiseAgentWork(AgentTask task, string why) {
       proposal.DecideBy = null;
       proposal.DecidedBy = null;
     }
+    foreach (var forWhom in AgentWorkFor.Where(w => w.Task == piece.Id).ToList()) { forWhom.Delete(); }
     piece.WaitingOn = "";
     piece.Requester = null;
     piece.StartedBy = null;
@@ -149,6 +150,7 @@ public int ForgetAgentWork(AgentTask task) {
     foreach (var wait in AgentWait.Where(w => w.Task == piece).ToList()) { wait.Delete(); }
     foreach (var wait in AgentWorkWait.Where(w => w.Task == piece).ToList()) { wait.Delete(); }
     foreach (var parking in AgentTaskParking.Where(p => p.Task == piece).ToList()) { parking.Delete(); }
+    foreach (var forWhom in AgentWorkFor.Where(w => w.Task == piece.Id).ToList()) { forWhom.Delete(); }
     // That it was corrected, and what was learned from it, outlive the record. What each correction SAID was about
     // this work, and goes with it; the correction lets go of the work.
     foreach (var correction in AgentCorrection.Where(c => c.Task == piece).ToList()) {
@@ -165,7 +167,10 @@ public int ForgetAgentWork(AgentTask task) {
       correction.Proposal = null;
     }
     foreach (var learned in AgentInstruction.Where(i => i.LearnedIn == piece).ToList()) { learned.LearnedIn = null; }
-    foreach (var proposal in AgentProposal.Where(p => p.Task == piece).ToList()) { proposal.Delete(); }
+    foreach (var proposal in AgentProposal.Where(p => p.Task == piece).ToList()) {
+      foreach (var placed in AgentProposalPut.Where(x => x.Proposal == proposal.Id).ToList()) { placed.Delete(); }
+      proposal.Delete();
+    }
     piece.Delete();
   }
   return tree.Count;

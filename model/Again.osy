@@ -50,7 +50,7 @@ public Guid RetryAgentWork(AgentTask task) {
   }
   // The record keeps the brief as a JSON string; read it back exactly, as the one member of an object.
   var brief = JsonSerializer.Deserialize<GivenBrief>("{\"Text\":" + given! + "}").Text;
-  var who = new AgentRef { Name = task.Agent, Actor = task.Actor, Person = task.Requester, ForSomebody = task.Requester != null };
+  var who = new AgentRef { Name = task.Agent, Actor = task.Actor, SameAs = task.Id, ForSomebody = true };
   // Charged to what the first was charged to. The limits those carried were the caller's to say then, and are not
   // kept; the attempt is held by its own.
   foreach (var scope in task.ChargedTo.Split("\n")) { if (scope.Trim() != "") { who = who.On(scope.Trim()); } }

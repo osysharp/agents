@@ -83,8 +83,9 @@ public class Porter : Agent {
 public AgentOutcome<Grade> Settle(Crate crate) {
   return await Agents.Of<Clerk>().Do(new SettleCrate(), crate, about: "Crate " + crate.Code);
 }
-public AgentOutcome<Grade> SettleFor(Person grower, Crate crate) {
-  return await Agents.Of<Clerk>().For(grower).Do(new SettleCrate(), crate, about: "Crate " + crate.Code);
+/// For whoever made `row` — a note a grower wrote — as the platform recorded them.
+public AgentOutcome<Grade> SettleFor(Entity row, Crate crate) {
+  return await Agents.Of<Clerk>().For(row).Do(new SettleCrate(), crate, about: "Crate " + crate.Code);
 }
 public AgentOutcome<Grade> Carry(Crate crate) {
   return await Agents.Of<Porter>().Do(new SettleCrate(), crate, about: "Crate " + crate.Code);
@@ -171,5 +172,23 @@ public void ForgeProposal(AgentTask task) { new AgentProposal { Task = task, Age
 /// An answer written straight onto a question, and a standing rule made up.
 public void ForgeAnswer(AgentHelp question) { question.Answer = "Do as you like."; question.Status = HelpStatus.Answered; }
 public void ForgeRule(Person me) { new AgentStandingRule { Agent = "Packhouse.Clerk", Action = "Packhouse.CondemnCrate", GrantedBy = me }; }
-/// The app's own relay, called by somebody signed in.
-public void RelayByHand(AgentProposal proposal, Person by) { RelayProposalDecision(proposal, true, "", by); }
+/// The packhouse's own relay, as an inbox carries a yes: the app, carrying a note as the answer.
+[Event("A yes to relay")]
+public sealed class YesToRelay { public AgentProposal Proposal; public Note Answer; }
+[On] void RelayTheYes(YesToRelay e) {
+  try {
+    var decided = RelayProposalDecision(e.Proposal, true, "", e.Answer);
+    new Heard { What = "relayed", About = decided.Status.Name };
+  } catch (AgentRefused refused) {
+    new Heard { What = "relay refused", About = refused.Message };
+  }
+}
+public void RelayYes(AgentProposal proposal, Note answer) { Raise(new YesToRelay { Proposal = proposal, Answer = answer }); }
+/// The packhouse puts a proposal on a slip, as an inbox puts one in a request: its answer is given there.
+[Event("A proposal put on a slip")]
+public sealed class PutOnSlip { public AgentProposal Proposal; public Slip Slip; }
+[On] void PutTheProposal(PutOnSlip e) { AwaitProposalAnswerIn(e.Proposal, e.Slip); }
+public void PutProposalOn(AgentProposal proposal, Slip slip) { Raise(new PutOnSlip { Proposal = proposal, Slip = slip }); }
+
+/// The app's own relay, called by somebody signed in — with any row as "the answer".
+public void RelayByHand(AgentProposal proposal, Entity answer) { RelayProposalDecision(proposal, true, "", answer); }

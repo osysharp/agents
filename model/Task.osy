@@ -176,6 +176,49 @@ public entity AgentTask {
   }
 }
 
+/// ⭐ WHOM A PIECE OF WORK IS FOR, AS THE PLATFORM RECORDED IT — one row per receipt, made as the receipt is opened.
+/// `ActsFor` is a `[CreatedFor]` stamp: the platform writes it as the person the row's making was judged for, and no
+/// code writes it. It is the person every tool of the work runs on behalf of (`RunAsAgent`, `BriefAs`), read again
+/// from here at each — never from the receipt's own `Requester`, nor from the work's remembered state.
+///
+/// - `Agents.Of<X>()`: made in the caller's own context — the signed-in caller; in a workflow body that runs as its
+///   actor, the person who started the run; in a system body, nobody.
+/// - `For(row)`: made in a block acting for that row's `[CreatedBy]` creator (`Records.CreatedBy(row)`).
+/// - Work handed on: made in a block acting for whoever the work above is for, as ITS row records.
+/// - Null — or no row at all, as for work opened before this release — the agent acts alone, with its own roles.
+///
+/// Its own row rather than a field of `AgentTask` because the receipt is opened by whoever gives the work, and a
+/// block that acts as the agent may not open one; and because a person taken off the work (`AnonymiseAgentWork`)
+/// takes this with them, which a stamp no code may write could not.
+[Unique(Task)]
+public entity AgentWorkFor {
+  /// The receipt, by its id.
+  [Required, Immutable, Index] Guid Task;
+  /// The person the work is for: who the platform judged this row's making for. Null: nobody — the agent alone.
+  [CreatedFor, Classification(Personal.Identity)] Guid? ActsFor;
+
+  security {
+    // Read with the receipt: whoever reads whom a piece of work is for there (its `Requester`) reads it here.
+    allow read when UsesAgents where AgentTask.Any(t => t.Id == Task && (t.Requester == user || t.StartedBy == user));
+    allow read when SupervisesAgents || AuditsAgents || ReadsAllAgentWork || DecidesAgentProposals || ErasesAgentRecords || TeachesAgents;
+    allow read when IsAuthenticated where AgentProposal.Any(p => p.Task.Id == Task && p.DecideBy == user);
+    // Made by whoever opens the work, or in the block that acts for the person — the agent's account and that person
+    // — by the kit's two openers and nothing else.
+    allow create when IsAuthenticated || IsAnonymous;
+    // SECURITY-INVARIANT(agents-the-person-a-work-is-for-is-the-platforms-record): whom a piece of work acts for is
+    // `ActsFor`, a `[CreatedFor]` stamp the platform writes as the row is made, in the caller's own context or in a
+    // block acting for an attested person (`Records.CreatedBy(row)`, the work above's own `ActsFor`); the row is made
+    // only by `OpenAgentTask`/`MarkAgentWorkFor`, never changed, and goes only with the work. Every tool reads it again
+    // here. Failure mode: a value the kit or the app wrote — the remembered state, `Requester`, a person picked by code
+    // — decides whose rights an agent borrows. Guarded by tests/people.test.osy
+    // `work_for_a_row_acts_for_whoever_made_it` and `work_opened_before_its_person_was_recorded_acts_as_the_agent_alone`.
+    deny create except via OpenAgentTask, MarkAgentWorkFor;
+    deny update;
+    allow delete when ErasesAgentRecords;
+    deny delete except via AnonymiseAgentWork, ForgetAgentWork;
+  }
+}
+
 /// An agent's place in the app: who answers for it, and whether it is working.
 ///
 /// ⚑ AN AGENT WITHOUT A SPONSOR DOES NOT RUN. The sponsor is the person accountable for what it does; whoever
@@ -299,7 +342,16 @@ public class AgentTaskOpening {
   public string RunState = "";
   public Guid? RunItem;
   public Guid? RunStarter;
+  /// Whom the work is for is recorded by the opener, in a block acting for them (`MarkAgentWorkFor`) — work handed
+  /// on, and work `For` a row or a person. Otherwise it is recorded here, in the caller's own context.
+  public bool ForInBlock = false;
 }
+
+/// Record whom a piece of work is for — called in a block acting for that person, so the platform stamps them.
+// Whoever the block acts for — a person, or nobody — and the agent: the kit calls it, and only in that block.
+policy RecordsWhomWorkIsFor => IsAuthenticated || IsAnonymous;
+[Server, Authorize(RecordsWhomWorkIsFor), CommitsAlone]
+internal void MarkAgentWorkFor(Guid task) { new AgentWorkFor { Task = task }; }
 
 /// ⭐ OPEN THE RECEIPT. Refused — before anything is written — when the agent has no sponsor or is paused.
 [Server, Authorize(UsesAgents), CommitsAlone]
@@ -344,7 +396,9 @@ internal Guid OpenAgentTask(AgentTaskOpening opening) {
     if (forWhom != asked) {
       throw new AgentRefused($"{bare} is handed this by another piece of work, and works for whoever that work is for — nobody else.");
     }
-  } else if (requester != null && startedBy != null && requester!.Id != startedBy!.Id && !Security.Authorize(startedBy!, DirectsAgentsForOthers)) {
+  } else if (startedBy != null && (requester == null ? opening.ForInBlock : requester!.Id != startedBy!.Id)
+             && !Security.Authorize(startedBy!, DirectsAgentsForOthers)) {
+    // …and "for nobody" — a row nobody is recorded as making — is somebody else too: the agent's own roles alone.
     throw new AgentRefused($"You may give {bare} work for yourself, not for somebody else: it would act with what they may do. "
       + "The app says who may: `policy DirectsAgentsForOthers => …;`.");
   }
@@ -362,6 +416,9 @@ internal Guid OpenAgentTask(AgentTaskOpening opening) {
     RetryOf = opening.RetryOf == null ? null : AgentTask.FirstOrDefault(t => t.Id == opening.RetryOf),
   };
   if (parent == null) { new AgentTraceHead { Root = task.Id }; }
+  // Whom it is for, as the platform records it here: whoever this is judged for — the signed-in caller, a run's
+  // starter, or nobody.
+  if (!opening.ForInBlock) { new AgentWorkFor { Task = task.Id }; }
   Raise(new AgentTaskStarted { Task = task });
   return task.Id;
 }

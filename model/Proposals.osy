@@ -212,7 +212,7 @@ public ProposalDecision ApproveAgentProposal(AgentProposal proposal, bool always
     if (tool == null) { throw new AgentRefused($"There is no action {BareName(proposal.Action)} any more."); }
     AllowAlone(proposal.Agent, tool!, proposal.Skill, fromProposal: proposal.Id);
   }
-  return DecideAgentProposal(proposal.Id, true, "", me.Id);
+  return DecideAgentProposal(proposal.Id, true, "", me.Id, null);
 }
 
 /// ⭐ SAY NO, with the reason — which the agent is given, and goes on from.
@@ -220,24 +220,93 @@ public ProposalDecision ApproveAgentProposal(AgentProposal proposal, bool always
 public ProposalDecision RejectAgentProposal(AgentProposal proposal, string reason) {
   var me = RequireDecider(proposal);
   if (reason.Trim() == "") { throw new ValidationException("Say why not: the agent is told, and can do something about it."); }
-  return DecideAgentProposal(proposal.Id, false, reason.Trim(), me.Id);
+  return DecideAgentProposal(proposal.Id, false, reason.Trim(), me.Id, null);
+}
+
+/// Where a proposal was put for a person to answer — a request in an inbox — as the code that put it there said, once.
+/// An answer relayed to the proposal must belong to that row (`RelayProposalDecision`).
+[Unique(Proposal)]
+public entity AgentProposalPut {
+  /// The proposal, by its id.
+  [Required, Immutable, Index] Guid Proposal;
+  /// The row its answer is given in: its type (`Records.TypeId`) and its id.
+  [Required, Immutable] Guid InType;
+  [Required, Immutable] Guid In;
+
+  security {
+    allow read when IsAuthenticated || IsAnonymous;
+    allow create when IsAuthenticated || IsAnonymous;
+    // SECURITY-INVARIANT(agents-a-relayed-answer-is-the-proposals-own): where a proposal's answer is awaited is said
+    // once, by the app, when the proposal is put there (`AwaitProposalAnswerIn`), and is never changed; only the work's
+    // erasure takes it away. Failure mode: app code points a waiting proposal at a request somebody else answered, and
+    // their yes decides it. Guarded by tests/autonomy.test.osy `an_answer_given_elsewhere_decides_nothing`.
+    deny create except via AwaitProposalAnswerIn;
+    deny update;
+    allow delete when ErasesAgentRecords;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+/// ⭐ SAY WHERE A PROPOSAL'S ANSWER IS GIVEN — the row a person answers it in (a request in their inbox), once, as it is
+/// put there. A decision relayed to it (`RelayProposalDecision`) is then taken only from an answer that belongs to that
+/// row: one whose `[RollsUpTo]` names it.
+///
+///     var request = PutRequest(new NewRequest { … About = Subject.Of("AgentProposal", p.Id, p.Label) … });
+///     AwaitProposalAnswerIn(p, request);
+///
+/// ⚑ FOR CODE THAT RUNS AS THE APP ONLY, as `RelayProposalDecision` is.
+[Server, Authorize(IsTheApp)]
+public void AwaitProposalAnswerIn(AgentProposal proposal, Entity row) {
+  if (AgentProposalPut.Any(x => x.Proposal == proposal.Id)) {
+    throw new AgentRefused("This proposal was put somewhere already: its answer is given there.");
+  }
+  new AgentProposalPut { Proposal = proposal.Id, InType = Records.TypeId(row), In = row.Id };
 }
 
 /// A decision a person made somewhere else — on a request in their inbox — carried to the proposal by the code that
-/// received it. `by` is that person: the tool runs as them. A no needs nobody — a request that ran out of time is
-/// a no with its reason.
+/// received it. `answer` is the platform's record of that decision: a row the person made as they decided, in their
+/// own request (the requests kit's `GivenAnswer`). The tool runs for its maker as the platform recorded them —
+/// `Records.CreatedBy(answer)` — and never for a person the code names. A yes with nobody recorded is refused. A no
+/// needs nobody — a request that ran out of time is a no with its reason.
+///
+/// The answer must belong to where the proposal was put (`AwaitProposalAnswerIn`): its `[RollsUpTo]` names that row.
+/// An answer given anywhere else — another request, about another proposal — decides nothing, yes or no.
 ///
 /// ⚑ FOR CODE THAT RUNS AS THE APP ONLY. No signed-in caller reaches it: a person says yes with `ApproveAgentProposal`,
 ///   which reads who they are from the session.
 [Server, Authorize(IsTheApp)]
-public ProposalDecision RelayProposalDecision(AgentProposal proposal, bool approved, string reason, Principal? by) {
-  if (approved && by == null) { throw new AgentRefused("A yes is somebody's: say who approved."); }
+public ProposalDecision RelayProposalDecision(AgentProposal proposal, bool approved, string reason, Entity? answer = null) {
+  // SECURITY-INVARIANT(agents-a-relayed-yes-is-the-recorded-answerers): who said yes is read by the platform from its
+  // own record of the answer (`Records.CreatedBy(answer)`) — no parameter names a person — and a yes with nobody
+  // recorded is refused. Failure mode: app code relays a yes "by" anybody it likes, and the tool runs with their
+  // rights. Guarded by tests/autonomy.test.osy `a_relayed_yes_is_judged_for_whoever_made_the_answer`.
+  Guid? decider = answer == null ? null : Records.CreatedBy(answer!);
+  if (approved && decider == null) { throw new AgentRefused("A yes is somebody's: the answer records nobody who gave it."); }
+  // SECURITY-INVARIANT(agents-a-relayed-answer-is-the-proposals-own): the answer is taken only where the proposal was
+  // put — the row `AwaitProposalAnswerIn` recorded, which the answer's own `[RollsUpTo]` must name. Failure mode: app
+  // code relays a yes somebody gave on another request, and the tool runs with their rights for something they never
+  // saw. Guarded by tests/autonomy.test.osy `an_answer_given_elsewhere_decides_nothing`.
+  if (answer != null && !AnswerBelongsTo(answer!, proposal)) {
+    throw new AgentRefused("That answer was not given where this proposal was put, so it decides nothing.");
+  }
+  var by = decider == null ? null : Principal.FirstOrDefault(p => p.Id == decider);
+  if (approved && by == null) { throw new AgentRefused("A yes is somebody's: whoever gave it is no longer a person of the app."); }
   // The same line `RequireDecider` holds, for a yes that arrives from an inbox: see the invariant there.
   if (approved && proposal.Routed && proposal.Task.Requester != null && proposal.Task.Requester!.Id == by!.Id
       && (proposal.DecideBy == null || proposal.DecideBy!.Id != by!.Id) && !Security.Authorize(by!, DecidesAgentProposals)) {
     throw new AgentRefused($"This proposal is decided by {RouteWords(proposal)}: the skill that proposed it says so. The work is for {NameOfPrincipal(by!)}; the decision is not theirs.");
   }
-  return DecideAgentProposal(proposal.Id, approved, reason, by == null ? null : by!.Id);
+  return DecideAgentProposal(proposal.Id, approved, reason, decider, answer);
+}
+
+/// Whether `answer` was given where `proposal` was put: one of the rows it rolls up to is the one recorded.
+bool AnswerBelongsTo(Entity answer, AgentProposal proposal) {
+  var placed = AgentProposalPut.FirstOrDefault(x => x.Proposal == proposal.Id);
+  if (placed == null) { return false; }
+  foreach (var up in Records.RollsUpTo(answer)) {
+    if (up.Id == placed!.In && Records.TypeId(up) == placed!.InType) { return true; }
+  }
+  return false;
 }
 
 /// Whoever is signed in, when a proposal is theirs to decide.
@@ -274,7 +343,8 @@ public string RouteWords(AgentProposal proposal) {
 }
 
 /// One decision, however it arrived: checked, run when it is a yes, written down, and the work woken.
-ProposalDecision DecideAgentProposal(Guid id, bool approved, string reason, Guid? by) {
+/// `answer` null: the signed-in decider (`RequireDecider` has asked); otherwise the platform's record of whoever gave it.
+ProposalDecision DecideAgentProposal(Guid id, bool approved, string reason, Guid? by, Entity? answer) {
   var proposal = AgentProposal.Single(p => p.Id == id);
   var bare = BareName(proposal.Agent);
   if (proposal.Status != ProposalStatus.Waiting) {
@@ -320,10 +390,11 @@ ProposalDecision DecideAgentProposal(Guid id, bool approved, string reason, Guid
 
   // SECURITY-INVARIANT(agents-an-approved-proposal-runs-as-the-approver): the tool runs as the agent ON BEHALF OF
   // whoever approved — both must be allowed, by the app's own rules — and never as the app or as the person who first
-  // asked. Guarded by tests/autonomy.test.osy `an_approved_proposal_runs_as_the_approver`.
+  // asked. The approver is a person the platform attests: the signed-in decider, or the recorded maker of the answer a
+  // relay carries — never a person code passed. Guarded by tests/autonomy.test.osy
+  // `an_approved_proposal_runs_as_the_approver` and `a_relayed_yes_is_judged_for_whoever_made_the_answer`.
   // The agent's account by its key off the receipt — the approver need not be able to read it.
   var actor = proposal.Task.Actor;
-  var approver = Principal.Single(p => p.Id == by!.Value);
   var task = AgentTask.Single(t => t.Id == proposal.Task.Id);
   // Read before the switch of who is acting: inside it, the proposal is read as the agent and the approver may.
   var action = proposal.Action;
@@ -331,8 +402,10 @@ ProposalDecision DecideAgentProposal(Guid id, bool approved, string reason, Guid
   var values = Actions.ValuesFromJson(action, proposal.ArgumentsJson);
   ActionResult result;
   try {
-    runas (Actor.From(actor), onBehalfOf: approver, scope: task) {
-      result = Actions.Run(action, values, cause: cause);
+    if (answer == null) {
+      runas (Actor.From(actor), onBehalfOf: Session.CurrentUser, scope: task) { result = Actions.Run(action, values, cause: cause); }
+    } else {
+      runas (Actor.From(actor), onBehalfOf: Records.CreatedBy(answer!), scope: task) { result = Actions.Run(action, values, cause: cause); }
     }
   } catch (Exception e) {
     result = new ActionResult { Outcome = ActionOutcome.Failed, Said = "", Value = "", Problem = e.Message, RanAs = "" };

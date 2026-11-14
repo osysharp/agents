@@ -377,11 +377,11 @@ long RoomOf(AgentRun run) {
 /// for — so a row the model names is found only when both may read it.
 string BriefAs(AgentRun run, Principal account, SkillBase skill, string inputJson) {
   var task = AgentTask.Single(t => t.Id == run.Task);
-  if (run.Person == null) {
+  var forWhom = AgentWorkFor.FirstOrDefault(w => w.Task == run.Task);
+  if (forWhom == null || forWhom!.ActsFor == null) {
     runas (Actor.From(account), scope: task) { return skill.BriefHanded(inputJson); }
   }
-  var person = Principal.FirstOrDefault(p => p.Id == run.Person);
-  runas (Actor.From(account), onBehalfOf: person, scope: task) { return skill.BriefHanded(inputJson); }
+  runas (Actor.From(account), onBehalfOf: forWhom!.ActsFor, scope: task) { return skill.BriefHanded(inputJson); }
 }
 
 /// What a piece of work is about, as its receipt says.

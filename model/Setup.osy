@@ -20,8 +20,8 @@ virtual policy AuditsAgents => false;
 /// `policy AgentsMayConsult => false;` switches the help of a stronger model off for everybody.
 virtual policy AgentsMayConsult => true;
 
-/// Who may give an agent work FOR SOMEBODY ELSE (`Agents.Of<X>().For(person)`) while signed in themselves. Nobody,
-/// until the app says: `policy DirectsAgentsForOthers => IsLead;`. Naming yourself needs nobody's leave, and neither
+/// Who may give an agent work FOR SOMEBODY ELSE (`Agents.Of<X>().For(row)` of a row another person made) while
+/// signed in themselves. Nobody, until the app says: `policy DirectsAgentsForOthers => IsLead;`. Naming yourself needs nobody's leave, and neither
 /// does work the app starts itself — a workflow, a handler — where nobody is signed in.
 virtual policy DirectsAgentsForOthers => false;
 

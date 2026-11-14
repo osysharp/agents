@@ -291,9 +291,29 @@ public AgentOutcome<Grade> TraineeInspects(Crate crate) { return await Agents.Of
 public void UseTheStowaway(Crate crate) { await Agents.Of<Stowaway>().Do(new GradeCrate(), crate); }
 public void SorterDescribes() { await Agents.Of<Sorter>().Do(new DescribeDelivery(), "anyone"); }
 
-/// For a grower who is not the one signed in.
-public AgentOutcome<Grade> InspectFor(Person grower, Crate crate) {
-  return await Agents.Of<Inspector>().For(grower).Do(new GradeCrate(), crate);
+/// A note somebody writes about a crate: a row whose maker the platform records.
+entity Note {
+  Crate? Crate;
+  /// The slip it answers, when it answers one: a note rolls up to its slip.
+  [RollsUpTo] Slip? Slip;
+  [MaxLength(200)] string Text = "";
+  [CreatedBy] Guid? WrittenBy;
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}
+public Note WriteNote(Crate crate, string text) { return new Note { Crate = crate, Text = text }; }
+public Note WriteLooseNote(string text) { return new Note { Text = text }; }
+public Note AnswerOn(Slip slip, string text) { return new Note { Slip = slip, Text = text }; }
+
+/// The packhouse's own inbox, as these tests stand one in: a proposal is put on a slip, and answered by a note on it.
+entity Slip {
+  [MaxLength(200)] string About = "";
+  security { allow read, create when IsAuthenticated || IsAnonymous; }
+}
+public Slip WriteSlip(string about) { return new Slip { About = about }; }
+
+/// For whoever made `row`, as the platform recorded them.
+public AgentOutcome<Grade> InspectForMaker(Entity row, Crate crate) {
+  return await Agents.Of<Inspector>().For(row).Do(new GradeCrate(), crate);
 }
 
 /// Grade a crate, charged to the delivery it came with — and held to what the delivery may spend, in dollars.
