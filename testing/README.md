@@ -3,8 +3,8 @@
 Test an agent without a model: write what the model answers, turn by turn, and assert what the agent then did.
 
 ```osy
-use Osysharp.Agents@1;
-tests use Osysharp.Agents.Testing@1;
+use Osysharp.Agents@2;
+tests use Osysharp.Agents.Testing@2;
 
 [Test]
 [runas(Ada)]
@@ -64,7 +64,7 @@ osy test kits/agents-testing/tests
 
 ## Source and package
 
-- Package: `Osysharp.Agents.Testing` — `tests use Osysharp.Agents.Testing@1;`
+- Package: `Osysharp.Agents.Testing` — `tests use Osysharp.Agents.Testing@2;`
 - Source: [`kits/agents-testing`](.) — `model/Script.osy`
 - Uses [`Osysharp.Agents`](../agents) and the scripted model of [`Osysharp.Llm`](../llm).
 
