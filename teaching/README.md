@@ -4,8 +4,8 @@ The two places people teach an AI agent, drawn: **Correct this** on a piece of i
 **Instructions** page.
 
 ```osy
-use Osysharp.Agents@1;
-use Osysharp.Agents.Teaching@1;
+use Osysharp.Agents@2;
+use Osysharp.Agents.Teaching@2;
 
 [Route("/work/{task}")] [Authorize(UsesAgents)]
 component WorkPage(Guid task) { render { WorkTeaching(task); } }
@@ -83,7 +83,7 @@ osy test kits/agents-teaching/tests --pixels   # the same in a real browser, pho
 
 ## Source and package
 
-- Package: `Osysharp.Agents.Teaching` — `use Osysharp.Agents.Teaching@1;`
+- Package: `Osysharp.Agents.Teaching` — `use Osysharp.Agents.Teaching@2;`
 - Source: [`kits/agents-teaching`](.) — `model/Views.osy` (what the screens read and send), `model/ui/Correct.osy`
   (`CorrectThis`, `WorkTeaching`), `model/ui/Instructions.osy` (`AgentInstructions`)
 - Uses [`Osysharp.Agents`](../agents) (corrections, instructions, instruction sets) and `Osysharp.Ui`.
