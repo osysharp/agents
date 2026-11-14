@@ -3,21 +3,21 @@
 An AI agent's work as a step of a business process — seen from the process, and from the work.
 
 ```osy
-use Osysharp.Agents@1;
+use Osysharp.Agents@2;
 use Osysharp.Processes@1;         // …and this bridge is there: nothing to wire.
 
 workflow Qualification {
   Tracks = Supplier.Stage; Initial = Screening;
   state Screening {
     enter {
-      var check = await Agents.Of<Screener>().For(this.Item.RequestedBy).Do(new CheckDocuments(), this.Item);
+      var check = await Agents.Of<Screener>().For(this.Item).Do(new CheckDocuments(), this.Item);
       if (check.Done && !check.Result.Complete) { goto Incomplete; }        // the typed result decides
       goto Assessing;
     }
   }
   state Assessing {
     enter {
-      var risk = await Agents.Of<Assessor>().For(this.Item.RequestedBy).Do(new AssessRisk(), this.Item);
+      var risk = await Agents.Of<Assessor>().For(this.Item).Do(new AssessRisk(), this.Item);
       if (!risk.Done) {                                                     // it gave up: the process does not
         Processes.Problem("The assessor could not finish, so the risk officer assesses this supplier by hand.");
         goto ByHand;
@@ -38,7 +38,7 @@ somebody with the authority approves. Three of those steps are agents' work; one
 not; the approval waits days for the person who gives it. The process is an ordinary workflow, and each agent step
 is an ordinary call in it:
 
-- **Typed in, typed out.** `await Agents.Of<X>().For(person).Do(skill, input)` answers the skill's own result, and
+- **Typed in, typed out.** `await Agents.Of<X>().For(this.Item).Do(skill, input)` answers the skill's own result, and
   the process goes where that result says.
 - **It waits without losing its place.** Work that stops on a person — a proposal to decide, a question to answer —
   parks the run with it, for as long as the person takes, and the step answers the finished work.
@@ -109,7 +109,7 @@ osy test kits/agents-processes/tests --pixels   # the same in a real browser, ph
 
 ## Source and package
 
-- Package: `Osysharp.Agents.Processes` — arrives by itself in an app that uses both `Osysharp.Agents@1` and
+- Package: `Osysharp.Agents.Processes` — arrives by itself in an app that uses both `Osysharp.Agents@2` and
   `Osysharp.Processes@1`
 - Source: [`kits/agents-processes`](.) — `model/Bridge.osy`, `model/ui/Steps.osy`
 - Uses [`Osysharp.Agents`](../agents), [`Osysharp.Agents.Inspector`](../agents-inspector),

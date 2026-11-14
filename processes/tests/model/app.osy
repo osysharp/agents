@@ -67,8 +67,8 @@ entity Supplier {
   decimal PlannedSpend = 0;
   /// What its insurer covers it for, in euros, as its certificate says.
   decimal InsuredFor = 0;
-  /// The buyer who asked for it to be qualified.
-  [Required] Person RequestedBy;
+  /// The buyer who asked for it to be qualified, as the platform recorded them: whoever made the row.
+  [CreatedBy] Guid? RequestedBy;
   SupplierStage Stage = SupplierStage.Screening;
   /// What screening found missing; what the assessment found.
   [MaxLength(400)] string Missing = "";
@@ -255,7 +255,7 @@ workflow Qualification {
 
   state Screening {
     enter {
-      var check = await Agents.Of<Screener>().For(this.Item.RequestedBy).Do(new CheckDocuments(), this.Item, about: "Documents of " + this.Item.Name);
+      var check = await Agents.Of<Screener>().For(this.Item).Do(new CheckDocuments(), this.Item, about: "Documents of " + this.Item.Name);
       if (check.Done && !check.Result.Complete) { goto Incomplete; }
       if (!check.Done) { Processes.Problem("The documents could not be checked, so the assessment goes ahead without: " + check.Problem); }
       goto Assessing;
@@ -263,7 +263,7 @@ workflow Qualification {
   }
   state Assessing {
     enter {
-      var risk = await Agents.Of<Assessor>().For(this.Item.RequestedBy).Do(new AssessRisk(), this.Item, about: "Risk of " + this.Item.Name);
+      var risk = await Agents.Of<Assessor>().For(this.Item).Do(new AssessRisk(), this.Item, about: "Risk of " + this.Item.Name);
       if (!risk.Done) {
         // The assessor gave up. The process does not: the risk officer assesses this one by hand.
         Processes.Problem("The assessor could not finish, so the risk officer assesses this supplier by hand.");
@@ -321,9 +321,7 @@ public class SupplierQualification : Process<Supplier> {
 
 /// A buyer asks for a supplier to be qualified.
 public Supplier Qualify(string name, string supplies, decimal plannedSpend, decimal insuredFor = 500000) {
-  var mine = Security.CurrentUserId;
-  var me = Person.Single(p => p.Id == mine);
-  var supplier = new Supplier { Name = name, Supplies = supplies, PlannedSpend = plannedSpend, InsuredFor = insuredFor, RequestedBy = me };
+  var supplier = new Supplier { Name = name, Supplies = supplies, PlannedSpend = plannedSpend, InsuredFor = insuredFor };
   UnitOfWork.Commit();
   Workflow.Run(supplier);
   return supplier;

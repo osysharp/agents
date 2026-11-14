@@ -7,11 +7,11 @@
 app Procurement {
   model "model/**/*.osy";
   tests "**/*.test.osy";
-  use Osysharp.Agents@1;
-  use Osysharp.Agents.Testing@1;
-  use Osysharp.Agents.Inspector@2;
-  use Osysharp.Agents.Teaching@1;
-  use Osysharp.Agents.Processes@1;
+  use Osysharp.Agents@2;
+  use Osysharp.Agents.Testing@2;
+  use Osysharp.Agents.Inspector@3;
+  use Osysharp.Agents.Teaching@2;
+  use Osysharp.Agents.Processes@2;
   use Osysharp.Processes@1;
   use Osysharp.Llm@2;
   use Osysharp.Identity@0;
