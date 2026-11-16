@@ -32,8 +32,25 @@ public class AgentsSetup {
   public List<Agent> Agents = [];
   /// What one piece of work may spend on models, in US dollars, when neither its agent nor its skill says.
   public decimal TaskBudget = 0.50m;
-  /// How many turns a piece of work may take when its skill does not say.
-  public int MaxTurns = 12;
+  /// How many turns a piece of work may take when its skill does not say — and the most a skill's own `StopWhen`
+  /// gets: a skill may say fewer, never more. Your organization may bound it (a range): the value read is then held
+  /// inside the range, whatever the app assigns.
+  [OrgPolicy(OrgPolicyMode.Range)] public int MaxTurns = 12;
+  /// ⭐ YOUR ORGANIZATION'S FLOOR, BY WHAT A TOOL DOES (ORGPOL OP-FP3). The least an agent must do before a tool that
+  /// changes the app's data, sends, spends or reaches outside in another way than sending or spending
+  /// (`ReachesOutAtLeast` covers neither a send nor a spend: those have their own) runs. `Alone` (the kit's default)
+  /// adds nothing; `Propose` makes such a tool proposed first, whatever an agent's `May` says — unless a person gives
+  /// a standing rule for it (`AllowAlone`); to stop that, lock `StandingRules` off or use `ProposeEveryTime`;
+  /// `ProposeEveryTime` and `Never` as their names say. A tool whose effects the compiler could not all see meets the
+  /// strictest of the four. An agent's own `May` can be stricter than the floor, never looser. Locked by an
+  /// organization, the value read is the organization's, whatever the app assigns.
+  [OrgPolicy(OrgPolicyMode.Lock)] public Leave ChangesAtLeast = Leave.Alone;
+  [OrgPolicy(OrgPolicyMode.Lock)] public Leave SendsAtLeast = Leave.Alone;
+  [OrgPolicy(OrgPolicyMode.Lock)] public Leave SpendsAtLeast = Leave.Alone;
+  [OrgPolicy(OrgPolicyMode.Lock)] public Leave ReachesOutAtLeast = Leave.Alone;
+  /// Whether anybody may say "from now on, alone" (`AllowAlone`). Off: a standing rule is refused, and the rules
+  /// that already stand are not read by the gate (they are kept, and count again if it is turned back on).
+  [OrgPolicy(OrgPolicyMode.Lock)] public bool StandingRules = true;
   /// The app's own checks on every piece of work — see `AgentGuard`. Asked in this order.
   public List<AgentGuard> Guards = [];
   /// How long work that says it is under way may write nothing on its record before it counts as abandoned — the
@@ -74,7 +91,8 @@ public class ModelNeeds {
 
 /// When a piece of work stops whether or not it is finished.
 public class StopWhen {
-  /// The most turns — one model answer, with the tools it asked for — before the work is stopped. 0: the app's `MaxTurns`.
+  /// The most turns — one model answer, with the tools it asked for — before the work is stopped. 0: the app's
+  /// `MaxTurns`. Never more than the app's `MaxTurns`, which your organization may bound: a larger value is cut to it.
   public int MaxTurns = 0;
   /// How many times the same tool may be asked for with the same arguments before the work is stopped as going in
   /// circles.

@@ -232,18 +232,22 @@ Agent? ListedAgent(string name) {
 }
 
 /// What one piece of work above says of a tool, by what the tool DOES — its agent's `May`, and its skill's when that
-/// is stricter. The tool need not be one of its own.
+/// is stricter, never looser than the organization's floor (`DeclaredLeave`). The tool need not be one of its own.
 Leave LeaveAt(WorkLevel level, ActionInfo tool) {
   var definition = level.Agent == "" ? null : ListedAgent(level.Agent);
   // An agent the app no longer lists, or a level that could not be read: nothing is let through on its account.
   if (definition == null) { return Leave.Never; }
-  var leave = definition!.May.For(tool);
-  foreach (var s in definition!.Skills) {
-    if (SkillNameOf(s) != level.Skill) { continue; }
-    var skills = s.May;
-    if (skills != null) { leave = Stricter(leave, skills!.For(tool)); }
-  }
-  return leave;
+  // Through the gate's own reading, so the organization's floor holds at every level above too.
+  return DeclaredLeave(definition!, level.Skill, tool, false) ?? Leave.Never;
+}
+
+/// Whether `leave` — what `LeaveAt` said of a level above — is stricter than that agent's own declaration: the
+/// organization's floor made it so.
+bool FloorHeldAt(WorkLevel level, ActionInfo tool, Leave leave) {
+  var definition = level.Agent == "" ? null : ListedAgent(level.Agent);
+  if (definition == null) { return false; }
+  var own = AgentsOwnLeave(definition!, level.Skill, tool, false);
+  return own != null && Rank(own!.Value) < Rank(leave);
 }
 
 /// ⭐ THE GATE OF THE WORK ABOVE. For a piece of work that was handed on: the strictest thing any piece of work above
@@ -266,18 +270,20 @@ GateVerdict? GateAbove(AgentRun run, ActionInfo tool, List<Guid> lifted) {
   GateVerdict? strictest = null;
   foreach (var level in LevelsAbove(run.Task)) {
     var leave = LeaveAt(level, tool);
-    if (leave == Leave.Propose && level.Agent != "") {
+    if (leave == Leave.Propose && level.Agent != "" && StandingRulesHold()) {
       var rule = StandingRuleFor(level.Agent, level.Skill, tool.Name, run.Person);
       if (rule != null) { leave = Leave.Alone; lifted.Add(rule!.Value); }
     }
     if (leave == Leave.Alone) { continue; }
     if (strictest != null && Rank(leave) <= Rank(strictest!.Leave)) { continue; }
     var who = level.Agent == "" ? "the work above it" : BareName(level.Agent) + ", which handed this work on,";
+    // Where it was the organization's floor, not that agent's own declaration, the words say so.
+    var floor = FloorHeldAt(level, tool, leave) ? " under your organization's policy" : "";
     strictest = new GateVerdict {
       Leave = leave,
-      Why = leave == Leave.Never ? $"{who} never does that"
-          : leave == Leave.ProposeEveryTime ? $"{who} proposes that every time"
-          : $"{who} may not do that alone",
+      Why = leave == Leave.Never ? $"{who} never does that{floor}"
+          : leave == Leave.ProposeEveryTime ? $"{who} proposes that every time{floor}"
+          : $"{who} may not do that alone{floor}",
     };
   }
   return strictest;

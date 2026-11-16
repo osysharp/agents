@@ -200,7 +200,10 @@ string ProposalFingerprintWith(AgentProposal proposal, string instructionSetHash
 /// agent's work then goes on from where it stood, with what the tool answered.
 ///
 /// For the person it is put to, the person the work is for, and whoever supervises the agents. `alwaysLikeThis`:
-/// also let the agent run this tool alone from now on, for the work it does for you (`AllowAlone`).
+/// also let the agent run this tool alone from now on, for the work it does for you (`AllowAlone`). The rule is made
+/// FIRST: where it is refused — standing rules switched off by the organization (`AgentsSetup.StandingRules`), or a
+/// tool its floor holds to "propose every time" or "never" — the whole call is refused and the yes is NOT recorded;
+/// the proposal still waits, to be approved again without `alwaysLikeThis`.
 ///
 /// It does NOT run — and says why — when what it was about has changed since it was proposed (the agent looks
 /// again), when the agent's declaration no longer lets it be done at all, or when what you may do does not cover it.

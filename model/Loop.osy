@@ -246,7 +246,7 @@ AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillN
   var stop = skill.Stop;
   var run = new AgentRun {
     Task = task, Root = task, Agent = agent.Name, Skill = skillName, Actor = agent.Actor.Id, Person = person,
-    LimitMicros = limit, Typed = skill.Typed(), MaxTurns = stop.MaxTurns > 0 ? stop.MaxTurns : setup.MaxTurns,
+    LimitMicros = limit, Typed = skill.Typed(), MaxTurns = TurnsFor(stop, setup),
     SameCall = stop.SameCall, ClearPast = stop.ClearResultsPast, StuckAfter = definition.StuckAfter,
     // Nobody to consult when the agent names nobody — or the app does not let its agents ask, for whoever this is.
     Consults = definition.Consults != "" && MayConsult() ? definition.Consults : "",
@@ -356,6 +356,18 @@ LlmMessage UserSays(string text) {
 }
 
 // ── one turn ────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// How many turns a piece of work may take: its skill's own, never more than the app's `MaxTurns` — which an
+/// organization may hold to a range (ORGPOL OP-FP3), so no skill takes more turns than the range allows. An app
+/// `MaxTurns` of 0 or less sets no cap of the app's own (a range never reads as that unless the organization sets it so):
+/// the skill's own number holds then.
+/// ⚑ FIXED AT `Opened`: the number is written on the run when the work opens. Work parked across a change of the
+///   policy (a proposal waiting, a person asked) keeps the number it opened with; the next piece of work reads the new one.
+int TurnsFor(StopWhen stop, AgentsSetup setup) {
+  if (setup.MaxTurns <= 0) { return stop.MaxTurns > 0 ? stop.MaxTurns : setup.MaxTurns; }
+  if (stop.MaxTurns > 0 && stop.MaxTurns < setup.MaxTurns) { return stop.MaxTurns; }
+  return setup.MaxTurns;
+}
 
 /// Whether the work goes on to another turn: not when somebody called it off, and not past its turns.
 bool NextTurn(AgentRun run) {

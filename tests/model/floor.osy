@@ -1,0 +1,135 @@
+// The organization's floor under the packhouse's agents (ORGPOL OP-FP3). The courier writes to growers — a SEND — and
+// declares it may do everything alone; the dispatcher hands that work to it, and declares the same. What an
+// organization would lock (`AgentsSetup.*AtLeast`, `StandingRules`) or hold to a range (`MaxTurns`) is read here from
+// a row a test writes (`PretendFloor`): with no organization in a test, the app's own value is what the kit reads, and
+// the platform's read gives an organization's value in its place whatever the app assigns (an-app-setting-read-obeys-
+// the-organisations-policy) — so the kit's side of the floor is what these tests hold.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+
+/// What a pretend organization sets: one row, written by a test. None: the kit's defaults.
+public entity PretendFloor {
+  Leave Changes = Leave.Alone;
+  Leave Sends = Leave.Alone;
+  Leave Spends = Leave.Alone;
+  Leave ReachesOut = Leave.Alone;
+  bool StandingRules = true;
+  int MaxTurns = 12;
+  security { allow read, create, update when IsAnonymous || IsAuthenticated; }
+}
+
+public Leave FloorChanges() { var f = PretendFloor.FirstOrDefault(); return f == null ? Leave.Alone : f!.Changes; }
+public Leave FloorSends() { var f = PretendFloor.FirstOrDefault(); return f == null ? Leave.Alone : f!.Sends; }
+public Leave FloorSpends() { var f = PretendFloor.FirstOrDefault(); return f == null ? Leave.Alone : f!.Spends; }
+public Leave FloorReachesOut() { var f = PretendFloor.FirstOrDefault(); return f == null ? Leave.Alone : f!.ReachesOut; }
+public bool FloorStandingRules() { var f = PretendFloor.FirstOrDefault(); return f == null ? true : f!.StandingRules; }
+public int FloorMaxTurns() { var f = PretendFloor.FirstOrDefault(); return f == null ? 12 : f!.MaxTurns; }
+
+/// The one row of the pretend organization's floor, made when there is none.
+public PretendFloor TheFloor() {
+  var f = PretendFloor.FirstOrDefault();
+  if (f != null) { return f!; }
+  return new PretendFloor();
+}
+
+/// A letter to a grower — what the courier's send leaves behind.
+public entity Letter {
+  [Required, MaxLength(40)] string Crate;
+  [Required, MaxLength(500)] string Text;
+  security { allow read, create when IsAuthenticated; }
+}
+
+/// The post itself: it sends something to somebody.
+[Sends]
+void PostLetter(Crate crate, string text) { new Letter { Crate = crate.Code, Text = text }; }
+
+/// Write to a crate's grower.
+[Action("Write to the grower")]
+public string WriteToGrower(Crate crate, string text) {
+  PostLetter(crate, text);
+  return $"Written about {crate.Code}.";
+}
+
+/// Tells a grower how a crate went.
+public class TellGrower : Skill<Crate, Grade> {
+  public override string Description => "Tell the grower how their crate went.";
+  public override List<ActionInfo> Tools => [Actions.Of(WriteToGrower)];
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+  // More turns than an organization may allow: the app's `MaxTurns` cuts it.
+  public override StopWhen Stop => new StopWhen { MaxTurns = 10 };
+  public override string HandedSchema() => HandOn.ById("The crate to write about.");
+  public override Crate Handed(string inputJson) {
+    var id = HandOn.IdIn(inputJson);
+    return Crate.Single(c => c.Id == id);
+  }
+}
+
+/// The same, with care: here every letter is proposed every time — stricter than any floor below it.
+public class TellGrowerCarefully : Skill<Crate, Grade> {
+  public override string Description => "Tell the grower how their crate went, with care.";
+  public override List<ActionInfo> Tools => [Actions.Of(WriteToGrower)];
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+  public override Permits? May => new Permits { ProposeEveryTime = [Actions.Of(WriteToGrower)] };
+}
+
+/// Hands word of a crate on to the courier.
+public class SendWord : Skill<Crate, Grade> {
+  public override string Description => "See that the grower hears how their crate went.";
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+}
+
+/// A tool of one class, for the floor's own tests: a real action's shape (`Weigh`), with its name and what it does made
+/// up — so each line of the floor (`FloorFor`) is met by a tool that does exactly that one thing. The floor is read from
+/// what a tool's `ActionEffects` say, so this is a tool of that class to it. Nothing runs it: the tests read the skills
+/// catalogue and `AllowAlone`, which read the gate's own `DeclaredLeave`.
+public ActionInfo ToolThat(string name, bool changes = false, bool sends = false, bool spends = false, bool reachesOut = false, bool unknown = false) {
+  var tool = Actions.Of(Weigh);
+  tool.Name = "Packhouse." + name;
+  tool.Query = false;
+  tool.Effects = new ActionEffects { Reads = [], Creates = [], Modifies = changes ? ["Packhouse.Crate"] : [], Deletes = [],
+    External = sends || spends || reachesOut, Sends = sends, Spends = spends, Unknown = unknown };
+  return tool;
+}
+
+/// A send the compiler could not see: what `ActionEffects` say of a tool that reaches `[Sends]` through a function value,
+/// or of an action with no effects recorded — nothing it can name, and `Unknown`.
+public ActionInfo UnseenSend() { return ToolThat("PostThroughAValue", unknown: true); }
+
+/// One tool of each class the floor knows, a query first, and the unseen send last.
+public class MindTheFloor : Skill<Crate, Grade> {
+  public override string Description => "Whatever the floor allows.";
+  public override List<ActionInfo> Tools => [Actions.Of(Weigh), ToolThat("ChangeTheCrate", changes: true), ToolThat("SendTheGrower", sends: true),
+    ToolThat("PayTheGrower", spends: true), ToolThat("CallTheMarket", reachesOut: true), UnseenSend()];
+  public override string Brief(Crate c) => $"Crate {c.Code}.";
+}
+
+/// Writes to growers — and declares it may do everything alone.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Courier : Agent {
+  public static Person Principal => new Person { Email = "courier@packhouse.example", DisplayName = "Courier" };
+  public override string Purpose => "You tell growers how their crates went.";
+  public override List<SkillBase> Skills => [new TellGrower(), new TellGrowerCarefully(), new MindTheFloor()];
+  public override Permits May => Permits.Everything();
+}
+
+/// Hands word on to the courier — and declares it may do everything alone too.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Dispatcher : Agent {
+  public static Person Principal => new Person { Email = "dispatcher@packhouse.example", DisplayName = "Dispatcher" };
+  public override string Purpose => "You see that growers hear how their crates went.";
+  public override List<SkillBase> Skills => [new SendWord()];
+  public override Permits May => Permits.Everything();
+  public override Delegation Delegates => new Delegation { To = [Specialist.Of<Courier>(new TellGrower())] };
+}
+
+public AgentOutcome<Grade> WriteAbout(Crate crate) {
+  return await Agents.Of<Courier>().Do(new TellGrower(), crate, about: "Crate " + crate.Code);
+}
+public AgentOutcome<Grade> WriteAboutCarefully(Crate crate) {
+  return await Agents.Of<Courier>().Do(new TellGrowerCarefully(), crate, about: "Crate " + crate.Code);
+}
+public AgentOutcome<Grade> SendWordOf(Crate crate) {
+  return await Agents.Of<Dispatcher>().Do(new SendWord(), crate, about: "Crate " + crate.Code);
+}

@@ -1,0 +1,293 @@
+// Osysharp.Agents — the organization's floor (ORGPOL OP-FP3). An organization may lock the least an agent must do
+// before a tool that changes, sends, spends or reaches out runs (`AgentsSetup.*AtLeast`), switch "from now on, alone"
+// off (`StandingRules`), and hold the turns a piece of work may take to a range (`MaxTurns`). An agent's own `May` can
+// be stricter than the floor, never looser — and so can the work above it.
+//
+// The pretend organization's floor is a row (`PretendFloor`, model/floor.osy) the app's setup reads.
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Packhouse.Testing;
+using Osysharp.Workflow;
+using Packhouse;
+
+[TestFixture]
+void FloorYard() {
+  Yard();
+  var dana = Person.Single(p => p.Email == "dana@packhouse.example");
+  new AgentSeat { Agent = "Packhouse.Courier", Sponsor = dana };
+  new AgentSeat { Agent = "Packhouse.Dispatcher", Sponsor = dana };
+}
+
+string LetterArgs(Crate crate, string text) { return "{\"crate\":\"" + crate.Id.ToString() + "\",\"text\":\"" + text + "\"}"; }
+
+/// The courier's script: one letter about `crate`, then its grade handed back.
+void ScriptOneLetter(Crate crate, string text) {
+  var script = AgentScript.Of(
+    Says.Tool("The grower should hear.", Actions.Of(WriteToGrower), LetterArgs(crate, text)),
+    Says.HandBack(new Grade { Score = 5, Finding = "Told." }));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+}
+
+/// Whether any line of a piece of work's record says `words`.
+bool RecordSays(Guid task, string words) { return Trajectory.Said(task).Any(l => l.Contains(words)); }
+
+/// What `AllowAlone` answered: "made", or the refusal's type and sentence.
+[SuppressWarning("observability-catch-without-log")]
+string RuleAsked(string agent, ActionInfo tool, string skill = "") {
+  try { AllowAlone(agent, tool, skill); return "made"; }
+  catch (Exception e) { return e.Type + "|" + e.Message; }
+}
+
+// ── the floor ───────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ The courier declares it sends alone. With no floor it does; under `SendsAtLeast = Propose` the same letter is
+/// proposed to the person the work is for, and nothing is sent until she says yes.
+[Test(FloorYard)]
+void an_org_floor_makes_a_declared_alone_send_proposed() {
+  runas (Ada) {
+    var a1 = CrateBy("A-1");
+    ScriptOneLetter(a1, "Your crate is in.");
+    var free = WriteAbout(a1);
+    Assert.True(free.Done);
+    Assert.Equal(1, Letter.Count());
+    Assert.True(RecordSays(free.Task, "It asked for WriteToGrower") && RecordSays(free.Task, "it is one of this work's tools, so it runs as the agent"));
+
+    TheFloor().Sends = Leave.Propose;
+    UnitOfWork.Commit();
+    Assert.Equal(Leave.Propose, App.Setting<AgentsSetup>().SendsAtLeast);
+
+    ScriptOneLetter(a1, "Your crate is graded.");
+    var held = WriteAbout(a1);
+    Assert.True(held.Waiting);
+    Assert.Equal(1, Letter.Count());
+    var proposal = AgentProposal.Single();
+    Assert.Equal("Packhouse.WriteToGrower", proposal.Action);
+    Assert.True(proposal.Sends);
+    Assert.Equal(Ada.Id, proposal.DecideBy!.Id);
+    Assert.True(RecordSays(held.Task, "your organization's policy says it is proposed first, so it was put to Ada"));
+    // The skills catalogue says the same.
+    Assert.Equal(["Propose"], Skills.Find("Packhouse.Courier", "Packhouse.TellGrower")!.Tools.Select(t => t.Leave.Name).ToList());
+
+    // A yes sends it, as her.
+    Assert.Equal(ProposalStatus.Done, ApproveAgentProposal(proposal).Status);
+    Assert.Equal(2, Letter.Count());
+  }
+}
+
+/// A floor is the least, not the most: a skill that proposes the letter every time still does, and no standing rule
+/// covers it — and a floor on another effect (spends) changes nothing for a tool that does not spend.
+[Test(FloorYard)]
+void an_agents_stricter_may_still_wins() {
+  runas (Ada) {
+    var floor = TheFloor();
+    floor.Sends = Leave.Propose;
+    floor.Spends = Leave.Never;
+    UnitOfWork.Commit();
+    var a1 = CrateBy("A-1");
+    ScriptOneLetter(a1, "Your crate is in.");
+    var careful = WriteAboutCarefully(a1);
+    Assert.True(careful.Waiting);
+    Assert.Equal(0, Letter.Count());
+    Assert.True(RecordSays(careful.Task, "its declaration says it is proposed every time"));
+    Assert.Equal(["ProposeEveryTime"], Skills.Find("Packhouse.Courier", "Packhouse.TellGrowerCarefully")!.Tools.Select(t => t.Leave.Name).ToList());
+    Assert.Equal("Osysharp.Agents.AgentRefused|Courier proposes WriteToGrower every time: its declaration says so, and no rule changes that.",
+      RuleAsked("Packhouse.Courier", Actions.Of(WriteToGrower), "Packhouse.TellGrowerCarefully"));
+    Assert.Equal(0, AgentStandingRule.Count());
+  }
+}
+
+// ── standing rules ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ With `StandingRules` off, "from now on, alone" is refused under that key — and the rules that stood before it was
+/// switched off no longer count: neither the clerk's own, nor the steward's for the work it hands on.
+[Test(FloorYard)]
+void no_standing_rule_under_standing_rules_off_and_old_ones_are_ignored() {
+  runas (Ada) {
+    var clerkRule = AllowAlone("Packhouse.Clerk", Actions.Of(FlagCrate)).Id;
+    var stewardRule = AllowAlone("Packhouse.Steward", Actions.Of(FlagCrate)).Id;
+    UnitOfWork.Commit();
+
+    TheFloor().StandingRules = false;
+    UnitOfWork.Commit();
+
+    // 1. A new rule is refused, under the organization's key.
+    Assert.Equal("PolicyRefused|This app tried to use the setting `Osysharp.Agents.AgentsSetup.StandingRules` in a way "
+      + "your organization's policy does not allow.", RuleAsked("Packhouse.Clerk", Actions.Of(MoveToLine)));
+    Assert.Equal(2, AgentStandingRule.Count());
+
+    // 2. The clerk's own rule is not read: its flag is proposed again.
+    var a2 = CrateBy("A-2");
+    var script = AgentScript.Of(
+      Says.Tool("It weighs 8 kg.", Actions.Of(FlagCrate), FlagArgs(a2, "short")),
+      Says.HandBack(new Grade { Score = 4, Finding = "Short.", Short = true }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var settled = Settle(a2);
+    Assert.True(settled.Waiting);
+    Assert.Equal("", CrateBy("A-2").Flag);
+    Assert.True(RecordSays(settled.Task, "its declaration says it is proposed first, so it was put to Ada"));
+    Assert.Equal(0, AgentStandingRule.Single(r => r.Id == clerkRule).Used);
+
+    // 3. Nor the steward's, for what it hands on: the inspector's flag under it is proposed on the steward's account.
+    var a1 = CrateBy("A-1");
+    var cast = AgentCast.Of()
+      .Plays<Steward>(AgentScript.Of(Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id)), Says.HandBack(new DeliveryNote { Graded = 1 })))
+      .Plays<Inspector>(AgentScript.Of(Says.Tool("It is bruised.", Actions.Of(FlagCrate), FlagArgs(a1, "bruised")), Says.HandBack(new Grade { Score = 5 })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    var walked = WalkThrough("ada@packhouse.example");
+    Assert.True(walked.Waiting);
+    Assert.Equal("", CrateBy("A-1").Flag);
+    var piece = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == walked.Task))[0];
+    Assert.True(RecordSays(piece.Id, "Steward, which handed this work on, may not do that alone, so it was put to Ada"));
+    Assert.Equal(0, AgentStandingRule.Single(r => r.Id == stewardRule).Used);
+    // The rules are kept, not taken back.
+    Assert.Equal(0, AgentStandingRule.Count(r => r.RevokedAt != null));
+  }
+}
+
+// ── handed-on work ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ The floor holds at every level of handed-on work. Under `SendsAtLeast = Propose`, Ada tells the courier it may
+/// write alone for her work, and in its own work it does. Under the dispatcher — which declares everything alone too —
+/// the floor holds the dispatcher's level as well, and nobody lifted that: the letter is proposed.
+[Test(FloorYard)]
+void handed_on_work_meets_the_floor_too() {
+  runas (Ada) {
+    TheFloor().Sends = Leave.Propose;
+    UnitOfWork.Commit();
+    var rule = AllowAlone("Packhouse.Courier", Actions.Of(WriteToGrower), "Packhouse.TellGrower").Id;
+    UnitOfWork.Commit();
+
+    var a1 = CrateBy("A-1");
+    ScriptOneLetter(a1, "Your crate is in.");
+    var own = WriteAbout(a1);
+    Assert.True(own.Done);
+    Assert.Equal(1, Letter.Count());
+    Assert.True(RecordSays(own.Task, "a person said it may, from now on"));
+
+    var cast = AgentCast.Of()
+      .Plays<Dispatcher>(AgentScript.Of(Says.HandTo<Courier>(new TellGrower(), Says.Row(a1.Id)), Says.HandBack(new Grade { Score = 5 })))
+      .Plays<Courier>(AgentScript.Of(Says.Tool("The grower should hear.", Actions.Of(WriteToGrower), LetterArgs(a1, "Graded.")),
+        Says.HandBack(new Grade { Score = 5 })));
+    ScriptedAnswer.Stub((model, request) => cast.Answer(model, request));
+    var handed = SendWordOf(a1);
+    Assert.True(handed.Waiting);
+    Assert.Equal(1, Letter.Count());
+    var piece = WorkTree.HandedOnBy(AgentTask.Single(t => t.Id == handed.Task))[0];
+    Assert.True(RecordSays(piece.Id, "Dispatcher, which handed this work on, may not do that alone under your organization's policy, so it was put to Ada"));
+    Assert.Equal(1, AgentStandingRule.Single(r => r.Id == rule).Used);
+  }
+}
+
+// ── turns ───────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ The courier's skill asks for ten turns. The app's `MaxTurns` — which an organization holds to a range — is two:
+/// the work stops after two, and no skill's own number takes it past that.
+[Test(FloorYard)]
+void max_turns_is_held_to_the_range() {
+  runas (Ada) {
+    TheFloor().MaxTurns = 2;
+    UnitOfWork.Commit();
+    Assert.Equal(2, App.Setting<AgentsSetup>().MaxTurns);
+    var a1 = CrateBy("A-1");
+    var script = AgentScript.Of(
+      Says.Tool(Actions.Of(WriteToGrower), LetterArgs(a1, "One.")),
+      Says.Tool(Actions.Of(WriteToGrower), LetterArgs(a1, "Two.")),
+      Says.Tool(Actions.Of(WriteToGrower), LetterArgs(a1, "Three.")),
+      Says.HandBack(new Grade { Score = 5 }));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var outcome = WriteAbout(a1);
+    Assert.False(outcome.Done);
+    Assert.Equal(AgentTaskStatus.Stopped, AgentTask.Single(t => t.Id == outcome.Task).Status);
+    Assert.Equal(2, Letter.Count());
+  }
+}
+
+// ── each floor, its own class of tool (OP-FP3c) ─────────────────────────────────────────────────────────────────────
+
+/// What the catalogue says of the courier's `MindTheFloor` tools — a query, then a tool that changes, sends, spends,
+/// reaches out, and one whose effects are unknown — read through the gate's own `DeclaredLeave`.
+List<string> FloorLeaves() {
+  return Skills.Find("Packhouse.Courier", "Packhouse.MindTheFloor")!.Tools.Select(t => t.Leave.Name).ToList();
+}
+
+/// The pretend organization's four floors, set at once.
+void SetFloor(Leave changes, Leave sends, Leave spends, Leave reachesOut) {
+  var floor = TheFloor();
+  floor.Changes = changes;
+  floor.Sends = sends;
+  floor.Spends = spends;
+  floor.ReachesOut = reachesOut;
+  UnitOfWork.Commit();
+}
+
+/// ⭐ Each floor, set alone, holds the tool of its class and no other — and a query is never floored. The courier
+/// declares everything alone, so whatever is not `Alone` below is the floor's. The unknown tool, last, meets every one.
+[Test(FloorYard)]
+void each_floor_holds_its_own_class_of_tool() {
+  runas (Ada) {
+    //                                 query    changes    sends      spends     reaches    unknown
+    Assert.Equal(["Alone", "Alone", "Alone", "Alone", "Alone", "Alone"], FloorLeaves());
+    SetFloor(Leave.Propose, Leave.Alone, Leave.Alone, Leave.Alone);
+    Assert.Equal(["Alone", "Propose", "Alone", "Alone", "Alone", "Propose"], FloorLeaves());
+    SetFloor(Leave.Alone, Leave.Propose, Leave.Alone, Leave.Alone);
+    Assert.Equal(["Alone", "Alone", "Propose", "Alone", "Alone", "Propose"], FloorLeaves());
+    SetFloor(Leave.Alone, Leave.Alone, Leave.Propose, Leave.Alone);
+    Assert.Equal(["Alone", "Alone", "Alone", "Propose", "Alone", "Propose"], FloorLeaves());
+    SetFloor(Leave.Alone, Leave.Alone, Leave.Alone, Leave.Propose);
+    Assert.Equal(["Alone", "Alone", "Alone", "Alone", "Propose", "Propose"], FloorLeaves());
+    // Every floor at Never: the query still runs alone, and nothing else runs at all.
+    SetFloor(Leave.Never, Leave.Never, Leave.Never, Leave.Never);
+    Assert.Equal(["Alone", "Never", "Never", "Never", "Never", "Never"], FloorLeaves());
+  }
+}
+
+/// ⭐ M1: a tool whose send the compiler could not see (`ActionEffects.Unknown`: reached through a function value, or
+/// no effects recorded) reads as doing nothing it can name. Under `SendsAtLeast = Propose` it is proposed, not run
+/// alone — and under several floors it meets the strictest.
+[Test(FloorYard)]
+void a_tool_whose_effects_are_unknown_meets_the_strictest_floor() {
+  runas (Ada) {
+    Assert.True(UnseenSend().Effects.Unknown);
+    Assert.False(UnseenSend().Effects.Sends);
+    Assert.Equal("Alone", FloorLeaves()[5]);
+    SetFloor(Leave.Alone, Leave.Propose, Leave.Alone, Leave.Alone);
+    Assert.Equal("Propose", FloorLeaves()[5]);
+    SetFloor(Leave.Propose, Leave.Alone, Leave.ProposeEveryTime, Leave.Alone);
+    Assert.Equal("ProposeEveryTime", FloorLeaves()[5]);
+  }
+}
+
+/// ⭐ S1: a standing rule the FLOOR forbids (not the agent's declaration) is refused under the floor's key, as every
+/// refusal the organization's policy causes is — for a tool whose send was seen, and for one whose effects are unknown.
+[Test(FloorYard)]
+void a_standing_rule_the_floor_forbids_is_refused_under_its_key() {
+  runas (Ada) {
+    SetFloor(Leave.Alone, Leave.ProposeEveryTime, Leave.Alone, Leave.Alone);
+    Assert.Equal("PolicyRefused|This app tried to use the setting `Osysharp.Agents.AgentsSetup.SendsAtLeast` in a way "
+      + "your organization's policy does not allow.", RuleAsked("Packhouse.Courier", Actions.Of(WriteToGrower), "Packhouse.TellGrower"));
+    Assert.Equal("PolicyRefused|This app tried to use the setting `Osysharp.Agents.AgentsSetup.SendsAtLeast` in a way "
+      + "your organization's policy does not allow.", RuleAsked("Packhouse.Courier", UnseenSend(), "Packhouse.MindTheFloor"));
+    SetFloor(Leave.Never, Leave.Alone, Leave.Alone, Leave.Alone);
+    Assert.Equal("PolicyRefused|This app tried to use the setting `Osysharp.Agents.AgentsSetup.ChangesAtLeast` in a way "
+      + "your organization's policy does not allow.", RuleAsked("Packhouse.Courier", ToolThat("ChangeTheCrate", changes: true), "Packhouse.MindTheFloor"));
+    Assert.Equal(0, AgentStandingRule.Count());
+  }
+}
+
+/// ⭐ A `Never` floor locked while a proposal waits: the yes does not run it — the proposal goes out of date.
+[Test(FloorYard)]
+void a_never_floor_stales_a_waiting_proposal() {
+  runas (Ada) {
+    SetFloor(Leave.Alone, Leave.Propose, Leave.Alone, Leave.Alone);
+    var a1 = CrateBy("A-1");
+    ScriptOneLetter(a1, "Your crate is in.");
+    var held = WriteAbout(a1);
+    Assert.True(held.Waiting);
+    var proposal = AgentProposal.Single();
+
+    SetFloor(Leave.Alone, Leave.Never, Leave.Alone, Leave.Alone);
+    Assert.Equal(ProposalStatus.Stale, ApproveAgentProposal(proposal).Status);
+    Assert.Equal(0, Letter.Count());
+  }
+}

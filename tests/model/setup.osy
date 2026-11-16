@@ -20,8 +20,12 @@ app.Llm = new LlmSetup {
 app.Agents = new AgentsSetup {
   Agents = [new Inspector(), new Sorter(), new Trainee(), new Clerk(), new Porter(), new Understudy(),
             new Foreman(), new Usher(), new Director(), new Yardmaster(), new Steward(), new Warden(), new Gatekeeper(),
-            new Labeller(), new Docker()],
+            new Labeller(), new Docker(), new Courier(), new Dispatcher()],
   TaskBudget = 0.05m,
+  // What an organization would set, as a pretend organization's row says (floor.osy, ORGPOL OP-FP3).
+  MaxTurns = FloorMaxTurns(),
+  ChangesAtLeast = FloorChanges(), SendsAtLeast = FloorSends(), SpendsAtLeast = FloorSpends(), ReachesOutAtLeast = FloorReachesOut(),
+  StandingRules = FloorStandingRules(),
   Guards = [new Embargo()],
   // The machines the packhouse hands work outside to, and the one kind of work it hands them (hosts.osy).
   Hosts = new PackhouseHosts(),

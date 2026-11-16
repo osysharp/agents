@@ -143,6 +143,14 @@ public entity AgentStandingRule {
 [Server, Authorize(WidensAgentAutonomy)]
 public AgentStandingRule AllowAlone(string agent, ActionInfo tool, string skill = "", bool forEverybody = false, Guid? fromProposal = null) {
   var definition = Definition(agent);
+  // SECURITY-INVARIANT(agents-no-standing-rule-when-the-organization-says-none): with `AgentsSetup.StandingRules`
+  // off — which an organization may lock — nobody says "from now on, alone": this refuses under that key, and the
+  // gate reads no rule that already stands (`GateFor`, `GateAbove`). Failure mode: an organization turns standing
+  // rules off and a rule given last week still lets an agent send unasked. Guarded by tests/floor.test.osy
+  // `no_standing_rule_under_standing_rules_off_and_old_ones_are_ignored`.
+  if (!StandingRulesHold()) {
+    OrgPolicy.Refuse(StandingRulesKey, $"a standing rule for {BareName(agent)} to run {BareName(tool.Name)} alone");
+  }
   var me = Security.CurrentUserId;
   if (me == null) { throw new AgentRefused("A standing rule is a person's to give: nobody is signed in."); }
   var person = Principal.Single(p => p.Id == me);
@@ -152,6 +160,12 @@ public AgentStandingRule AllowAlone(string agent, ActionInfo tool, string skill 
   var declared = DeclaredLeave(definition, skill, tool);
   var bare = BareName(tool.Name);
   if (declared == null) { throw new AgentRefused($"{BareName(agent)} has no tool {bare}" + (skill == "" ? "." : $" in {BareName(skill)}.")); }
+  // Never, or proposed every time, because of the organization's floor rather than the declaration: refused under the
+  // floor's key, as every refusal the organization's policy causes is.
+  var own = AgentsOwnLeave(definition, skill, tool, true);
+  if ((declared == Leave.Never || declared == Leave.ProposeEveryTime) && own != null && Rank(own!.Value) < Rank(declared!.Value)) {
+    RefuseUnderFloor(FloorFor(tool).Key, $"a standing rule for {BareName(agent)} to run {bare} alone");
+  }
   if (declared == Leave.Never) { throw new AgentRefused($"{BareName(agent)} never runs {bare}: its declaration says so, and no rule changes that."); }
   if (declared == Leave.ProposeEveryTime) { throw new AgentRefused($"{BareName(agent)} proposes {bare} every time: its declaration says so, and no rule changes that."); }
   Principal? whose = forEverybody ? null : person;
@@ -184,9 +198,91 @@ internal void NoteStandingRuleUsed(Guid rule) {
   row.LastUsedAt = DateTime.UtcNow;
 }
 
-/// What an agent's declaration says about one tool: the stricter of the agent's own and — for work on a skill — the
-/// skill's. Null: no skill of the agent holds the tool (for `skill`, when one is named).
-Leave? DeclaredLeave(Agent definition, string skill, ActionInfo tool) {
+/// The key of the organization's floor for one class of effect (`AgentsSetup.*AtLeast`).
+const string ChangesFloorKey = "Osysharp.Agents.AgentsSetup.ChangesAtLeast";
+const string SendsFloorKey = "Osysharp.Agents.AgentsSetup.SendsAtLeast";
+const string SpendsFloorKey = "Osysharp.Agents.AgentsSetup.SpendsAtLeast";
+const string ReachesOutFloorKey = "Osysharp.Agents.AgentsSetup.ReachesOutAtLeast";
+const string StandingRulesKey = "Osysharp.Agents.AgentsSetup.StandingRules";
+
+/// What the organization's floor says of one tool, and under which key: the strictest of the floors for what the
+/// tool does. A query only reads, and no floor reaches it. A tool whose effects could not all be seen
+/// (`ActionEffects.Unknown`) gets the strictest of the four.
+public class FloorVerdict {
+  public Leave Leave = Leave.Alone;
+  /// The `AgentsSetup` key that set it; "" when no floor adds anything.
+  public string Key = "";
+}
+
+FloorVerdict FloorFor(ActionInfo tool) {
+  var floor = new FloorVerdict();
+  if (tool.Query) { return floor; }
+  var setup = App.Setting<AgentsSetup>();
+  var effects = tool.Effects;
+  if (effects.Spends) { RaiseFloor(floor, setup.SpendsAtLeast, SpendsFloorKey); }
+  if (effects.Sends) { RaiseFloor(floor, setup.SendsAtLeast, SendsFloorKey); }
+  if (effects.External && !effects.Sends && !effects.Spends) { RaiseFloor(floor, setup.ReachesOutAtLeast, ReachesOutFloorKey); }
+  if (effects.Creates.Count + effects.Modifies.Count + effects.Deletes.Count > 0) { RaiseFloor(floor, setup.ChangesAtLeast, ChangesFloorKey); }
+  // Something it does could not be seen (a call the compiler could not follow, or no effects recorded): it may do any
+  // of the four, so the strictest of the four floors holds.
+  if (effects.Unknown) {
+    RaiseFloor(floor, setup.SpendsAtLeast, SpendsFloorKey);
+    RaiseFloor(floor, setup.SendsAtLeast, SendsFloorKey);
+    RaiseFloor(floor, setup.ReachesOutAtLeast, ReachesOutFloorKey);
+    RaiseFloor(floor, setup.ChangesAtLeast, ChangesFloorKey);
+  }
+  return floor;
+}
+
+/// Refuse `what` under the floor `key` names (`FloorVerdict.Key`) — `OrgPolicy.Refuse` takes each key as written, so
+/// the compiler can tell which package declares it.
+void RefuseUnderFloor(string key, string what) {
+  if (key == SpendsFloorKey) { OrgPolicy.Refuse("Osysharp.Agents.AgentsSetup.SpendsAtLeast", what); }
+  if (key == SendsFloorKey) { OrgPolicy.Refuse("Osysharp.Agents.AgentsSetup.SendsAtLeast", what); }
+  if (key == ReachesOutFloorKey) { OrgPolicy.Refuse("Osysharp.Agents.AgentsSetup.ReachesOutAtLeast", what); }
+  if (key == ChangesFloorKey) { OrgPolicy.Refuse("Osysharp.Agents.AgentsSetup.ChangesAtLeast", what); }
+}
+
+void RaiseFloor(FloorVerdict floor, Leave leave, string key) {
+  if (Rank(leave) > Rank(floor.Leave)) { floor.Leave = leave; floor.Key = key; }
+}
+
+/// Whether standing rules count: the app's `AgentsSetup.StandingRules`, which an organization may lock off.
+bool StandingRulesHold() { return App.Setting<AgentsSetup>().StandingRules; }
+
+/// ⭐ WHAT AN AGENT'S DECLARATION SAYS ABOUT ONE TOOL, UNDER THE ORGANIZATION'S FLOOR: the stricter of the agent's
+/// own and — for work on a skill — the skill's, and never looser than the floor for what the tool does
+/// (`AgentsSetup.*AtLeast`). Null: no skill of the agent holds the tool (for `skill`, when one is named).
+/// `ownTool` false: what the agent says of a tool that need not be one of its own — a piece of work ABOVE the one
+/// that asks (`LeaveAt`) — its `May`, and the named skill's when that is stricter; never null then.
+///
+/// SECURITY-INVARIANT(agents-the-organizations-floor-holds-every-gate): every reader of what an agent may do with a
+/// tool — the gate (`GateFor`), the gate of the work above (`LeaveAt`), `AllowAlone`, a proposal decided
+/// (`DecideAgentProposal`) and the skills catalogue — reads it through here, so an agent's `May` or a skill's can
+/// make a tool stricter than the organization's floor and never looser. A tool whose effects could not all be seen
+/// meets the strictest of the four floors. Failure mode: an organization locks `SendsAtLeast = Propose`, and an agent
+/// that declares `Sends = Leave.Alone` — or a piece of work handed on under one, or a tool whose send the compiler
+/// could not see — sends unasked. Guarded by tests/floor.test.osy `an_org_floor_makes_a_declared_alone_send_proposed`,
+/// `handed_on_work_meets_the_floor_too`, `each_floor_holds_its_own_class_of_tool`,
+/// `a_tool_whose_effects_are_unknown_meets_the_strictest_floor`.
+Leave? DeclaredLeave(Agent definition, string skill, ActionInfo tool, bool ownTool = true) {
+  var declared = AgentsOwnLeave(definition, skill, tool, ownTool);
+  if (declared == null) { return null; }
+  return Stricter(declared!.Value, FloorFor(tool).Leave);
+}
+
+/// What the agent's and its skill's `May` say, before the organization's floor — read by `DeclaredLeave` and by the
+/// gate's words, which say when it was the floor that made a tool stricter.
+Leave? AgentsOwnLeave(Agent definition, string skill, ActionInfo tool, bool ownTool) {
+  if (!ownTool) {
+    var mine = definition.May.For(tool);
+    foreach (var s in definition.Skills) {
+      if (SkillNameOf(s) != skill) { continue; }
+      var skills = s.May;
+      if (skills != null) { mine = Stricter(mine, skills!.For(tool)); }
+    }
+    return mine;
+  }
   Leave? leave = null;
   foreach (var s in definition.Skills) {
     if (skill != "" && SkillNameOf(s) != skill) { continue; }
@@ -218,22 +314,26 @@ public class GateVerdict {
 GateVerdict GateFor(AgentRun run, Agent definition, ActionInfo tool) {
   var declared = DeclaredLeave(definition, run.Skill, tool);
   if (declared == null) { return new GateVerdict { Leave = Leave.Never, Why = "it is not one of this work's tools" }; }
-  if (declared == Leave.Never) { return new GateVerdict { Leave = Leave.Never, Why = "the agent's declaration says it never does" }; }
+  // Who said it: the agent's declaration, or — where that was looser — the organization's floor.
+  var own = AgentsOwnLeave(definition, run.Skill, tool, true);
+  var whose = own != null && Rank(own!.Value) < Rank(declared!.Value) ? "your organization's policy" : "its declaration";
+  if (declared == Leave.Never) { return new GateVerdict { Leave = Leave.Never, Why = whose == "its declaration" ? "the agent's declaration says it never does" : whose + " says it is never done" }; }
   // Work that was handed on: the gate of every piece of work above it holds here too — see `GateAbove`.
   List<Guid> lifted = [];
   var above = run.Parent == null ? null : GateAbove(run, tool, lifted);
   if (above != null && above!.Leave == Leave.Never) { return above!; }
   if (above != null && above!.Leave == Leave.ProposeEveryTime) { return above!; }
-  if (declared == Leave.ProposeEveryTime) { return new GateVerdict { Leave = Leave.ProposeEveryTime, Why = "its declaration says it is proposed every time" }; }
+  if (declared == Leave.ProposeEveryTime) { return new GateVerdict { Leave = Leave.ProposeEveryTime, Why = whose + " says it is proposed every time" }; }
   if (above != null && above!.Leave == Leave.Propose) { return above!; }
   if (declared == Leave.Alone) {
     var why = tool.Query ? "it only reads" : "its declaration lets it";
     if (lifted.Count > 0) { why = why + ", and a person said the work above it may, from now on"; }
     return new GateVerdict { Leave = Leave.Alone, RulesAbove = lifted, Why = why };
   }
-  var rule = StandingRuleFor(run.Agent, run.Skill, tool.Name, run.Person);
+  // Standing rules switched off (`AgentsSetup.StandingRules`): the rules that stand are not read.
+  var rule = StandingRulesHold() ? StandingRuleFor(run.Agent, run.Skill, tool.Name, run.Person) : null;
   if (rule != null) { return new GateVerdict { Leave = Leave.Alone, Rule = rule, RulesAbove = lifted, Why = "a person said it may, from now on" }; }
-  return new GateVerdict { Leave = Leave.Propose, Why = "its declaration says it is proposed first" };
+  return new GateVerdict { Leave = Leave.Propose, Why = whose + " says it is proposed first" };
 }
 
 /// The standing rule that covers a tool for work done for `person`, if one stands. Read where it is stored, so a
