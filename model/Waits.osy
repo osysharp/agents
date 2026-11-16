@@ -17,6 +17,8 @@ public entity AgentWait {
   [Immutable] AgentProposal? Proposal;
   [Immutable] AgentHelp? Question;
   [Immutable] bool OnWork = false;
+  /// …or work it handed outside: each piece, with where it stood as the work stopped, one a line (`OnOutside`).
+  [Immutable, MaxLength(4000)] string OnOutside = "";
   [Immutable] DateTime Since = DateTime.UtcNow;
   AgentWaitStatus Status;                               // no default — AgentWaitFlow owns it
 
@@ -72,6 +74,8 @@ bool WaitIsOver(AgentWait wait) {
   if (wait.Task.StopAsked) { return true; }
   // Work it handed on: over when every piece has ended.
   if (wait.OnWork) { return !AgentTask.Any(t => t.Parent == wait.Task && (t.Status == AgentTaskStatus.Working || t.Status == AgentTaskStatus.Waiting)); }
+  // Work it handed outside: over when a piece has ended, or gone quiet since the work stopped.
+  if (wait.OnOutside != "") { return OutsideMoved(wait.OnOutside); }
   if (wait.Proposal != null) { return wait.Proposal!.Status != ProposalStatus.Waiting; }
   if (wait.Question != null) { return wait.Question!.Status != HelpStatus.Waiting; }
   return true;
@@ -86,49 +90,117 @@ void WakeAgentWork(Guid task) {
   }
 }
 
-/// What a piece of work is stopped on, and everything it needs to go on: kept on the receipt, written and read only
-/// by this package.
+/// ⭐ WHERE A PIECE OF WORK GOES ON FROM: the work as it stood — kept on the receipt, written and read only by this
+/// package. Written when the work stops on something (`Parked`), and — while it runs in a workflow's run — after every
+/// answer of the model and every tool it asked for: the work's checkpoint. A run that dies part-way goes on from the
+/// newest one, so nothing the model answered is asked again and no tool that answered runs twice. Gone when the work
+/// ends.
 public entity AgentTaskParking {
   [Required, Immutable, Index] AgentTask Task;
   /// The work as it stood, as JSON of `AgentRun`: the conversation so far, the tools still to answer.
   [Classification(Personal.Content)] string State = "";
   DateTime At = DateTime.UtcNow;
+  /// It stopped here on something — a person, work handed on or outside — and what that came to is still to be told
+  /// to the model. False: a checkpoint of work under way, told everything it has heard.
+  bool Parked = true;
+  /// The turn of the work it stood at, and how many times work nothing was doing was started again from here.
+  int Turn = 0;
+  int Resumes = 0;
 
   security {
     allow read, create, update, delete when UsesAgents where Task.Requester == user || Task.StartedBy == user;
     allow read, create, update, delete when SupervisesAgents;
     allow delete when ErasesAgentRecords;
-    deny create except via ParkAgentTask;
-    deny update except via ParkAgentTask;
-    deny delete except via UnparkAgentTask, ForgetAgentWork;
+    deny create except via ParkAgentTask, CheckpointAgentTask;
+    deny update except via ParkAgentTask, CheckpointAgentTask, NoteResumedFrom;
+    deny delete except via CloseAgentTask, ForgetAgentWork;
+  }
+}
+
+/// ⭐ WHAT ONE TOOL CALL ANSWERED — kept, in a workflow's run, in the same commit as what the tool did (`RunToolOnce`),
+/// by the model's id for the call. Work that goes on after its run died is answered from here for a call already made,
+/// and the tool does not run twice. Gone when the work ends.
+[Unique(Task, ToolUseId)]
+public entity AgentToolRun {
+  [Required, Immutable, Index] AgentTask Task;
+  [Required, Immutable, MaxLength(200)] string ToolUseId;
+  /// The action it was, by its full name.
+  [Immutable, MaxLength(300)] string Action = "";
+  [Immutable] ActionOutcome Outcome;
+  /// What it answered — its sentence and its value as JSON — or why it did not run.
+  [Immutable, Classification(Personal.Content)] string Said = "";
+  [Immutable, Classification(Personal.Content)] string Value = "";
+  [Immutable, MaxLength(2000), Classification(Personal.Content)] string Problem = "";
+  [Immutable] DateTime At = DateTime.UtcNow;
+
+  security {
+    allow read, create, delete when UsesAgents where Task.Requester == user || Task.StartedBy == user;
+    allow read, create, delete when SupervisesAgents;
+    allow delete when ErasesAgentRecords;
+    deny create except via RunToolOnce;
+    deny update;
+    deny delete except via CloseAgentTask, ForgetAgentWork;
   }
 }
 
 /// Stop the work where it stands: its state is kept, the receipt says it is waiting and on what, and a wait is made.
 [Server, Authorize(UsesAgents), CommitsAlone]
-internal void ParkAgentTask(Guid task, string stateJson, string waitingOn, Guid? proposal, Guid? question, bool onWork = false) {
+internal void ParkAgentTask(Guid task, string stateJson, string waitingOn, Guid? proposal, Guid? question, bool onWork = false, string onOutside = "") {
   var t = AgentTask.Single(x => x.Id == task);
   var parking = AgentTaskParking.FirstOrDefault(p => p.Task == t);
-  if (parking == null) { new AgentTaskParking { Task = t, State = stateJson }; }
-  else { parking!.State = stateJson; parking!.At = DateTime.UtcNow; }
+  if (parking == null) { new AgentTaskParking { Task = t, State = stateJson, Parked = true }; }
+  else { parking!.State = stateJson; parking!.At = DateTime.UtcNow; parking!.Parked = true; parking!.Resumes = 0; }
   MarkAgentTaskWaiting(task, waitingOn);
   new AgentWait {
     Task = t, Proposal = proposal == null ? null : AgentProposal.FirstOrDefault(p => p.Id == proposal),
-    Question = question == null ? null : AgentHelp.FirstOrDefault(h => h.Id == question), OnWork = onWork,
+    Question = question == null ? null : AgentHelp.FirstOrDefault(h => h.Id == question), OnWork = onWork, OnOutside = onOutside,
   };
   Raise(new AgentTaskWaiting { Task = t, On = waitingOn });
 }
 
-/// Take the kept state of a piece of work, for going on with it.
+/// ⭐ THE WORK'S CHECKPOINT: the work as it stands now, written in a commit of its own — after a model's answer, after
+/// each tool. Only work under way is kept so; work that has ended keeps nothing.
 [Server, Authorize(UsesAgents), CommitsAlone]
-internal string UnparkAgentTask(Guid task) {
+internal void CheckpointAgentTask(Guid task, string stateJson, int turn) {
+  var t = AgentTask.Single(x => x.Id == task);
+  if (t.Status != AgentTaskStatus.Working) { return; }
+  var kept = AgentTaskParking.FirstOrDefault(p => p.Task == t);
+  if (kept == null) { new AgentTaskParking { Task = t, State = stateJson, Parked = false, Turn = turn }; return; }
+  // A new checkpoint is the work moving: whatever stopped it before is behind it.
+  kept!.Resumes = 0;
+  kept!.State = stateJson;
+  kept!.At = DateTime.UtcNow;
+  kept!.Parked = false;
+  kept!.Turn = turn;
+}
+
+/// Work goes on from its checkpoint once more: answers how many times it has, since the checkpoint was written.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal int NoteResumedFrom(Guid task) {
+  var t = AgentTask.Single(x => x.Id == task);
+  var kept = AgentTaskParking.FirstOrDefault(p => p.Task == t);
+  if (kept == null) { return 0; }
+  kept!.Resumes = kept!.Resumes + 1;
+  return kept!.Resumes;
+}
+
+/// What going on with a piece of work starts from: the work as it stood, and whether what it stopped on is still to be
+/// told to the model.
+class KeptWork {
+  public string State = "";
+  public bool Parked = false;
+  public DateTime At;
+}
+
+/// Take the kept state of a piece of work, for going on with it. It stays kept until the work's next checkpoint, or
+/// its end — so a run that dies while it goes on starts again from the same point.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal KeptWork UnparkAgentTask(Guid task) {
   var t = AgentTask.Single(x => x.Id == task);
   var parking = AgentTaskParking.FirstOrDefault(p => p.Task == t);
-  if (parking == null) { return ""; }
-  var state = parking!.State;
-  parking!.Delete();
+  if (parking == null) { return new KeptWork(); }
   MarkAgentTaskWorking(task);
-  return state;
+  return new KeptWork { State = parking!.State, Parked = parking!.Parked, At = parking!.At };
 }
 
 /// ⭐ GO ON WITH A PIECE OF WORK its wait is over for: its state is taken back, what the person decided or answered
@@ -136,12 +208,27 @@ internal string UnparkAgentTask(Guid task) {
 /// next thing it must wait for.
 void ContinueAgentWork(AgentWait wait) {
   var taskId = wait.Task.Id;
-  var stateJson = UnparkAgentTask(taskId);
-  if (stateJson == "") { return; }
-  var run = JsonSerializer.Deserialize<AgentRun>(stateJson);
+  var kept = UnparkAgentTask(taskId);
+  if (kept.State == "") { return; }
+  // A checkpoint written since this wait began: the wait's own going-on wrote it, and its run died part-way. What the
+  // work stopped on was told to the model then — it goes on from there, and nothing is told twice.
+  if (!kept.Parked && kept.At < wait.Since) { return; }
+  var run = JsonSerializer.Deserialize<AgentRun>(kept.State);
   run.Status = AgentTaskStatus.Working;
   var definition = Definition(run.Agent);
   var skill = SkillOfRun(definition, run);
+  if (kept.Parked) {
+    if (!ToldWhatItWaitedFor(run, wait)) { return; }
+  } else if (!ResumedFrom(run)) {
+    return;
+  }
+  DriveWork(run, skill);
+}
+
+/// What a piece of work waited for is told to the model — the decision, the answer, the work that came back — and kept.
+/// False: there is nothing more to do now — it was called off, or it waits again.
+bool ToldWhatItWaitedFor(AgentRun run, AgentWait wait) {
+  var taskId = wait.Task.Id;
 
   // Called off while it waited: nothing more is asked of anybody.
   var called = StopAskedOf(taskId);
@@ -152,10 +239,12 @@ void ContinueAgentWork(AgentWait wait) {
       CloseAgentQuestion(wait.Question!.Id, HelpStatus.Unavailable, "The work it belonged to was called off.", null);
     }
     End(run, AgentTaskStatus.Cancelled, called!);
-    return;
+    return false;
   }
   // The work it handed on has come back: each piece answers the tool call that handed it on.
   if (wait.OnWork) { GatherWaited(run); }
+  // Work it handed outside has ended, or gone quiet: the model is told, as data.
+  if (wait.OnOutside != "" && !OutsideCameBack(run)) { return false; }
 
   var waited = (long)(DurableClock.UtcNow - wait.Since).TotalSeconds;
   if (wait.Proposal != null) { ProposalDecided(run, wait.Proposal!); }
@@ -163,7 +252,9 @@ void ContinueAgentWork(AgentWait wait) {
     Ai.CountHumanWait((int)Math.Min(waited, 2000000000));
     PersonAnswered(run, wait.Question!, waited);
   }
-  DriveWork(run, skill);
+  // What it waited for has been told: from here on the work goes on from its own checkpoints.
+  Checkpoint(run);
+  return true;
 }
 
 /// The skill a kept piece of work was on: the one its agent holds by that name, or the free-text job behind `Ask`.
@@ -188,6 +279,10 @@ void ProposalDecided(AgentRun run, AgentProposal proposal) {
   if (proposal.Status == ProposalStatus.Done) {
     said = $"{who} approved {tool}, and it ran as them.";
     back.ResultJson = proposal.ResultJson ?? JsonSerializer.Serialize("Done.");
+    // What it ran handed work outside: opened here, on this work, and the model told it is pending.
+    var info = Actions.Find(proposal.Action);
+    var outside = info == null ? null : HandedOutside(run, info!, proposal.ToolUseId, proposal.ResultJson ?? "");
+    if (outside != null) { back.ResultJson = outside!.Said; back.IsError = outside!.Failed; }
     run.Failures = 0;
   } else if (proposal.Status == ProposalStatus.Rejected) {
     said = $"{who} said no to {tool}: {Clipped(proposal.Reason, 300)}";

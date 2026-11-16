@@ -1164,3 +1164,47 @@ void the_record_of_a_tree_is_one_chain_that_says_who_handed_what_to_whom() {
   runas (Omar) { Assert.Equal(2, WorkTree.Of(AgentTask.Single(t => t.Id == top)).Count); }
   runas (Ben) { Assert.Equal(0, AgentTask.Count()); }
 }
+
+// ── on a model key ──────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ WORK GIVEN ON A KEY RUNS ON IT, ALL THE WAY DOWN. The foreman takes a delivery in on the yard's key and hands two
+/// crates to the inspector: every model call of the work — its own, and those of the pieces it handed on — is sent
+/// through that key's client and recorded on the key, and every receipt keeps it. A key the app does not hold is
+/// refused before anything runs.
+[Test(Yard)]
+void a_task_runs_every_call_on_its_key_and_so_do_its_delegates() {
+  Guid top;
+  runas (Ada) {
+    var a1 = CrateBy("A-1");
+    var a2 = CrateBy("A-2");
+    var cast = AgentCast.Of()
+      .Plays<Foreman>(AgentScript.Of(
+        Says.Together(
+          Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a1.Id), "call-a1"),
+          Says.HandTo<Inspector>(new GradeCrate(), Says.Row(a2.Id), "call-a2")),
+        Says.HandBack(new DeliveryNote { Graded = 2, Short = 0, Summary = "Two crates." })))
+      .PlaysAbout<Inspector>("A-1", AgentScript.Of(Says.HandBack(new Grade { Score = 8, Finding = "Sound." })))
+      .PlaysAbout<Inspector>("A-2", AgentScript.Of(Says.HandBack(new Grade { Score = 7, Finding = "Sound." })));
+    ScriptedAnswer.Stub((model, request) => {
+      NoteApart("served by", model + " for " + AgentCast.AskedAgent(request));
+      return cast.Answer(model, request);
+    });
+
+    Assert.Throws<LlmKeyRefused>(() => TakeInOnKey("ada@packhouse.example", "ghost"));
+    Assert.Equal(0, AgentTask.Count());
+
+    var outcome = TakeInOnKey("ada@packhouse.example", "yard");
+    Assert.Equal("", outcome.Problem);
+    Assert.True(outcome.Done);
+    top = outcome.Task;
+    Assert.Equal(3, AgentTask.Count());
+    Assert.Equal(3, AgentTask.Count(t => t.Key == "yard"));
+    // Two turns of the foreman and one of each inspector, every one through the yard's key.
+    var served = Heard.Where(h => h.What == "served by").Select(h => h.About).OrderBy(a => a).ToList();
+    Assert.Equal("key:yard for Foreman|key:yard for Foreman|key:yard for Inspector|key:yard for Inspector", string.Join("|", served));
+  }
+  runas (Dana) {
+    Assert.Equal(4, ModelCall.Count());
+    Assert.Equal(4, ModelCall.Count(c => c.Account == "yard" && c.Scopes.Contains("key:yard")));
+  }
+}

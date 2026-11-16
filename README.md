@@ -81,7 +81,7 @@ It has no screens. It is the layer your pages, your processes and other packages
 | **Handing work on** | `Delegates => new Delegation { To = [Specialist.Of<Checker>(new CheckPapers()), Specialist.Helper(new Summarise())], MaxDepth }`: the model is offered each as a tool, typed in and out, and pieces asked for in one turn are done side by side. A piece has its own receipt under the one that handed it on (`Parent`, `Root`, `Depth`, and `Sequence` — its place in the order it was handed on); it is done for the same person, proposes what any piece of work above it would have to propose, never does what one above it never does, and spends out of what is left above it. `WorkTree.Of(task)` reads the tree; one record, one chain. |
 | **Guards** | `AgentsSetup.Guards = [new MyGuard()]` — a class of the app's asked before and after every model call and every tool, which may stop the step with a reason. The kit ships none. |
 | **Trying again** | `Retry => new RetryRule { Attempts = 2 }` on a skill: failed work is tried again from the start, each attempt with its own receipt. `AgentWorkGaveUp` once the last has failed. |
-| **Recorded work** | Work done outside the kit's loop — by a person's session, a process of the app's own, another system — recorded as the agent's: `BeginAgentWork(agent, skill, about)` opens its receipt (`Cause == Recorded`) under the instruction set active then, read by the kit and never told, and answers the `Guidance` to send the worker, word for word; `FinishAgentWork(task, resultJson, outcome)` closes it. `RecordAgentWork(…)` does both at once; `GuidanceFor(agent, skill)` is a look before. Refused as `Do` is: no sponsor, paused, a skill it does not hold. |
+| **Recorded work** | Work done outside the kit's loop — by a person's session, a process of the app's own, another system — recorded as the agent's: `BeginAgentWork(agent, skill, about)` opens its receipt (`Cause == Recorded`) under the instruction set active then, read by the kit and never told, and answers the `Guidance` to send the worker, word for word; `FinishAgentWork(task, resultJson, outcome)` closes it. `RecordAgentWork(…)` does both at once; `GuidanceFor(agent, skill)` is a look before. `chargedTo: ["product:" + p.Id]` on any of the three charges the work as `On` charges the kit's own: on the receipt (`ChargedTo`), and sent the instructions made for those scopes. The kit's own kinds (`agent:`, `skill:`, `task:`) are refused; a signed-in caller charges only where `ChargesAgentWorkTo(scope)` admits them — whoever supervises, or reads the work charged there, until the app says more. Refused as `Do` is: no sponsor, paused, a skill it does not hold. |
 | **Corrections** | `CorrectAgentWork(task, new Correction { Wrong, Right, Because, Kind })` — on the result, on one step of the record (`Step`) or on a proposal — by whoever the work was for, gave it, or is in charge. `CorrectAgentWorkFromOutcome(task, correction, outcome: "retry-stronger")` is the app's own code correcting work from what happened to it later, with nobody signed in: by nobody (`Source == Outcome`), counted by `EffectOf` like any. A record on that work: it changes nothing the agent does. When `TeachingSetup.ProposeAfter` (3) corrections of one `Kind` recur, one instruction drawn from them is PROPOSED — and no second while it waits. |
 | **Instructions** | Standing guidance for an agent, a skill, one person's work or what work is charged to. Proposed by a person (`ProposeAgentInstruction`), a model (`DraftAgentInstruction`) or the agent (`SuggestsInstructions`) — and sent to no model until a signed-in person `TeachesAgents` admits makes it active (`ActivateAgentInstruction`). Never an agent's own account; never code running as the app. |
 | **Instruction sets** | Every activation, retirement (`RetireAgentInstruction`) and rollback (`RollBackAgentInstructions(agent, toSet, why)`) is the agent's next numbered set: who, when, why, what is active after it, and a hash. A receipt records the set its work started under and the hash of what it was sent; a proposal's fingerprint covers the set. `InstructionsOf(task)` explains a past result; `EffectOf(instruction)` counts whether it helped. |
@@ -136,8 +136,11 @@ stream<AgentSignal> Watch(string question) {
   foreach (var s in Agents.Of<Inspector>().Stream(question)) { yield return s; }
 }
 
-// For a person who is not the one signed in.
-await Agents.Of<Inspector>().For(order.Customer).Do(new GradeCrate(), crate);
+// For the person who made a row (its [CreatedBy]), not the one signed in.
+await Agents.Of<Inspector>().For(order).Do(new GradeCrate(), crate);
+
+// On one of the app's model keys (`LlmSetup.Keys`): every model call of the work, and of the work it hands on.
+await Agents.Of<Inspector>().WithKey("team-b").Do(new GradeCrate(), crate);
 
 // A typed decision, with a second opinion when the first is not sure enough.
 Decision<Line> d = await Agents.Of<Sorter>().Decide<Line>(whatWasFound, "Which line does this crate go to?");
@@ -247,7 +250,7 @@ answers that, and the process goes on from there like from any branch.
 ```osy
 state Vetting {
   enter {
-    var vetted = await Agents.Of<Vetter>().For(this.Item.RequestedBy).Do(new VetSupplier(), this.Item);
+    var vetted = await Agents.Of<Vetter>().For(this.Item).Do(new VetSupplier(), this.Item);
     if (!vetted.Done) { goto NeedsAPerson; }
     goto Deciding;
   }

@@ -13,13 +13,19 @@ app.Llm = new LlmSetup {
                    Price = new LlmPrice { Input = 10, Output = 50 }, MaxOutputTokens = 1000 },
   ],
   Default = "Small",
+  // The yard's own key, answered by a script of its name so a test sees which key served a call.
+  Keys = [ new LlmKey { Id = "yard", Client = new ScriptedModel { Name = "key:yard" } } ],
 };
 
 app.Agents = new AgentsSetup {
   Agents = [new Inspector(), new Sorter(), new Trainee(), new Clerk(), new Porter(), new Understudy(),
-            new Foreman(), new Usher(), new Director(), new Yardmaster(), new Steward(), new Warden(), new Gatekeeper()],
+            new Foreman(), new Usher(), new Director(), new Yardmaster(), new Steward(), new Warden(), new Gatekeeper(),
+            new Labeller(), new Docker()],
   TaskBudget = 0.05m,
   Guards = [new Embargo()],
+  // The machines the packhouse hands work outside to, and the one kind of work it hands them (hosts.osy).
+  Hosts = new PackhouseHosts(),
+  OutsideKinds = [new LabelSheet()],
 };
 
 // A piece of work is sent at most three of the instructions people have given its agent.

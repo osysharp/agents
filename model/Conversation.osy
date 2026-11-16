@@ -1,0 +1,524 @@
+// A conversation with an agent — many turns, each a piece of work of its own, taken by the conversation's own small run
+// after the commit that asked for it. A turn keeps where it stands after every answer of the model and every tool, so a
+// run that dies part-way goes on without asking the model again or running a tool twice; work a turn hands outside stays
+// with the conversation, and its end starts the next turn.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Workflow;
+
+/// Where a conversation stands. ⚠ Appended, never inserted.
+public enum AgentConversationStatus {
+  /// Nothing is owed: it waits for the next thing said, or for work it handed outside to come back.
+  [Label("Idle")] Idle,
+  /// A turn is being taken.
+  [Label("Taking a turn")] Turning,
+  /// The turn under way stopped on something — a person, work it handed on — and goes on when that has answered.
+  [Label("Waiting")] Waiting,
+  [Label("Ended")] Ended,
+}
+
+/// ⭐ A CONVERSATION WITH AN AGENT: who it is with, the key it runs on and what it is charged to — each fixed when it is
+/// opened (`AgentRef.Converse`) — what has been said, and every turn as a receipt of its own (`Turns`). Made and
+/// changed only by this package's own functions; the person reads their own.
+public entity AgentConversation {
+  /// The agent, by its class's full name, and its account.
+  [Required, Immutable, MaxLength(200), Index] string Agent;
+  [Required, Immutable] Principal Actor;
+  /// Who it is with: whoever opened it, as the platform recorded it. Every turn works for them, and never past what they
+  /// may do. Null: nobody — the app's own code opened it, and the agent works with its own roles alone.
+  [CreatedBy, Index, Classification(Personal.Identity)] Guid? Person;
+  /// What it is about, as a person reads it in a list.
+  [Immutable, MaxLength(300), Classification(Personal.Content)] string About = "";
+  /// ⭐ WHO PAYS, FIXED ONCE: the model key every turn runs on ("": the app's default) and what every turn is charged to
+  /// (`AgentRef.On`, as JSON of its limits). Work a turn hands outside carries the same key.
+  [Immutable, MaxLength(200)] string Key = "";
+  [Immutable, MaxLength(4000)] string Charges = "[]";
+  /// What has been said, in order: JSON of `AgentTurn` — the person's messages, each turn's answer, and what work
+  /// handed outside handed back.
+  [Classification(Personal.Content)] string History = "[]";
+  /// Something has been said, or has come back, that no turn has taken yet.
+  bool Unanswered = false;
+  /// The work handed outside whose end the model has been told, one id a line.
+  [MaxLength(8000)] string Told = "";
+  /// The turnstile: what is added to it is added one at a time.
+  long Seq = 0;
+  AgentConversationStatus Status;                     // no default — AgentConversationFlow owns it
+  [Immutable] DateTime StartedAt = DateTime.UtcNow;
+  DateTime? EndedAt;
+  /// Each turn, as its receipt; and the work its turns handed outside.
+  [ForeignKey(Conversation)] AgentTask[] Turns;
+  [ForeignKey(Conversation)] AgentDelegation[] Delegations;
+
+  security {
+    // Whoever it is with reads it; whoever supervises, audits or teaches the agents reads every one.
+    allow read when UsesAgents where Person == user;
+    allow read when SupervisesAgents || AuditsAgents || TeachesAgents || ErasesAgentRecords;
+    allow create when UsesAgents;
+    allow update when UsesAgents where Person == user;
+    allow update when SupervisesAgents || ErasesAgentRecords;
+    deny create except via OpenAgentConversation;
+    deny update History except via AppendToConversation, EraseAgentConversationContent;
+    deny update Unanswered except via AppendToConversation, TakeConversationTurn;
+    deny update Told except via AppendToConversation, NoteToldInConversation;
+    deny update EndedAt except via EndAgentConversation;
+    allow delete when ErasesAgentRecords;
+    deny delete except via ForgetAgentConversation;
+  }
+}
+
+/// What a turn's model has written so far, while it writes — for a page to show live. At most four writes a second; gone
+/// when the turn's answer is in the conversation.
+[Unique(Task)]
+public entity AgentTurnDraft {
+  [Required, Immutable, Index] AgentConversation Conversation;
+  [Required, Immutable] Guid Task;
+  [Classification(Personal.Content)] string Text = "";
+  DateTime At = DateTime.UtcNow;
+
+  security {
+    allow read when UsesAgents where Conversation.Person == user;
+    allow read when SupervisesAgents || AuditsAgents || TeachesAgents;
+    allow create, update, delete when UsesAgents where Conversation.Person == user;
+    allow create, update, delete when SupervisesAgents;
+    allow delete when ErasesAgentRecords;
+    deny create except via DraftTurn;
+    deny update except via DraftTurn;
+    deny delete except via DropDraftRow, ForgetAgentConversation, EraseAgentConversationContent;
+  }
+}
+
+// ── opening, saying, ending ────────────────────────────────────────────────────────────────────────────────────────
+
+/// Open a conversation with an agent, for whoever is signed in — what `AgentRef.Converse` does.
+[Server, Authorize(UsesAgents)]
+internal AgentConversation OpenAgentConversation(string agent, Principal actor, string about, string key, string charges) {
+  RequireListed(agent);
+  var seat = SeatOf(agent);
+  var bare = BareName(agent);
+  if (seat == null || seat.Sponsor == null) {
+    throw new AgentNotSponsored($"{bare} has no sponsor, so it does not run. Whoever supervises the agents names the "
+      + $"person accountable for it: `SponsorAgent(Agents.Of<{bare}>().Name, person)`.");
+  }
+  if (seat.Paused) { throw new AgentPaused(seat.PausedWhy == "" ? $"{bare} is paused." : $"{bare} is paused: {seat.PausedWhy}"); }
+  // The key is checked here, once, for whoever opens it: every turn runs on it, and each call is checked again as it leaves.
+  if (key != "") { RequireModelKey(key); }
+  return new AgentConversation { Agent = agent, Actor = actor, About = Clipped(about, 300), Key = key, Charges = charges };
+}
+
+/// ⭐ SAY SOMETHING IN A CONVERSATION — whoever it is with (or, for one the app's own code opened, that code). It is
+/// added to what has been said at once, and the agent answers in a turn of its own, after this request — the answer
+/// is in `History` when the turn has ended, and `AgentTurnDraft` shows it as it is written.
+[Server, Authorize(UsesAgents)]
+public void Say(AgentConversation conversation, string text) {
+  var said = text.Trim();
+  if (said == "") { throw new ValidationException("Say something."); }
+  if (said.Length > 32000) { throw new ValidationException($"A message is at most 32000 characters, and this is {said.Length}."); }
+  if (conversation.Person != Security.CurrentUserId) {
+    throw new AgentRefused("This conversation is not yours: only whoever it is with speaks in it.");
+  }
+  if (conversation.Status == AgentConversationStatus.Ended) { throw new AgentRefused("This conversation has ended."); }
+  // Stored before it is heard: the conversation's run reads what was said where it is kept.
+  UnitOfWork.Commit();
+  AppendToConversation(conversation.Id, new AgentTurn { Role = "user", Text = said, At = DateTime.UtcNow });
+  AgentConversationFlow.RaiseSaid(conversation);
+}
+
+/// End a conversation — whoever it is with, or whoever supervises the agents. The turn under way is called off, and so
+/// is the work its turns handed outside that is still out.
+[Server, Authorize(UsesAgents)]
+public void EndConversation(AgentConversation conversation, string why = "") {
+  if (conversation.Status == AgentConversationStatus.Ended) { return; }
+  var me = Security.CurrentUserId;
+  var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+  if (conversation.Person != me && (person == null || !Security.Authorize(person!, SupervisesAgents))) {
+    throw new AgentRefused("This conversation is not yours to end.");
+  }
+  EndAgentConversation(conversation.Id);
+  foreach (var turn in AgentTask.Where(t => t.Conversation == conversation && (t.Status == AgentTaskStatus.Working || t.Status == AgentTaskStatus.Waiting)).ToList()) {
+    StopAgentTask(turn, why == "" ? "The conversation was ended." : "The conversation was ended: " + why);
+  }
+  AgentConversationFlow.RaiseEnd(conversation);
+}
+
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal void EndAgentConversation(Guid id) {
+  var c = AgentConversation.Single(x => x.Id == id);
+  if (c.EndedAt == null) { c.EndedAt = DateTime.UtcNow; }
+}
+
+// ── the conversation's own run ─────────────────────────────────────────────────────────────────────────────────────
+
+/// ⭐ A CONVERSATION'S RUN: one turn at a time. A turn is taken on a clock due at once, so it runs after the commit that
+/// asked for it — never in the person's request. Each arm decides from the row, never from the raise: something said,
+/// or work that came back, while a turn is under way is taken by the turn after it.
+public workflow AgentConversationFlow {
+  Tracks    = AgentConversation.Status;
+  Autostart = true;
+  Initial   = Idle;
+
+  /// Somebody said something.
+  event Said();
+  /// Work a turn handed outside ended after that turn did.
+  event DelegationEnded();
+  /// A turn that stopped on something has ended, in the run of its wait.
+  event TurnEnded();
+  /// The turn under way stopped part-way — the run doing it is gone — and goes on from where it stood.
+  event Resume();
+  event End();
+
+  on Said {
+    when (this.Item.Status == AgentConversationStatus.Idle && this.Item.Unanswered) { goto Turning; }
+    default { }
+  }
+  on DelegationEnded {
+    when (this.Item.Status == AgentConversationStatus.Idle && this.Item.Unanswered) { goto Turning; }
+    default { }
+  }
+  on TurnEnded {
+    when (this.Item.Status == AgentConversationStatus.Waiting && !TurnStillGoing(this.Item) && this.Item.Unanswered) { goto Turning; }
+    when (this.Item.Status == AgentConversationStatus.Waiting && !TurnStillGoing(this.Item)) { goto Idle; }
+    default { }
+  }
+  on Resume {
+    when (this.Item.Status == AgentConversationStatus.Turning) { goto Turning; }
+    default { }
+  }
+  on End { goto Ended; }
+
+  state Idle { }
+
+  state Turning {
+    Expire { Within = TimeSpan.Zero; Accrues = false; }
+    on Expire {
+      if (!TakeTurn(this.Item)) { goto Waiting; }
+      if (TurnOwed(this.Item.Id)) { goto Turning; }
+      goto Idle;
+    }
+  }
+
+  state Waiting { }
+
+  // Said as an event, so the work its turns handed outside is called off with the app's own authority.
+  terminal success Ended { enter { Raise(new AgentConversationEnded { Conversation = this.Item }); } }
+}
+
+/// Whether a turn of the conversation is still under way — working, or waiting on something.
+bool TurnStillGoing(AgentConversation c) {
+  return AgentTask.Any(t => t.Conversation == c && (t.Status == AgentTaskStatus.Working || t.Status == AgentTaskStatus.Waiting));
+}
+
+/// Whether something said, or come back, is still owed a turn — read where it is stored.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal bool TurnOwed(Guid id) {
+  var c = AgentConversation.Single(x => x.Id == id);
+  return c.Unanswered && c.Status != AgentConversationStatus.Ended && c.EndedAt == null;
+}
+
+/// ⭐ TAKE ONE TURN — in the conversation's run. A turn under way that its run left part-way goes on from its checkpoint;
+/// otherwise a new turn starts from what has been said. True: the turn has ended, and its answer is in the conversation.
+/// False: it stopped on something, and its wait goes on with it.
+bool TakeTurn(AgentConversation c) {
+  var skill = new Conversation();
+  AgentRun? run = null;
+  var under = TurnUnderWay(c.Id);
+  if (under != null && under!.Status == AgentTaskStatus.Waiting) { return false; }
+  if (under != null) {
+    var kept = UnparkAgentTask(under!.Id);
+    if (kept.State != "") {
+      run = JsonSerializer.Deserialize<AgentRun>(kept.State);
+      run!.Status = AgentTaskStatus.Working;
+      // Stopped at this same point too often: it has failed, and its answer — why there is none — is said.
+      if (!ResumedFrom(run!)) {
+        CloseConversationTurn(c.Id, run!.Task);
+        return true;
+      }
+    } else {
+      // It stopped before it kept anything: nothing of it can go on, and the turn is taken again from the start.
+      CloseAgentTask(under!.Id, AgentTaskStatus.Failed, "It stopped before it kept where it stood; the turn was taken again.", null);
+    }
+  }
+  if (run == null) {
+    var said = TakeConversationTurn(c.Id);
+    if (said.Count == 0) { return true; }
+    run = StartTurn(c, skill, said);
+  }
+  DriveWork(run!, skill);
+  if (run!.Status == AgentTaskStatus.Waiting) { return false; }
+  CloseConversationTurn(c.Id, run!.Task);
+  return true;
+}
+
+/// A turn under way: its receipt, and whether it is working or waiting.
+class TurnNow {
+  public Guid Id;
+  public AgentTaskStatus Status = AgentTaskStatus.Working;
+}
+
+/// The turn of a conversation still under way, if any — read where it is stored.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal TurnNow? TurnUnderWay(Guid id) {
+  var c = AgentConversation.Single(x => x.Id == id);
+  var t = AgentTask.Where(x => x.Conversation == c && x.Parent == null && (x.Status == AgentTaskStatus.Working || x.Status == AgentTaskStatus.Waiting))
+    .OrderByDescending(x => x.StartedAt).FirstOrDefault();
+  return t == null ? null : new TurnNow { Id = t!.Id, Status = t!.Status };
+}
+
+/// What has been said, for the turn about to be taken — and nothing is owed until something more is said.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal List<AgentTurn> TakeConversationTurn(Guid id) {
+  AgentConversation.Where(x => x.Id == id).Update(x => { x.Seq = x.Seq + 1; });
+  var c = AgentConversation.Single(x => x.Id == id);
+  c.Unanswered = false;
+  return HistoryOf(c.History);
+}
+
+/// Open the receipt of one turn: the agent, for whoever the conversation is with, on its key, charged where it is,
+/// with every tool its skills hold and what has been said so far.
+AgentRun StartTurn(AgentConversation c, SkillBase skill, List<AgentTurn> said) {
+  List<LlmLimit> charges = JsonSerializer.Deserialize<List<LlmLimit>>(c.Charges)!;
+  var agent = new AgentRef { Name = c.Agent, Actor = c.Actor, Row = c, ForSomebody = true, ChargedTo = charges, Key = c.Key == "" ? null : c.Key };
+  var definition = Definition(c.Agent);
+  var asked = "";
+  foreach (var t in said) { if (t.Role == "user" && t.Delegation == null) { asked = t.Text; } }
+  var about = c.About != "" ? c.About : Clipped(asked, 120);
+  var run = Opened(agent, definition, skill, "", AgentTaskCause.Chat, about, "", null, 1, null, c.Id);
+  List<ActionInfo> tools = [];
+  foreach (var s in definition.Skills) {
+    foreach (var tool in s.Tools) {
+      var known = false;
+      foreach (var t in tools) { if (t.Name == tool.Name) { known = true; } }
+      if (!known) { tools.Add(tool); }
+    }
+  }
+  run.Tools = ToolsOf(tools, run, skill);
+  // One message a role at a time: what was said one after another by the same side is one message.
+  foreach (var turn in said) {
+    var role = turn.Role == "assistant" ? "assistant" : "user";
+    var text = turn.Text.Trim();
+    if (text == "") { continue; }
+    var last = run.Messages.Count == 0 ? null : run.Messages[run.Messages.Count - 1];
+    if (last != null && last!.Role == role) {
+      last!.Content.Add(new LlmContentBlock { Kind = LlmBlockKind.Text, Text = text });
+    } else {
+      run.Messages.Add(new LlmMessage { Role = role, Content = [ new LlmContentBlock { Kind = LlmBlockKind.Text, Text = text } ] });
+    }
+  }
+  Trace(run, new TraceEntry {
+    Kind = TraceKind.Started, Summary = $"{BareName(c.Agent)} took a turn of a conversation." + run.ToldWords, PayloadJson = JsonSerializer.Serialize(asked),
+  });
+  Checkpoint(run);
+  return run;
+}
+
+/// A conversation's turn has ended: its answer — or why there is none — joins what has been said, and the work its turns
+/// handed outside that ended unheard joins it as data, for the next turn. Said once, whoever says it first.
+void CloseConversationTurn(Guid conversation, Guid task) {
+  var end = ReceiptEndOf(task);
+  if (end.Status == AgentTaskStatus.Working || end.Status == AgentTaskStatus.Waiting) { return; }
+  var text = "";
+  if (end.Status == AgentTaskStatus.Done && end.ResultJson != "") {
+    try { text = JsonSerializer.Deserialize<string>(end.ResultJson); } catch (Exception e) { text = end.ResultJson; }
+  }
+  AppendToConversation(conversation, new AgentTurn { Role = "assistant", Text = text, Task = task, At = DateTime.UtcNow,
+    Problem = end.Status == AgentTaskStatus.Done ? "" : end.Status.Label + ": " + end.Outcome });
+  DropDraft(task);
+  foreach (var id in EndedUnheard(conversation)) { TellConversation(conversation, id); }
+}
+
+/// The work a conversation's turns handed outside that has ended, and that no turn has heard.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal List<Guid> EndedUnheard(Guid id) {
+  var c = AgentConversation.Single(x => x.Id == id);
+  List<Guid> ended = [];
+  foreach (var d in AgentDelegation.Where(x => x.Conversation == c).Take(200).ToList()) {
+    if (Over(d) && !c.Told.Contains(d.Id.ToString())) { ended.Add(d.Id); }
+  }
+  return ended;
+}
+
+/// What a piece of work handed outside handed back joins the conversation, as data — once. True: it was added now.
+bool TellConversation(Guid conversation, Guid delegation) {
+  var now = DelegationAsStored(delegation);
+  if (now == null || !now!.Ended) { return false; }
+  return AppendToConversation(conversation, new AgentTurn { Role = "user", Text = ArrivalWords([EndedBlock(now!)]),
+                                                           Delegation = delegation, At = DateTime.UtcNow });
+}
+
+/// ⭐ ADD TO WHAT HAS BEEN SAID — one at a time, and each thing once: a turn's answer by its receipt, what work handed
+/// outside handed back by the delegation. Anything but a turn's answer is owed a turn. True: it was added now.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal bool AppendToConversation(Guid id, AgentTurn turn) {
+  AgentConversation.Where(x => x.Id == id).Update(x => { x.Seq = x.Seq + 1; });
+  var c = AgentConversation.Single(x => x.Id == id);
+  var said = HistoryOf(c.History);
+  foreach (var t in said) {
+    if (turn.Task != null && t.Task == turn.Task && t.Role == turn.Role) { return false; }
+  }
+  if (turn.Delegation != null) {
+    if (c.Told.Contains(turn.Delegation!.Value.ToString())) { return false; }
+    c.Told = Clipped((c.Told == "" ? "" : c.Told + "\n") + turn.Delegation!.Value.ToString(), 8000);
+  }
+  said.Add(turn);
+  c.History = JsonSerializer.Serialize(said);
+  if (turn.Role == "user") { c.Unanswered = true; }
+  return true;
+}
+
+/// A turn heard how a piece of work handed outside ended: the conversation does not hand it to a later turn.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal void NoteToldInConversation(Guid id, Guid delegation) {
+  AgentConversation.Where(x => x.Id == id).Update(x => { x.Seq = x.Seq + 1; });
+  var c = AgentConversation.Single(x => x.Id == id);
+  if (c.Told.Contains(delegation.ToString())) { return; }
+  c.Told = Clipped((c.Told == "" ? "" : c.Told + "\n") + delegation.ToString(), 8000);
+}
+
+List<AgentTurn> HistoryOf(string json) {
+  if (json.Trim() == "") { return []; }
+  return JsonSerializer.Deserialize<List<AgentTurn>>(json);
+}
+
+// ── hearing what happens to it ─────────────────────────────────────────────────────────────────────────────────────
+
+/// A turn that ended in the run of its wait — or was closed anywhere — is told to its conversation.
+[On] void TurnFinished(AgentTaskFinished e) { HearTurnEnded(e.Task); }
+[On] void TurnFailed(AgentTaskFailed e)     { HearTurnEnded(e.Task); }
+[On] void TurnStopped(AgentTaskStopped e)   { HearTurnEnded(e.Task); }
+
+void HearTurnEnded(AgentTask task) {
+  if (task.Conversation == null || task.Parent != null) { return; }
+  TellTurnEnded(task.Id);
+}
+
+[Server, Authorize(IsTheApp)]
+internal void TellTurnEnded(Guid task) {
+  var t = AgentTask.Single(x => x.Id == task);
+  if (t.Conversation == null) { return; }
+  var c = t.Conversation!;
+  CloseConversationTurn(c.Id, task);
+  AgentConversationFlow.RaiseTurnEnded(c);
+}
+
+/// Work a conversation's turn handed outside ended after that turn did: it joins the conversation, and is owed a turn.
+[On]
+void HearConversationOutsideEnded(AgentDelegationEnded e) {
+  if (e.Delegation.Conversation == null) { return; }
+  TellOutsideEnded(e.Delegation.Id);
+}
+
+[Server, Authorize(IsTheApp)]
+internal void TellOutsideEnded(Guid delegation) {
+  var d = AgentDelegation.FirstOrDefault(x => x.Id == delegation);
+  if (d == null || d!.Conversation == null) { return; }
+  // The turn that handed it out is still under way: that turn hears it — or, when it ends first, its close hands it on.
+  if (d!.Task.Status == AgentTaskStatus.Working || d!.Task.Status == AgentTaskStatus.Waiting) { return; }
+  var c = d!.Conversation!;
+  if (c.Status == AgentConversationStatus.Ended) { return; }
+  if (TellConversation(c.Id, delegation)) { AgentConversationFlow.RaiseDelegationEnded(c); }
+}
+
+/// A conversation ended.
+[Event("Agent conversation ended")]
+public sealed class AgentConversationEnded { public AgentConversation Conversation; }
+
+/// A conversation that has ended calls off the work its turns handed outside that is still out.
+[On] void HearConversationEnded(AgentConversationEnded e) { CallOffConversationOutside(e.Conversation.Id); }
+
+[Server, Authorize(IsTheApp)]
+internal void CallOffConversationOutside(Guid id) {
+  var c = AgentConversation.Single(x => x.Id == id);
+  foreach (var d in AgentDelegation.Where(x => x.Conversation == c && x.End == AgentDelegationEnd.None).Take(50).ToList()) {
+    if (Over(d)) { continue; }
+    runas (Actor.From(d.Actor)) { CancelAs(d.Id, "The conversation it was part of has ended."); }
+  }
+}
+
+// ── the answer as it is written ────────────────────────────────────────────────────────────────────────────────────
+
+/// Ask the model for a conversation's turn, its answer handed on as it is written: the text so far is kept on the turn's
+/// draft, at most four times a second, for a page to show. What comes back is what `AskTheModel` answers.
+async Task<TurnAnswer> AskWhileDrafting(AgentRun run, TurnAsk ask) {
+  var answer = new TurnAnswer();
+  var response = new LlmResponse();
+  var text = "";
+  var shown = "";
+  var lastShown = DateTime.MinValue;
+  LlmContentBlock? building = null;
+  var result = new LlmResult();
+  var served = false;
+  try {
+    foreach (var e in Llm.Stream(ask.Request, ask.Call)) {
+      if (e.Kind == LlmStreamEventKind.TextDelta) {
+        text = text + (e.Delta ?? "");
+        shown = shown + (e.Delta ?? "");
+        var now = DateTime.UtcNow;
+        if ((now - lastShown).TotalMilliseconds >= 250) { DraftTurn(run.Conversation!.Value, run.Task, shown); lastShown = now; }
+      } else if (e.Kind == LlmStreamEventKind.ToolUseStart) {
+        if (text != "") { response.Content.Add(new LlmContentBlock { Kind = LlmBlockKind.Text, Text = text }); text = ""; }
+        building = new LlmContentBlock { Kind = LlmBlockKind.ToolUse, ToolUseId = e.ToolUseId, ToolName = e.ToolName, InputJson = "" };
+      } else if (e.Kind == LlmStreamEventKind.ToolInputDelta) {
+        if (building != null) { building!.InputJson = (building!.InputJson ?? "") + (e.InputDelta ?? ""); }
+      } else if (e.Kind == LlmStreamEventKind.ToolUseEnd) {
+        if (building != null) {
+          if ((building!.InputJson ?? "") == "") { building!.InputJson = "{}"; }
+          response.Content.Add(building!);
+          building = null;
+        }
+      } else if (e.Kind == LlmStreamEventKind.MessageComplete) {
+        response.StopReason = e.StopReason;
+        response.InputTokens = e.InputTokens;
+        response.OutputTokens = e.OutputTokens;
+        response.CacheReadTokens = e.CacheReadTokens;
+        response.CacheCreationTokens = e.CacheCreationTokens;
+        result.Model = e.Model;
+        result.RouteRule = e.RouteRule;
+        result.Call = e.Call ?? Guid.Empty;
+        result.CostMicros = e.CostMicros;
+        served = true;
+      }
+    }
+  } catch (LlmBudgetExceeded e) {
+    answer.Refusal = "Its money ran out: " + e.Message;
+    answer.RefusedAs = AgentTaskStatus.Stopped;
+    answer.SpentScope = e.Scope;
+    answer.SpentSubject = e.Subject;
+    return answer;
+  } catch (LlmRefused e) {
+    answer.Refusal = "No model would take it: " + e.Message;
+    return answer;
+  } catch (ExternalServiceException e) {
+    answer.Refusal = "The model could not be reached: " + e.Message;
+    return answer;
+  }
+  if (!served) {
+    answer.Refusal = "The model's answer ended without its closing event.";
+    return answer;
+  }
+  if (text != "") { response.Content.Add(new LlmContentBlock { Kind = LlmBlockKind.Text, Text = text }); }
+  if (shown != "") { DraftTurn(run.Conversation!.Value, run.Task, shown); }
+  result.Response = response;
+  answer.Result = result;
+  return answer;
+}
+
+/// Keep what a turn's model has written so far.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal void DraftTurn(Guid conversation, Guid task, string text) {
+  var draft = AgentTurnDraft.FirstOrDefault(d => d.Task == task);
+  if (draft == null) {
+    new AgentTurnDraft { Conversation = AgentConversation.Single(c => c.Id == conversation), Task = task, Text = text };
+    return;
+  }
+  draft!.Text = text;
+  draft!.At = DateTime.UtcNow;
+}
+
+/// The draft of a turn whose answer is in the conversation goes.
+void DropDraft(Guid task) { foreach (var d in AgentTurnDraft.Where(x => x.Task == task).ToList()) { DropDraftRow(d.Id); } }
+
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal void DropDraftRow(Guid id) {
+  foreach (var d in AgentTurnDraft.Where(x => x.Id == id).ToList()) { d.Delete(); }
+}

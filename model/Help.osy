@@ -172,10 +172,12 @@ string ConsultBrief() {
 /// given with it — never the conversation — and NO tools: it advises, and whoever asked goes on doing the work.
 ///
 /// The call is an ordinary metered one, charged to the same scopes and held to the same limits as the work it is
-/// asked during (`step: Consult`), and never stepped down to a cheaper model: a consult that does not fit is refused.
+/// asked during (`step: Consult`), on its model key (`key`, "": the app's default — what a call written before keys
+/// passes, so it runs where a call naming no key does), and never stepped down to a cheaper model: a consult that does
+/// not fit is refused.
 /// Recorded as an `AgentHelp` row whatever became of it.
 HelpAnswer AskModel(string agent, string consults, HelpReason why, string question, string context,
-                    Guid? task, Guid? requester, List<string> scopes, List<LlmLimit> limits) {
+                    Guid? task, Guid? requester, List<string> scopes, List<LlmLimit> limits, string key = "") {
   var answer = new HelpAnswer { Model = consults };
   if (consults == "") {
     answer.Answer = "This agent names no model to consult.";
@@ -188,7 +190,7 @@ HelpAnswer AskModel(string agent, string consults, HelpReason why, string questi
     try {
       var result = await Llm.Complete(request, new LlmCall {
         Model = consults, Kind = LlmTaskKind.Reason, Step = LlmStep.Consult, Scopes = scopes, Limits = limits,
-        Purpose = "consult", OnLimit = LlmOnLimit.Stop,
+        Purpose = "consult", OnLimit = LlmOnLimit.Stop, Key = key == "" ? null : key,
         // A consult during a piece of work is charged where the work is (its scopes say), not to the run it is made in.
         ChargedToItsRun = task == null,
       });

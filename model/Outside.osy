@@ -1,0 +1,995 @@
+// Work handed OUTSIDE the app — to a build host, another system — and answered back over six calls: the contract
+// `agents.delegation/1`. The work stays the agent's: its receipt lists it, its spend counts against it, and nobody
+// but the host that claimed it answers it.
+//
+//     var d = DelegateOutsideFor(work.Task, new DelegationRequest {
+//       Kind = "prototype/1", Instruction = "Build the checkout as one page.", InputsJson = inputs,
+//       Timeout = TimeSpan.FromHours(2), StaleAfter = TimeSpan.FromMinutes(10), Budget = 3.00m });
+//     QueueHostTask(d.Id);                                  // the app's own transport
+//
+//     // …and on the app's own host channel, as the host that took it:
+//     var envelope = ClaimDelegation(id, attempt);
+//     ReportDelegationProgress(id, attempt, seq, new DelegationProgress { Step = "Edit", Now = "Laying out the cart." });
+//     CompleteDelegation(id, attempt, new DelegationResult { Json = "{…}", Text = "Done." });
+//
+// ⚑ WHO ANSWERS IS THE APP'S TO SAY, TWICE. `policy HandlesDelegations => IsBuildHost;` says who may call back at all
+//   (nobody, until the app says), and `AgentsSetup.Hosts` — the app's `DelegationHosts` — names, on every call, the host
+//   the request comes from as the app authenticated it on its own channel ("" — none). The first claim binds the
+//   delegation to that identity; every later call must name the same one, or it is refused.
+//
+// ⚑ EVERY WRITE IS THE AGENT'S. A host holds no right to any row of this file: each call checks who it is, then does
+//   its work as the agent whose work it is (`runas`), so the change trail names the agent and the rows are read by
+//   whoever reads the agent's work.
+namespace Osysharp.Agents;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Storage;
+using Osysharp.Workflow;
+
+/// ⭐ WHO MAY CALL BACK ON WORK HANDED OUTSIDE — claim it, report on it, hand its files and its result back, record what
+/// it spent. Nobody, until the app names its hosts: `policy HandlesDelegations => IsBuildHost;`. Nobody signed in —
+/// an anonymous request — is never admitted, whatever this says.
+virtual policy HandlesDelegations => false;
+
+/// ⭐ THE HOSTS, AS THE APP KNOWS THEM: which host a request comes from, and whether it may take a delegation.
+///
+/// Derived by the app and named in `app.Agents` (`Hosts = new BuildHosts()`):
+///
+///     public class BuildHosts : DelegationHosts {
+///       public override string Calling() { return "host:" + CallingHost().Id; }    // the key this request came with
+///       public override bool MayTake(Guid delegation, string host) { return HostTaskFor(delegation)?.Host == host; }
+///     }
+///
+/// ⚑ THE APP'S CODE IS THE TRUST BOUNDARY. `Calling` answers from what the app authenticated (a host key, a signed
+///   request) — never from anything the request body says, which a host could set to another's.
+public class DelegationHosts {
+  /// The host the request being served comes from, as the app authenticated it on its own channel: one line, at most
+  /// 200 characters. "": none — the call is refused.
+  public virtual string Calling() { return ""; }
+  /// Whether that host may take this delegation — whether the app's own transport offered it there. Yes, until the
+  /// app says: a delegation nobody has claimed is taken by the first host `HandlesDelegations` admits.
+  public virtual bool MayTake(Guid delegation, string host) { return true; }
+}
+
+/// ⭐ ONE KIND OF WORK HANDED OUTSIDE — its name with its version ("prototype/1"), the schema of what it hands back,
+/// and the check a result must pass. Listed in `app.Agents` (`OutsideKinds = [new Prototype()]`); work of a kind the
+/// app does not list is refused before anything is written.
+public class DelegationKind {
+  /// "<name>/<version>": the version fixes the result's shape.
+  public virtual string Name => "";
+  /// The JSON Schema of `DelegationResult.Json`, as the host is handed it in the envelope.
+  public virtual string ResultSchema => "{}";
+  /// What is wrong with a result, in a sentence the delegation ends `Failed` with — or null: it fits.
+  public virtual string? Check(DelegationResult result, List<DelegationFile> files) { return null; }
+}
+
+/// Where a delegation stands. Its own run (`AgentDelegationFlow`) moves it. ⚠ Appended, never inserted.
+public enum AgentDelegationStatus {
+  /// Handed out; no host has claimed it yet.
+  [Label("Offered")] Offered,
+  /// A host claimed it and reports on it.
+  [Label("Running")] Running,
+  /// Nothing has been heard of it for longer than it may be quiet.
+  [Label("Stalled")] Stalled,
+  [Label("Completed")] Completed,
+  [Label("Failed")] Failed,
+  [Label("Cancelled")] Cancelled,
+  /// Its time ran out before it ended.
+  [Label("Timed out")] TimedOut,
+}
+
+/// How a delegation was ended by a call — what its run moves it to. ⚠ Appended, never inserted.
+public enum AgentDelegationEnd { None, Completed, Failed, Cancelled }
+
+/// Why a host says the work failed. ⚠ Appended, never inserted.
+public enum DelegationFailure {
+  /// The worker's process died.
+  Crashed,
+  /// It hit its limit — time, money, turns.
+  Limit,
+  /// It stopped reporting.
+  NoReport,
+  /// The worker would not do it.
+  Refused,
+  Other,
+}
+
+/// ⭐ ONE PIECE OF WORK HANDED OUTSIDE, on the receipt of the work that handed it out. Made only by `DelegateOutsideFor`
+/// (and, inside agent work, by the loop); answered only by the host that claimed it.
+public entity AgentDelegation {
+  [Required, Immutable, Index] AgentTask Task;
+  /// The tool call that handed it out, when an agent's tool did ("": the app's code did).
+  [Immutable, MaxLength(200)] string ToolUseId = "";
+  /// The conversation whose turn handed it out: it stays with the conversation after that turn, and its end starts the
+  /// next. Null: it is waited for by the work that handed it out.
+  [Immutable, Index] AgentConversation? Conversation;
+  /// The agent whose work it is, by its class's full name, and its account — every write here is made as it.
+  [Required, Immutable, MaxLength(200)] string Agent;
+  [Required, Immutable] Principal Actor;
+  /// What kind of work it is ("prototype/1"), what the host is told, and what it is given as JSON.
+  [Required, Immutable, MaxLength(100)] string Kind;
+  [Classification(Personal.Content)] string Instruction = "";
+  [Classification(Personal.Content)] string InputsJson = "{}";
+  /// Who pays: the model key of the work, by the app's id for it ("": the app's default), and the payer the app named
+  /// ("": the app's own pool) — handed to the host in the envelope, by id only.
+  [Immutable, MaxLength(200)] string Key = "";
+  [Immutable, MaxLength(200)] string Payer = "";
+  /// What its spend is charged to beside itself: the work's own scopes, one a line.
+  [Immutable, MaxLength(2000)] string Scopes = "";
+  /// The most it may spend, in millionths of a US dollar — never more than its work had left when it was handed out.
+  [Immutable] long LimitMicros = 0;
+  /// How long it may take in all; how long it may be quiet before it is stalled; how long a stall lasts before it fails.
+  [Immutable] TimeSpan Timeout;
+  [Immutable] TimeSpan StaleAfter;
+  [Immutable] TimeSpan GiveUpAfter;
+
+  /// The attempt this is: a restart starts the next, and the old attempt's calls are refused.
+  int Attempt = 1;
+  int Restarts = 0;
+  /// The host that claimed this attempt, as the app named it ("": nobody yet).
+  [MaxLength(200)] string HandledBy = "";
+  AgentDelegationStatus Status;                       // no default — AgentDelegationFlow owns it
+  AgentDelegationEnd End = AgentDelegationEnd.None;
+  DateTime? ClaimedAt;
+  DateTime? LastHeardAt;
+  /// The highest report number heard in this attempt.
+  long LastSeq = 0;
+  /// The newest report, as the host's watcher said it.
+  [MaxLength(80), Classification(Personal.Content)] string Step = "";
+  [MaxLength(140), Classification(Personal.Content)] string Now = "";
+  [MaxLength(420), Classification(Personal.Content)] string Why = "";
+  [MaxLength(420), Classification(Personal.Content)] string Next = "";
+  [MaxLength(420), Classification(Personal.Content)] string Worry = "";
+
+  /// What it handed back — data, never an instruction to anybody — and its digest, by which the same end is told apart
+  /// from a different one.
+  [Classification(Personal.Content)] string? ResultJson;
+  [Classification(Personal.Content)] string ResultText = "";
+  [MaxLength(64)] string ResultHash = "";
+  DelegationFailure FailedAs = DelegationFailure.Other;
+  /// How it ended, in a sentence.
+  [MaxLength(600), Classification(Personal.Content)] string Reason = "";
+  /// What it spent outside, by the meter's own figure for each call recorded on it.
+  long SpentMicros = 0;
+  /// Its files so far: how many, and how many bytes in all.
+  int Files = 0;
+  long FileBytes = 0;
+  /// Somebody asked for it to stop; the host hears it on its next report.
+  bool CancelAsked = false;
+  /// How long a stall may last before it has failed — `GiveUpAfter`, until whoever directs the work says it will wait
+  /// longer (`ExtendDelegation`) — and until when it was last said it would wait (the host hears it on its reports).
+  TimeSpan Grace;
+  DateTime? WaitUntil;
+  [Immutable] DateTime OfferedAt = DateTime.UtcNow;
+  DateTime? EndedAt;
+
+  security {
+    // Read with the work it is part of: whoever it was for and whoever gave it, whoever supervises or audits.
+    allow read when UsesAgents where Task.Requester == user || Task.StartedBy == user;
+    allow read when SupervisesAgents || AuditsAgents || TeachesAgents;
+    // The agent's own account reads and writes it: every call back is carried out as the agent whose work it is.
+    allow read, update when IsAuthenticated where Actor == user;
+    // Which agent's work it is — and nothing more — is read past these rules, so a host's call knows whose work to
+    // carry it out as before it is checked.
+    allow read via AgentOfDelegation;
+    allow create when UsesAgents;
+    deny create except via OpenAgentDelegation;
+    // SECURITY-INVARIANT(agents-a-delegation-is-answered-only-by-the-host-that-claimed-it): a delegation is
+    // claimed, reported on, ended and charged only through the six calls of this file, each refused unless the app's
+    // `HandlesDelegations` admits the caller AND the app's own code (`DelegationHosts.Calling`) names, from what IT
+    // authenticated, the host the request comes from; the first claim binds `HandledBy` to that name for the attempt,
+    // and every later call must name the same host and attempt. A delegation's id gives nothing; a signed-in person
+    // the app has not named a host, and an anonymous caller, are never admitted; the app's code is the trust boundary.
+    // A restart (`RestartDelegation`) starts the next attempt unbound, so an old attempt's calls are refused. Failure
+    // mode: whoever learns an id — a page, another host, a log — forges an end, a result or spend on somebody's work.
+    // Guarded by tests/outside.test.osy `a_delegation_is_answered_only_by_the_host_identity_that_claimed_it`.
+    deny update except via ClaimAs, HeardAs, EndAs, SpentAs, FiledAs, RestartAs, CancelAs, ExtendAs, DelegationLapsed, EraseAgentWorkContent;
+    allow delete when ErasesAgentRecords;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+/// One report on a delegation — the newest 200 are kept.
+public entity AgentDelegationProgress {
+  [Required, Immutable, Index] AgentDelegation Delegation;
+  [Immutable] int Attempt = 1;
+  long Seq = 0;
+  [MaxLength(80), Classification(Personal.Content)] string Step = "";
+  [MaxLength(140), Classification(Personal.Content)] string Now = "";
+  [MaxLength(420), Classification(Personal.Content)] string Why = "";
+  [MaxLength(420), Classification(Personal.Content)] string Next = "";
+  [MaxLength(420), Classification(Personal.Content)] string Worry = "";
+  /// When the host says it was so, and when it was heard.
+  DateTime? At;
+  DateTime HeardAt = DateTime.UtcNow;
+
+  security {
+    allow read when UsesAgents where Delegation.Task.Requester == user || Delegation.Task.StartedBy == user;
+    allow read when SupervisesAgents || AuditsAgents || TeachesAgents;
+    allow read, create, update, delete when IsAuthenticated where Delegation.Actor == user;
+    deny create except via HeardAs;
+    deny update except via HeardAs, EraseAgentWorkContent;
+    allow delete when ErasesAgentRecords;
+    deny delete except via HeardAs, ForgetAgentWork;
+  }
+}
+
+/// One file a host handed back on a delegation: readable exactly where its delegation is.
+public entity AgentDelegationFile {
+  [Required, Immutable, Index] AgentDelegation Delegation;
+  [Immutable] int Attempt = 1;
+  [Required, Immutable, MaxLength(200)] string Name;
+  [Required, Immutable, MaxLength(100)] string ContentType;
+  [Immutable] long Size = 0;
+  /// The SHA-256 of the bytes as base64: the same upload twice is one file.
+  [Immutable, MaxLength(64)] string Digest = "";
+  [Required, Immutable, Attachment] FileAsset File;
+
+  security {
+    allow read when UsesAgents where Delegation.Task.Requester == user || Delegation.Task.StartedBy == user;
+    allow read when SupervisesAgents || AuditsAgents || TeachesAgents;
+    allow read, create, delete when IsAuthenticated where Delegation.Actor == user;
+    deny create except via FiledAs;
+    deny update;
+    allow delete when ErasesAgentRecords;
+    deny delete except via ForgetAgentWork;
+  }
+}
+
+// ── handing work out ────────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What a piece of work is handed out with.
+public class DelegationRequest {
+  /// One of the app's `OutsideKinds`, by its name: "prototype/1".
+  public string Kind = "";
+  public string Instruction = "";
+  public string InputsJson = "{}";
+  /// How long it may take in all, and be quiet; a stall nobody acts on fails after twice as long again.
+  public TimeSpan Timeout = TimeSpan.FromHours(1);
+  public TimeSpan StaleAfter = TimeSpan.FromMinutes(10);
+  /// The most it may spend, in US dollars — never more than its work has left. Null: what its work has left.
+  public decimal? Budget;
+  /// Who pays, as the app names its payer ("product:" + p.Id); "": the app's own.
+  public string Payer = "";
+}
+
+/// What handing work out answers: the delegation, for the app's own transport to carry to a host. From one of an
+/// agent's tools (`DelegateOutside`) it is what the tool answers: the loop opens the delegation as the tool returns,
+/// so `Id` is empty there and `Request` is what is handed out — the app's transport hears `AgentDelegationOffered`.
+public class Delegated {
+  public Guid Id;
+  public string Kind = "";
+  /// What one of an agent's tools hands out; null once it is open.
+  public DelegationRequest? Request;
+}
+
+/// ⭐ HAND PART OF THE WORK OUTSIDE FROM ONE OF THE AGENT'S TOOLS — an `[Action]` the agent holds answers what this
+/// answers, and returns at once:
+///
+///     [Action("Build a prototype on a host")]
+///     public Delegated BuildPrototype(Design design, string instruction) {
+///       return DelegateOutside(new DelegationRequest { Kind = "prototype/1", Instruction = instruction,
+///                                                      Timeout = TimeSpan.FromHours(2), StaleAfter = TimeSpan.FromMinutes(10) });
+///     }
+///
+/// The loop opens the delegation on the work's receipt as the tool returns — on the work's key, charged where it is,
+/// out of what it has left, with the tool call that asked — and tells the model it is pending. What comes back reaches
+/// the model later as data. The app's transport carries it to a host on `AgentDelegationOffered`. Refused outside an
+/// agent's work (`DelegateOutsideFor` is the way from anywhere else), and for a kind or limits the app does not allow.
+public Delegated DelegateOutside(DelegationRequest request) {
+  if (!Actions.Cause.StartsWith("agent-task:")) {
+    throw new AgentRefused("`DelegateOutside` hands work outside from one of an agent's tools, while it works. From anywhere "
+      + "else, hand out part of a piece of work under way with `DelegateOutsideFor(task, request)`.");
+  }
+  var kind = CheckedRequest(request);
+  return new Delegated { Kind = kind.Name, Request = request };
+}
+
+/// ⭐ HAND PART OF A PIECE OF WORK OUTSIDE — to a host the app's own transport reaches. The delegation is on the work's
+/// receipt, runs on its key, is charged where it is charged and spends out of what it has left. For whoever began the
+/// work, whoever supervises the agents, and the app's own code. Refused — before anything is written — when the work
+/// has ended, the kind is not one of the app's, or a limit is out of range.
+[Server, Authorize(UsesAgents)]
+public Delegated DelegateOutsideFor(Guid task, DelegationRequest request) {
+  var receipt = AgentTask.FirstOrDefault(t => t.Id == task);
+  if (receipt == null) { throw new ValidationException("There is no such piece of work, or it is not yours to read."); }
+  if (receipt!.Status != AgentTaskStatus.Working && receipt!.Status != AgentTaskStatus.Waiting) {
+    throw new AgentRefused($"This piece of work has ended: {receipt!.Status.Label.ToLower()}. Nothing more is handed out from it.");
+  }
+  var me = Security.CurrentUserId;
+  var began = receipt!.StartedBy == null ? null : receipt!.StartedBy!.Id;
+  if (me != began) {
+    var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
+    if (person == null || !Security.Authorize(person!, SupervisesAgents)) {
+      throw new AgentRefused("Work is handed out by whoever began it, or by whoever supervises the agents.");
+    }
+  }
+  return OpenAgentDelegation(task, "", request);
+}
+
+/// Open a delegation on a piece of work: checked, limited by what the work has left, and started on its run.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal Delegated OpenAgentDelegation(Guid task, string toolUseId, DelegationRequest request) {
+  var receipt = AgentTask.Single(t => t.Id == task);
+  // Once for each tool call: work that goes on after its run died, and asks again for a call already handed out, is
+  // answered the delegation that call opened — never a second one.
+  if (toolUseId != "") {
+    var open = AgentDelegation.FirstOrDefault(d => d.Task == receipt && d.ToolUseId == toolUseId);
+    if (open != null) { return new Delegated { Id = open!.Id, Kind = open!.Kind }; }
+  }
+  var kind = CheckedRequest(request);
+  // Never more than the work has left: what it may spend, less what it has.
+  var left = receipt.LimitMicros - receipt.SpentMicros;
+  if (left < 0) { left = 0; }
+  var most = request.Budget == null ? left : Micros(request.Budget!);
+  var limit = most < left ? most : left;
+  var giveUp = TimeSpan.FromSeconds(request.StaleAfter.TotalSeconds * 2);
+  var made = new AgentDelegation {
+    Task = receipt, ToolUseId = toolUseId, Agent = receipt.Agent, Actor = receipt.Actor, Kind = kind.Name,
+    Instruction = request.Instruction, InputsJson = request.InputsJson == "" ? "{}" : request.InputsJson,
+    Key = receipt.Key, Payer = request.Payer.Trim(), Scopes = Clipped(string.Join("\n", DelegationScopes(receipt)), 2000),
+    LimitMicros = limit, Timeout = request.Timeout, StaleAfter = request.StaleAfter, GiveUpAfter = giveUp, Grace = giveUp,
+    Conversation = receipt.Conversation,
+  };
+  Raise(new AgentDelegationOffered { Delegation = made });
+  return new Delegated { Id = made.Id, Kind = kind.Name };
+}
+
+/// A request to hand work outside, checked before anything is written: answers its kind.
+DelegationKind CheckedRequest(DelegationRequest request) {
+  var kind = KindOf(request.Kind);
+  if (request.Instruction.Trim() == "") { throw new ValidationException("Say what is to be done: `Instruction`."); }
+  if (request.Instruction.Length > 64000) { throw new ValidationException("An instruction is at most 64000 characters."); }
+  if (request.InputsJson.Length > 262144) { throw new ValidationException("A delegation's inputs are at most 256 KB of JSON."); }
+  if (request.Timeout <= TimeSpan.Zero || request.Timeout > TimeSpan.FromDays(7)) {
+    throw new ValidationException("A delegation's `Timeout` is more than nothing and at most 7 days.");
+  }
+  if (request.StaleAfter < TimeSpan.FromMinutes(1) || request.StaleAfter > request.Timeout) {
+    throw new ValidationException("A delegation's `StaleAfter` is at least a minute and at most its `Timeout`.");
+  }
+  if (request.Budget != null && request.Budget! < 0) { throw new ValidationException("A delegation's `Budget` is 0 or more."); }
+  if (request.Payer.Length > 200 || request.Payer.Contains("\n")) { throw new ValidationException("A payer is named on one line, in at most 200 characters."); }
+  return kind;
+}
+
+/// What a delegation's spend is charged to beside itself: its agent, its skill, its work and every piece of work above
+/// it, and what that work is charged to — so it counts wherever a call of the work itself would.
+List<string> DelegationScopes(AgentTask task) {
+  List<string> scopes = ["agent:" + task.Agent];
+  if (task.Skill != "") { scopes.Add("skill:" + task.Skill); }
+  var piece = task;
+  while (piece != null) {
+    scopes.Add("task:" + piece!.Id.ToString());
+    piece = piece!.Parent;
+  }
+  foreach (var line in task.ChargedTo.Split("\n")) {
+    if (line.Trim() != "" && !scopes.Contains(line.Trim())) { scopes.Add(line.Trim()); }
+  }
+  return scopes;
+}
+
+/// One of the app's kinds of outside work, by its name.
+DelegationKind KindOf(string name) {
+  foreach (var kind in App.Setting<AgentsSetup>().OutsideKinds) {
+    if (kind.Name == name) { return kind; }
+  }
+  throw new AgentRefused($"\"{name}\" is not a kind of work this app hands outside. List it where the app is configured: "
+    + "`app.Agents = new AgentsSetup { OutsideKinds = [new MyKind()] };`.");
+}
+
+// ── the delegation's own run ───────────────────────────────────────────────────────────────────────────────────────
+
+/// A delegation's run: it keeps the time — how long it may be quiet, how long it may take — and moves it as the host's
+/// calls are heard. Each arm decides from the row, never from the raise.
+public workflow AgentDelegationFlow {
+  Tracks    = AgentDelegation.Status;
+  Autostart = true;
+  Initial   = Offered;
+  // Nothing waits for ever: past its time it has timed out, whatever it was doing.
+  Deadline { Within = this.Item.Timeout; }
+
+  /// A host claimed it, or reported on it.
+  event Heard();
+  /// A call ended it — completed, failed or cancelled.
+  event Ended();
+  /// It was restarted: the next attempt waits for a host.
+  event Restarted();
+  /// Whoever directs the work said it will wait longer for it.
+  event Extended();
+
+  on Deadline {
+    DelegationLapsed(this.Item, DelegationFailure.Limit, "It ran out of time before it ended.");
+    goto TimedOut;
+  }
+
+  on Ended {
+    when (this.Item.End == AgentDelegationEnd.Completed) { goto Completed; }
+    when (this.Item.End == AgentDelegationEnd.Failed) { goto Failed; }
+    when (this.Item.End == AgentDelegationEnd.Cancelled) { goto Cancelled; }
+    default { }
+  }
+
+  // A stall the work said it will wait out starts its clock again, from now, for as long as it said.
+  on Extended {
+    when (this.Item.Status == AgentDelegationStatus.Stalled) { goto Stalled; }
+    default { }
+  }
+
+  state Offered {
+    // Nobody claimed it in time: it is stalled, as one whose host went quiet is.
+    Expire { Within = this.Item.StaleAfter; }
+    on Expire { goto Stalled; }
+    on Heard {
+      when (this.Item.HandledBy != "") { goto Running; }
+      default { }
+    }
+    on Restarted { goto Offered fresh; }
+  }
+
+  state Running {
+    // ⭐ EACH REPORT STARTS THE QUIET CLOCK AGAIN: a goto to the state the run is in arms its `Expire` anew.
+    Expire { Within = this.Item.StaleAfter; }
+    on Expire { goto Stalled; }
+    on Heard { goto Running; }
+    on Restarted { goto Offered; }
+  }
+
+  state Stalled {
+    // Whoever waits on it hears that it went quiet: the work it is part of decides what to do.
+    enter { Raise(new AgentDelegationStalled { Delegation = this.Item }); }
+    // A stall nobody acts on — no report, no restart, no cancel, no word that the work will wait — has failed.
+    Expire { Within = this.Item.Grace > TimeSpan.Zero ? this.Item.Grace : this.Item.GiveUpAfter; }
+    on Expire {
+      DelegationLapsed(this.Item, DelegationFailure.NoReport, "It stopped reporting.");
+      goto Failed;
+    }
+    on Heard {
+      when (this.Item.HandledBy != "") { goto Running; }
+      default { }
+    }
+    on Restarted { goto Offered; }
+  }
+
+  terminal success Completed { enter { DelegationClosed(this.Item); } }
+  terminal error Failed {
+    Message = "the work handed outside failed";
+    enter { DelegationClosed(this.Item); }
+  }
+  terminal cancel Cancelled {
+    Message = "the work handed outside was called off";
+    enter { DelegationClosed(this.Item); }
+  }
+  terminal error TimedOut {
+    Message = "the work handed outside ran out of time";
+    enter { DelegationClosed(this.Item); }
+  }
+}
+
+/// Its run ended it — out of time, or quiet for too long: why, said once.
+[Server, Authorize(IsTheApp)]
+internal void DelegationLapsed(AgentDelegation d, DelegationFailure failure, string reason) {
+  if (d.End != AgentDelegationEnd.None) { return; }
+  d.FailedAs = failure;
+  d.Reason = reason;
+}
+
+/// A delegation has ended, however it did: whoever waits on it hears.
+void DelegationClosed(AgentDelegation d) {
+  Raise(new AgentDelegationEnded { Delegation = d });
+}
+
+// ── the six calls back ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/// What a host is handed when it claims a delegation: `agents.delegation/1`.
+public class DelegationEnvelope {
+  public string Schema = "agents.delegation/1";
+  public Guid Id;
+  public int Attempt = 1;
+  public string Kind = "";
+  public string Instruction = "";
+  /// The inputs, as the JSON they were handed out with.
+  public string Inputs = "{}";
+  public DelegationLimits Limits;
+  public DelegationPays Pays;
+  public DelegationReporting Report;
+  /// The JSON Schema `DelegationResult.Json` is checked against.
+  public string ResultSchema = "{}";
+}
+
+public class DelegationLimits {
+  public TimeSpan Timeout;
+  public TimeSpan StaleAfter;
+  public long BudgetMicros = 0;
+}
+
+/// Who pays — the key by the app's id for it, never the key itself — and the payer the app named.
+public class DelegationPays {
+  public string Key = "";
+  public string Payer = "";
+}
+
+/// How the host reports: how often, and what files it may hand back.
+public class DelegationReporting {
+  public TimeSpan ProgressEvery = TimeSpan.FromSeconds(60);
+  public int MaxFiles = 20;
+  public long MaxFileBytes = 26214400;
+  public long MaxBytes = 104857600;
+  public List<string> Types = [];
+}
+
+/// One report, as the host's watcher said it. Each is clipped to its length: step 80, now 140, why/next/worry 420.
+public class DelegationProgress {
+  public string Step = "";
+  public string Now = "";
+  public string Why = "";
+  public string Next = "";
+  public string Worry = "";
+  /// When it was so, as the host says. Null: when it was heard.
+  public DateTime? At;
+}
+
+/// What a report is answered with: where the delegation stands, and whether somebody asked it to stop.
+public class DelegationReportAnswer {
+  public AgentDelegationStatus Status = AgentDelegationStatus.Running;
+  public bool CancelAsked = false;
+  public DateTime? ExtendTo;
+}
+
+/// What a host hands back: the result as JSON of the kind's schema, its words, and its files by their upload ids.
+public class DelegationResult {
+  public string Json = "";
+  public string Text = "";
+  public List<Guid> Files = [];
+}
+
+/// One file as a kind's check sees it.
+public class DelegationFile {
+  public Guid Id;
+  public string Name = "";
+  public string ContentType = "";
+  public long Size = 0;
+}
+
+/// Why a host says the work failed.
+public class DelegationFailed {
+  public DelegationFailure Code = DelegationFailure.Other;
+  public string Text = "";
+}
+
+/// ⭐ CLAIM A DELEGATION: the first claim binds it to the host the app names for this request, and answers the
+/// envelope. The same host claiming again is answered the same envelope; any other is refused.
+[Server, Authorize(HandlesDelegations)]
+public DelegationEnvelope ClaimDelegation(Guid id, int attempt) {
+  var host = CallingDelegationHost();
+  var account = DelegationAccount(id);
+  runas (Actor.From(account)) { return ClaimAs(id, attempt, host); }
+}
+
+/// ⭐ REPORT ON A DELEGATION: what it is doing now. `seq` rises with each report; one that does not is not heard again.
+/// Heard at most once in ten seconds — a later one in that time replaces the newest — and the newest 200 are kept. A
+/// report starts the quiet clock again, and moves a stalled delegation back to running.
+[Server, Authorize(HandlesDelegations)]
+public DelegationReportAnswer ReportDelegationProgress(Guid id, int attempt, long seq, DelegationProgress p) {
+  var host = CallingDelegationHost();
+  var account = DelegationAccount(id);
+  runas (Actor.From(account)) { return HeardAs(id, attempt, host, seq, p); }
+}
+
+/// ⭐ HAND A FILE BACK ON A DELEGATION — at most 25 MB, 20 files and 100 MB in all, of a type the envelope lists, whose
+/// bytes are what the type says. The same file again (the attempt, the name and the bytes) is the same upload. Answers
+/// its id, for `DelegationResult.Files`.
+[Server, Authorize(HandlesDelegations)]
+public Guid UploadDelegationArtifact(Guid id, int attempt, string name, string contentType, byte[] bytes) {
+  var host = CallingDelegationHost();
+  var account = DelegationAccount(id);
+  runas (Actor.From(account)) { return FiledAs(id, attempt, host, name, contentType, bytes); }
+}
+
+/// ⭐ END A DELEGATION WITH ITS RESULT. The first end wins: the same result again is answered as done, a different one
+/// is refused. A result that does not fit its kind ends the delegation `Failed`, and says why.
+[Server, Authorize(HandlesDelegations)]
+public void CompleteDelegation(Guid id, int attempt, DelegationResult result) {
+  var host = CallingDelegationHost();
+  var account = DelegationAccount(id);
+  runas (Actor.From(account)) { EndAs(id, attempt, host, result, null); }
+}
+
+/// ⭐ END A DELEGATION AS FAILED, with why. The first end wins, as `CompleteDelegation`.
+[Server, Authorize(HandlesDelegations)]
+public void FailDelegation(Guid id, int attempt, DelegationFailed failed) {
+  var host = CallingDelegationHost();
+  var account = DelegationAccount(id);
+  runas (Actor.From(account)) { EndAs(id, attempt, host, null, failed); }
+}
+
+/// ⭐ RECORD A MODEL CALL A DELEGATION'S HOST MADE, on the meter: charged to the delegation (`delegation:<id>`) and to
+/// everything its work is charged to, and counted on the work's receipt. `Account` is the key it actually ran on. The
+/// app's `RecordsModelCalls` admits the host too (`policy RecordsModelCalls => ManagesModelSpend || IsBuildHost;`).
+/// Answers the meter row's call.
+[Server, Authorize(HandlesDelegations)]
+public Guid RecordDelegationSpend(Guid id, int attempt, OutsideModelCall call) {
+  var host = CallingDelegationHost();
+  var account = DelegationAccount(id);
+  var scopes = ScopesOfBound(id, attempt, host, account);
+  List<string> named = [];
+  foreach (var s in call.Scopes) { if (s.Trim() != "") { named.Add(s.Trim()); } }
+  foreach (var line in scopes.Split("\n")) { if (line != "" && !named.Contains(line)) { named.Add(line); } }
+  call.Scopes = named;
+  var recorded = RecordOutsideModelCall(call);
+  Raise(new AgentDelegationSpent { Delegation = id, Call = recorded });
+  return recorded;
+}
+
+/// What a bound delegation's spend is charged to — read as its agent, once the host is checked.
+string ScopesOfBound(Guid id, int attempt, string host, Principal account) {
+  runas (Actor.From(account)) { return BoundScopes(id, attempt, host); }
+}
+
+/// The host this request comes from, as the app's own code names it — refused when it names none, and always for a
+/// caller nobody is signed in as.
+string CallingDelegationHost() {
+  if (Security.CurrentUserId == null) {
+    throw new AgentRefused("Work handed outside is answered by a host the app has signed in, never by an anonymous caller.");
+  }
+  var host = App.Setting<AgentsSetup>().Hosts.Calling().Trim();
+  if (host == "") {
+    throw new AgentRefused("This request comes from no host the app knows. The app names its host for each request: "
+      + "`public override string Calling()` on its `DelegationHosts`.");
+  }
+  if (host.Length > 200 || host.Contains("\n")) { throw new AgentRefused("A host is named on one line, in at most 200 characters."); }
+  return host;
+}
+
+/// The account of the agent whose work a delegation is — which every call back is carried out as. A delegation the
+/// caller is not to know of is refused in the same words as one that does not exist.
+Principal DelegationAccount(Guid id) {
+  var agent = AgentOfDelegation(id);
+  if (agent == "") { throw new AgentRefused(NotYoursToAnswer()); }
+  var definition = Definition(agent);
+  return Actor.Of(definition.GetType());
+}
+
+/// Which agent's work a delegation is — the one thing a host learns before it is checked, read past the rows' rules.
+/// `internal`, so no request calls it: reached only from the calls back, each behind `HandlesDelegations`, and from
+/// calling a delegation off or starting it again, each behind its own check (`MayDirectDelegation`).
+[Server]
+internal string AgentOfDelegation(Guid id) {
+  var d = AgentDelegation.FirstOrDefault(x => x.Id == id);
+  return d == null ? "" : d!.Agent;
+}
+
+string NotYoursToAnswer() { return "This delegation is not yours to answer: no such delegation, another host claimed it, or it was restarted."; }
+
+/// The delegation, held to the host and the attempt that call back: refused for any other.
+AgentDelegation Bound(Guid id, int attempt, string host) {
+  var d = AgentDelegation.FirstOrDefault(x => x.Id == id);
+  if (d == null || d!.HandledBy != host || d!.Attempt != attempt) { throw new AgentRefused(NotYoursToAnswer()); }
+  return d!;
+}
+
+bool Over(AgentDelegation d) {
+  return d.Status == AgentDelegationStatus.Completed || d.Status == AgentDelegationStatus.Failed
+      || d.Status == AgentDelegationStatus.Cancelled || d.Status == AgentDelegationStatus.TimedOut || d.End != AgentDelegationEnd.None;
+}
+
+[Server, Authorize(IsAuthenticated), CommitsAlone]
+internal DelegationEnvelope ClaimAs(Guid id, int attempt, string host) {
+  var d = AgentDelegation.FirstOrDefault(x => x.Id == id);
+  if (d == null || d!.Attempt != attempt) { throw new AgentRefused(NotYoursToAnswer()); }
+  if (d!.HandledBy == "") {
+    if (Over(d!)) { throw new AgentRefused("This delegation has ended: " + d!.Status.Label.ToLower() + "."); }
+    if (!App.Setting<AgentsSetup>().Hosts.MayTake(id, host)) { throw new AgentRefused(NotYoursToAnswer()); }
+    d!.HandledBy = host;
+    d!.ClaimedAt = DateTime.UtcNow;
+    d!.LastHeardAt = DateTime.UtcNow;
+    UnitOfWork.Commit();
+    AgentDelegationFlow.RaiseHeard(d!);
+  } else if (d!.HandledBy != host) {
+    throw new AgentRefused(NotYoursToAnswer());
+  }
+  return EnvelopeOf(d!);
+}
+
+DelegationEnvelope EnvelopeOf(AgentDelegation d) {
+  var kind = KindOf(d.Kind);
+  return new DelegationEnvelope {
+    Id = d.Id, Attempt = d.Attempt, Kind = d.Kind, Instruction = d.Instruction, Inputs = d.InputsJson,
+    Limits = new DelegationLimits { Timeout = d.Timeout, StaleAfter = d.StaleAfter, BudgetMicros = d.LimitMicros },
+    Pays = new DelegationPays { Key = d.Key, Payer = d.Payer },
+    Report = new DelegationReporting { Types = DelegationFileTypes() },
+    ResultSchema = kind.ResultSchema,
+  };
+}
+
+[Server, Authorize(IsAuthenticated), CommitsAlone]
+internal DelegationReportAnswer HeardAs(Guid id, int attempt, string host, long seq, DelegationProgress p) {
+  var d = Bound(id, attempt, host);
+  var answer = new DelegationReportAnswer { Status = d.Status, CancelAsked = d.CancelAsked,
+                                            ExtendTo = d.WaitUntil != null && d.WaitUntil! > DateTime.UtcNow ? d.WaitUntil : null };
+  if (Over(d) || seq <= d.LastSeq) { return answer; }
+  var now = DateTime.UtcNow;
+  var newest = AgentDelegationProgress.Where(x => x.Delegation == d && x.Attempt == attempt).OrderByDescending(x => x.HeardAt).FirstOrDefault();
+  var step = Clipped(p.Step.Trim(), 80);
+  var said = Clipped(p.Now.Trim(), 140);
+  var why = Clipped(p.Why.Trim(), 420);
+  var next = Clipped(p.Next.Trim(), 420);
+  var worry = Clipped(p.Worry.Trim(), 420);
+  // At most one row in ten seconds: a later report in that time replaces the newest.
+  if (newest != null && newest!.HeardAt > now.AddSeconds(-10)) {
+    newest!.Seq = seq; newest!.Step = step; newest!.Now = said; newest!.Why = why; newest!.Next = next; newest!.Worry = worry;
+    newest!.At = p.At ?? now;
+  } else {
+    new AgentDelegationProgress { Delegation = d, Attempt = attempt, Seq = seq, Step = step, Now = said, Why = why, Next = next,
+                                  Worry = worry, At = p.At ?? now, HeardAt = now };
+    // The newest 200 are kept.
+    var kept = AgentDelegationProgress.Count(x => x.Delegation == d);
+    if (kept > 200) {
+      foreach (var old in AgentDelegationProgress.Where(x => x.Delegation == d).OrderBy(x => x.HeardAt).Take(kept - 200).ToList()) { old.Delete(); }
+    }
+  }
+  d.LastSeq = seq;
+  d.LastHeardAt = now;
+  d.Step = step; d.Now = said; d.Why = why; d.Next = next; d.Worry = worry;
+  UnitOfWork.Commit();
+  AgentDelegationFlow.RaiseHeard(d);
+  answer.Status = AgentDelegation.Single(x => x.Id == id).Status;
+  return answer;
+}
+
+/// The types a host may hand back.
+List<string> DelegationFileTypes() {
+  return ["text/html", "image/png", "image/jpeg", "image/webp", "image/gif", "image/svg+xml", "application/pdf",
+          "text/markdown", "text/plain", "application/json"];
+}
+
+/// What is wrong with a file's bytes for the type it says it is — or "": they are what it says.
+string NotWhatItSays(string contentType, byte[] b) {
+  var magic = BinaryTypeOf(b);
+  if (contentType == "image/png" || contentType == "image/jpeg" || contentType == "image/webp" || contentType == "image/gif"
+      || contentType == "application/pdf") {
+    return magic == contentType ? "" : $"It is declared {contentType}, and its bytes are not.";
+  }
+  // Every other allowed type is text: never a binary format, and UTF-8 throughout.
+  if (magic != "" || !IsUtf8Text(b)) { return $"It is declared {contentType}, and its bytes are not text."; }
+  if (contentType == "image/svg+xml" && !Encoding.UTF8.GetString(b).Contains("<svg")) { return "It is declared an SVG picture, and holds none."; }
+  return "";
+}
+
+/// The binary format a file's first bytes declare, or "".
+string BinaryTypeOf(byte[] b) {
+  if (b.Length >= 8 && b[0] == 137 && b[1] == 80 && b[2] == 78 && b[3] == 71) { return "image/png"; }
+  if (b.Length >= 3 && b[0] == 255 && b[1] == 216 && b[2] == 255) { return "image/jpeg"; }
+  if (b.Length >= 6 && b[0] == 71 && b[1] == 73 && b[2] == 70 && b[3] == 56) { return "image/gif"; }
+  if (b.Length >= 12 && b[0] == 82 && b[1] == 73 && b[2] == 70 && b[3] == 70 && b[8] == 87 && b[9] == 69 && b[10] == 66 && b[11] == 80) {
+    return "image/webp";
+  }
+  if (b.Length >= 5 && b[0] == 37 && b[1] == 80 && b[2] == 68 && b[3] == 70 && b[4] == 45) { return "application/pdf"; }
+  if (b.Length >= 4 && b[0] == 80 && b[1] == 75 && (b[2] == 3 || b[2] == 5)) { return "application/zip"; }
+  return "";
+}
+
+/// Text: no NUL, and the whole reads as UTF-8 without a replacement character.
+bool IsUtf8Text(byte[] b) {
+  for (var i = 0; i < b.Length; i++) { if (b[i] == 0) { return false; } }
+  return !Encoding.UTF8.GetString(b).Contains("�");
+}
+
+[Server, Authorize(IsAuthenticated), CommitsAlone]
+internal Guid FiledAs(Guid id, int attempt, string host, string name, string contentType, byte[] bytes) {
+  var d = Bound(id, attempt, host);
+  if (Over(d)) { throw new AgentRefused("This delegation has ended: " + d.Status.Label.ToLower() + "."); }
+  var shown = name.Trim();
+  if (shown == "" || shown.Length > 200 || shown.Contains("/") || shown.Contains("\\") || shown.Contains("\n") || shown.StartsWith(".")) {
+    throw new ValidationException("A file is named by a plain name of at most 200 characters: `index.html`.");
+  }
+  var type = contentType.Trim().ToLower();
+  if (!DelegationFileTypes().Contains(type)) {
+    throw new ValidationException($"{type} is not a type a host may hand back: " + string.Join(", ", DelegationFileTypes()) + ".");
+  }
+  if (bytes.Length == 0) { throw new ValidationException("A file holds something."); }
+  if (bytes.Length > 26214400) { throw new ValidationException("A file is at most 25 MB."); }
+  var lie = NotWhatItSays(type, bytes);
+  if (lie != "") { throw new ValidationException(lie); }
+  var digest = Crypto.Sha256Hex(Convert.ToBase64String(bytes));
+  var same = AgentDelegationFile.FirstOrDefault(f => f.Delegation == d && f.Attempt == attempt && f.Name == shown && f.Digest == digest);
+  if (same != null) { return same!.Id; }
+  if (d.Files >= 20) { throw new ValidationException("A delegation hands back at most 20 files."); }
+  if (d.FileBytes + bytes.Length > 104857600) { throw new ValidationException("A delegation hands back at most 100 MB in all."); }
+  var file = File.Create(shown, type, bytes);
+  var made = new AgentDelegationFile { Delegation = d, Attempt = attempt, Name = shown, ContentType = type, Size = bytes.Length, Digest = digest, File = file };
+  d.Files = d.Files + 1;
+  d.FileBytes = d.FileBytes + bytes.Length;
+  return made.Id;
+}
+
+[Server, Authorize(IsAuthenticated), CommitsAlone]
+internal void EndAs(Guid id, int attempt, string host, DelegationResult? result, DelegationFailed? failed) {
+  var d = Bound(id, attempt, host);
+  var hash = result != null ? Crypto.Sha256Hex("completed\n" + result!.Json + "\n" + result!.Text + "\n" + string.Join(",", result!.Files))
+                            : Crypto.Sha256Hex("failed\n" + failed!.Code.ToString() + "\n" + failed!.Text);
+  if (Over(d)) {
+    // The first end wins: the same end again is done; anything else is refused.
+    if (d.ResultHash == hash) { return; }
+    throw new AgentRefused("This delegation has already ended: " + d.Status.Label.ToLower() + ". A different end is refused.");
+  }
+  d.ResultHash = hash;
+  if (failed != null) {
+    if (failed!.Text.Length > 65536) { throw new ValidationException("Why it failed is at most 64 KB of text."); }
+    d.End = AgentDelegationEnd.Failed;
+    d.FailedAs = failed!.Code;
+    d.ResultText = failed!.Text;
+    d.Reason = Clipped(failed!.Text.Trim() == "" ? "The host said it failed (" + failed!.Code.ToString() + ")." : failed!.Text.Trim(), 600);
+  } else {
+    if (result!.Json.Length > 262144) { throw new ValidationException("A result is at most 256 KB of JSON."); }
+    if (result!.Text.Length > 65536) { throw new ValidationException("A result's words are at most 64 KB."); }
+    List<DelegationFile> files = [];
+    foreach (var f in result!.Files) {
+      var row = AgentDelegationFile.FirstOrDefault(x => x.Id == f && x.Delegation == d);
+      if (row == null) { throw new ValidationException("A result names only the files handed back on its own delegation."); }
+      files.Add(new DelegationFile { Id = row!.Id, Name = row!.Name, ContentType = row!.ContentType, Size = row!.Size });
+    }
+    d.ResultJson = result!.Json;
+    d.ResultText = result!.Text;
+    var wrong = KindOf(d.Kind).Check(result!, files);
+    if (wrong != null) {
+      // Data that does not fit is not a result: it ends failed, and says why.
+      d.End = AgentDelegationEnd.Failed;
+      d.FailedAs = DelegationFailure.Other;
+      d.Reason = Clipped("What it handed back does not fit " + d.Kind + ": " + wrong!, 600);
+    } else {
+      d.End = AgentDelegationEnd.Completed;
+      d.Reason = "Completed.";
+    }
+  }
+  d.LastHeardAt = DateTime.UtcNow;
+  d.EndedAt = DateTime.UtcNow;
+  UnitOfWork.Commit();
+  AgentDelegationFlow.RaiseEnded(d);
+}
+
+/// The scopes a bound delegation's spend is charged to, itself first.
+[Server, Authorize(IsAuthenticated), CommitsAlone]
+internal string BoundScopes(Guid id, int attempt, string host) {
+  var d = Bound(id, attempt, host);
+  return "delegation:" + d.Id.ToString() + "\n" + d.Scopes;
+}
+
+/// A call a delegation's host made, counted on it and on its work's receipt, by the meter's own figure.
+[On]
+void HearDelegationSpent(AgentDelegationSpent e) { SpentAs(e.Delegation, e.Call); }
+
+[Server, Authorize(IsTheApp)]
+internal void SpentAs(Guid id, Guid call) {
+  var d = AgentDelegation.FirstOrDefault(x => x.Id == id);
+  var row = ModelCall.FirstOrDefault(c => c.Call == call);
+  if (d == null || row == null) { return; }
+  d!.SpentMicros = d!.SpentMicros + row!.CostMicros;
+  SettleAgentTask(d!.Task.Id, new AgentTaskUse { Micros = row!.CostMicros, OutsideMicros = row!.CostMicros });
+}
+
+// ── in the app: calling it off, starting it again ──────────────────────────────────────────────────────────────────
+
+/// ⭐ CALL A DELEGATION OFF: it ends `Cancelled` now, and its host hears so on its next report. For whoever the work is
+/// theirs to stop — whoever began it, whoever supervises the agents, the agent itself, the app's own code.
+[Server]
+public void CancelDelegation(Guid id, string why = "") {
+  var account = DelegationAccount(id);
+  MayDirectDelegation(id, account);
+  runas (Actor.From(account)) { CancelAs(id, why); }
+}
+
+/// ⭐ START A DELEGATION AGAIN. `fresh` (the default): as its next attempt — nobody holds it, it waits for a host, and
+/// every call of the attempt before is refused from now on. Not fresh: the same attempt resumed by the host that holds
+/// it, from where it stood. Either way the app's transport hears `AgentDelegationRestarted`. At most two restarts;
+/// after that it is called off, or a person asked. Answers the attempt.
+[Server]
+public int RestartDelegation(Guid id, bool fresh = true) {
+  var account = DelegationAccount(id);
+  MayDirectDelegation(id, account);
+  runas (Actor.From(account)) { return RestartAs(id, fresh); }
+}
+
+/// ⭐ SAY THE WORK WILL WAIT LONGER FOR A DELEGATION: a stall it is in does not fail for `by` from now, and the host hears
+/// until when on its reports (`DelegationReportAnswer.ExtendTo`). Never past its `Timeout`. Answers until when.
+[Server]
+public DateTime ExtendDelegation(Guid id, TimeSpan by) {
+  var account = DelegationAccount(id);
+  MayDirectDelegation(id, account);
+  runas (Actor.From(account)) { return ExtendAs(id, by); }
+}
+
+/// Whoever may call a delegation off or start it again: refused for anybody else.
+void MayDirectDelegation(Guid id, Principal account) {
+  if (IsTheApp) { return; }
+  var me = Security.CurrentUserId;
+  if (me == null) { throw new AgentRefused(NotYoursToAnswer()); }
+  if (me == account.Id) { return; }
+  var person = Principal.FirstOrDefault(p => p.Id == me);
+  if (person != null && Security.Authorize(person!, SupervisesAgents)) { return; }
+  var d = AgentDelegation.FirstOrDefault(x => x.Id == id);
+  if (d != null) {
+    var began = d!.Task.StartedBy == null ? null : d!.Task.StartedBy!.Id;
+    var forWhom = d!.Task.Requester == null ? null : d!.Task.Requester!.Id;
+    if (began == me || forWhom == me) { return; }
+  }
+  throw new AgentRefused("Work handed outside is called off or started again by whoever began it, or by whoever supervises the agents.");
+}
+
+[Server, Authorize(IsAuthenticated), CommitsAlone]
+internal void CancelAs(Guid id, string why) {
+  var d = AgentDelegation.Single(x => x.Id == id);
+  if (Over(d)) { return; }
+  d.CancelAsked = true;
+  d.End = AgentDelegationEnd.Cancelled;
+  d.Reason = Clipped(why.Trim() == "" ? "It was called off." : "It was called off: " + why.Trim(), 600);
+  d.EndedAt = DateTime.UtcNow;
+  UnitOfWork.Commit();
+  AgentDelegationFlow.RaiseEnded(d);
+}
+
+[Server, Authorize(IsAuthenticated), CommitsAlone]
+internal int RestartAs(Guid id, bool fresh) {
+  var d = AgentDelegation.Single(x => x.Id == id);
+  if (Over(d)) { throw new AgentRefused("This delegation has ended: " + d.Status.Label.ToLower() + ". Hand the work out again instead."); }
+  if (d.Restarts >= 2) { throw new AgentRefused("This delegation has been started again twice. Call it off, or ask a person."); }
+  // A resume is the same attempt, by the host that holds it; one nobody holds is started fresh.
+  var anew = fresh || d.HandledBy == "";
+  if (anew) {
+    d.Attempt = d.Attempt + 1;
+    d.HandledBy = "";
+    d.ClaimedAt = null;
+    d.LastSeq = 0;
+  }
+  d.Restarts = d.Restarts + 1;
+  UnitOfWork.Commit();
+  AgentDelegationFlow.RaiseRestarted(d);
+  Raise(new AgentDelegationRestarted { Delegation = d, Fresh = anew });
+  return d.Attempt;
+}
+
+[Server, Authorize(IsAuthenticated), CommitsAlone]
+internal DateTime ExtendAs(Guid id, TimeSpan by) {
+  var d = AgentDelegation.Single(x => x.Id == id);
+  if (Over(d)) { throw new AgentRefused("This delegation has ended: " + d.Status.Label.ToLower() + "."); }
+  if (by < TimeSpan.FromMinutes(1)) { throw new ValidationException("Wait at least a minute longer."); }
+  var now = DateTime.UtcNow;
+  // Never past its time: nothing waits for ever.
+  var left = d.OfferedAt.Add(d.Timeout) - now;
+  var grace = by < left ? by : left;
+  if (grace < TimeSpan.FromMinutes(1)) { grace = TimeSpan.FromMinutes(1); }
+  d.Grace = grace;
+  d.WaitUntil = now.Add(grace);
+  UnitOfWork.Commit();
+  AgentDelegationFlow.RaiseExtended(d);
+  return d.WaitUntil!;
+}
+
+// ── what happens to it, told as events ─────────────────────────────────────────────────────────────────────────────
+
+/// A piece of work was handed outside: the app's transport carries it to a host.
+[Event("Agent work handed outside")]
+public sealed class AgentDelegationOffered { public AgentDelegation Delegation; }
+
+/// A delegation ended — completed, failed, called off or out of time.
+[Event("Agent work handed outside ended")]
+public sealed class AgentDelegationEnded { public AgentDelegation Delegation; }
+
+/// A delegation went quiet for longer than it may: whoever waits on it hears.
+[Event("Agent work handed outside stalled")]
+public sealed class AgentDelegationStalled { public AgentDelegation Delegation; }
+
+/// A delegation was started again: `Fresh`, as its next attempt for any host; else resumed by the host that holds it.
+/// The app's transport carries it there.
+[Event("Agent work handed outside started again")]
+public sealed class AgentDelegationRestarted {
+  public AgentDelegation Delegation;
+  public bool Fresh;
+}
+
+/// A call a delegation's host made was recorded on the meter.
+[Event("Agent work handed outside spent")]
+public sealed class AgentDelegationSpent {
+  public Guid Delegation;
+  public Guid Call;
+}

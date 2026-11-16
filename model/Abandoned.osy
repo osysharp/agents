@@ -69,8 +69,9 @@ bool IsUnder(AgentTask piece, AgentTask above) {
   return false;
 }
 
-/// ⭐ CLOSE THE WORK NOTHING IS DOING ANY MORE. Every piece of work that says it is under way in a whole that has
-/// written nothing for `AgentsSetup.AbandonedAfter` is closed — `Failed`, "It stopped without reporting back", or
+/// ⭐ CLOSE THE WORK NOTHING IS DOING ANY MORE — or, when a run of the kit's was doing it and it kept where it stood,
+/// have that run go on with it (`StartedAgain`). Every other piece of work that says it is under way in a whole that
+/// has written nothing for `AgentsSetup.AbandonedAfter` is closed — `Failed`, "It stopped without reporting back", or
 /// `Cancelled` when somebody had called it off — and with it everything it handed on: a piece that waited for a
 /// person is called off and its proposal withdrawn; a piece above that was waiting for it is told, and goes on.
 /// Answers how many pieces were found.
@@ -109,6 +110,8 @@ void HearWorkWasAbandoned(AgentWorkAbandoned e) { CloseAbandonedWork(e.Task.Id, 
 internal void CloseAbandonedWork(Guid id, DateTime quietSince) {
   var task = AgentTask.Single(t => t.Id == id);
   if (task.Status != AgentTaskStatus.Working) { return; }
+  // Work under a run that kept where it stood is not closed: its run is told to go on with it.
+  if (!task.StopAsked && StartedAgain(task, quietSince)) { return; }
   var root = task.Root ?? task;
   var bare = BareName(task.Agent);
   var status = task.StopAsked ? AgentTaskStatus.Cancelled : AgentTaskStatus.Failed;
@@ -130,6 +133,27 @@ internal void CloseAbandonedWork(Guid id, DateTime quietSince) {
   CallOffWorkUnder(task.Id, $"{bare}'s work, which it was part of, stopped without reporting back.");
   // The work above, if it waits for this piece, hears that it has ended.
   if (task.Parent != null && task.Parent!.Status == AgentTaskStatus.Waiting) { TellWaits(task.Parent!.Id); }
+}
+
+/// ⭐ WORK UNDER A RUN GOES ON, RATHER THAN BEING CLOSED. Work that kept where it stood (a checkpoint, `Checkpoint`)
+/// and is driven by a run of the kit's — a conversation's turn, or work going on after a wait — is not abandoned when
+/// the process doing it dies: the run is told to go on with it, from its checkpoint, and the record says so. Work that
+/// has gone on from the same checkpoint `MostResumes` times is closed as before. Answers whether it was told.
+bool StartedAgain(AgentTask task, DateTime quietSince) {
+  var kept = AgentTaskParking.FirstOrDefault(p => p.Task == task && !p.Parked);
+  if (kept == null || kept!.Resumes >= MostResumes) { return false; }
+  var conversation = task.Conversation;
+  AgentWait? wait = AgentWait.Where(w => w.Task == task && w.Status == AgentWaitStatus.Waiting).OrderByDescending(w => w.Since).FirstOrDefault();
+  var byConversation = conversation != null && conversation!.Status == AgentConversationStatus.Turning;
+  if (!byConversation && wait == null) { return false; }
+  var root = task.Root ?? task;
+  AppendAgentTrace(root.Id, task.Id, new TraceEntry {
+    Kind = TraceKind.Resumed,
+    Summary = $"Nothing had been done in it since {quietSince.ToString("yyyy-MM-dd HH:mm")} UTC: its run was told to go on from where it stood after turn {kept!.Turn}.",
+  });
+  if (byConversation) { AgentConversationFlow.RaiseResume(conversation!); }
+  else { AgentWaitFlow.RaiseWake(wait!); }
+  return true;
 }
 
 // ── the kit's own clock ──────────────────────────────────────────────────────────────────────────────────────────

@@ -121,6 +121,10 @@ public void CloseTheYard() { new Heard { What = "yard closed" }; }
 public AgentOutcome<DeliveryNote> TakeIn(string growerEmail) {
   return await Agents.Of<Foreman>().Do(new TakeInDelivery(), growerEmail, about: "Delivery of " + growerEmail);
 }
+/// The same, on one of the app's model keys.
+public AgentOutcome<DeliveryNote> TakeInOnKey(string growerEmail, string key) {
+  return await Agents.Of<Foreman>().WithKey(key).Do(new TakeInDelivery(), growerEmail, about: "Delivery of " + growerEmail);
+}
 public AgentOutcome<DeliveryNote> ShowIn(string growerEmail) {
   return await Agents.Of<Usher>().Do(new TakeInDelivery(), growerEmail, about: "Delivery of " + growerEmail);
 }

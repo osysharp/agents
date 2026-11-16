@@ -7,7 +7,7 @@ using Osysharp.Llm;
 using Osysharp.Agents;
 using Osysharp.Workflow;
 
-[Role] enum PackhouseRole { Authenticator, Grower, Lead, Auditor, Grader, Records, Teacher, OnCall, Bookkeeper, Deputy, Patron }
+[Role] enum PackhouseRole { Authenticator, Grower, Lead, Auditor, Grader, Records, Teacher, OnCall, Bookkeeper, Deputy, Patron, Host }
 
 partial entity RoleGrant { security { allow read when IsAuthenticated; } }
 

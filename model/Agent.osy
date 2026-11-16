@@ -116,10 +116,16 @@ public class AgentWork<TIn, TOut> {
   }
 }
 
-/// One turn of a conversation handed to `Ask`: who said it — "user" or "assistant" — and what.
+/// One turn of a conversation handed to `Ask`: who said it — "user" or "assistant" — and what. In a conversation's
+/// `History` it also says which turn answered (`Task`), what work handed outside handed back (`Delegation`: `Text` is
+/// that, as data), why a turn has no answer (`Problem`), and when.
 public class AgentTurn {
   public string Role = "user";
   public string Text = "";
+  public Guid? Task;
+  public Guid? Delegation;
+  public string Problem = "";
+  public DateTime? At;
 }
 
 /// What an agent answered when it was asked.
@@ -175,6 +181,8 @@ public class AgentRef {
   public bool ForSomebody = false;
   /// What the caller charges the work to beside the agent and the piece of work itself — see `On`.
   public List<LlmLimit> ChargedTo = [];
+  /// The model key every call of the work runs on, by the app's id for it — see `WithKey`. Null: the app's default.
+  public string? Key;
 
   /// ⭐ THE SAME AGENT, WORKING FOR WHOEVER MADE `row` — and so never past what that person may do — rather than for
   /// whoever is signed in. The person is the platform's own record of who made the row (its `[CreatedBy]` stamp,
@@ -185,7 +193,21 @@ public class AgentRef {
   /// ⚑ A SIGNED-IN CALLER NAMES THEMSELVES, AND NOBODY ELSE — unless the app says they may:
   ///   `policy DirectsAgentsForOthers => IsLead;`. Otherwise the work is refused before anything runs.
   public AgentRef For(Entity row) {
-    return new AgentRef { Name = Name, Actor = Actor, Row = row, ForSomebody = true, ChargedTo = ChargedTo };
+    return new AgentRef { Name = Name, Actor = Actor, Row = row, ForSomebody = true, ChargedTo = ChargedTo, Key = Key };
+  }
+
+  /// ⭐ THE SAME AGENT, ITS WORK RUN ON ONE OF THE APP'S MODEL KEYS — by the app's id for it (`LlmSetup.Keys`). Every
+  /// model call of the work runs on that key and is recorded on it, and so does every call of the work it hands on and
+  /// every attempt that tries it again: the receipt keeps the key (`AgentTask.Key`). A key the app does not hold, or one
+  /// whoever gives the work may not spend (`UsesModelKey`), is refused before anything runs.
+  ///
+  ///     var outcome = await Agents.Of<Planner>().WithKey(key.Id.ToString()).On("item:" + i.Id).Do(new PlanItem(), i);
+  public AgentRef WithKey(string key) {
+    var id = key.Trim();
+    if (id == "" || id.Length > 200 || id.Contains("\n")) {
+      throw new ValidationException("A model key is named by the app's id for it: one line, at most 200 characters.");
+    }
+    return new AgentRef { Name = Name, Actor = Actor, Row = Row, SameAs = SameAs, ForSomebody = ForSomebody, ChargedTo = ChargedTo, Key = id };
   }
 
   /// ⭐ THE SAME AGENT, ITS WORK CHARGED TO SOMETHING OF THE CALLER'S — a case, an order, a project — and held to
@@ -200,13 +222,11 @@ public class AgentRef {
 
   /// The same, with the limit said in full — its window, its figure in millionths of a dollar, what to do at it.
   public AgentRef On(LlmLimit charge) {
-    if (charge.Scope.Trim() == "" || !charge.Scope.Contains(":")) {
-      throw new ValidationException("Work is charged to a kind and a subject: `\"case:\" + c.Id`.");
-    }
+    var scope = ChargeScope(charge.Scope);
     List<LlmLimit> all = [];
-    foreach (var c in ChargedTo) { if (c.Scope != charge.Scope) { all.Add(c); } }
-    all.Add(charge);
-    return new AgentRef { Name = Name, Actor = Actor, Row = Row, SameAs = SameAs, ForSomebody = ForSomebody, ChargedTo = all };
+    foreach (var c in ChargedTo) { if (c.Scope != scope) { all.Add(c); } }
+    all.Add(new LlmLimit { Scope = scope, Window = charge.Window, LimitMicros = charge.LimitMicros, OnLimit = charge.OnLimit });
+    return new AgentRef { Name = Name, Actor = Actor, Row = Row, SameAs = SameAs, ForSomebody = ForSomebody, ChargedTo = all, Key = Key };
   }
 
   /// ⭐ GIVE IT A PIECE OF WORK: a skill it holds, and the skill's input. Answers a task that ends when the work
@@ -234,6 +254,20 @@ public class AgentRef {
   public AgentWork<TIn, TOut> Open<TIn, TOut>(Skill<TIn, TOut> skill, TIn input, string about = "") {
     var run = StartWork(this, skill, skill.Brief(input), about, null, 1);
     return new AgentWork<TIn, TOut> { Task = run.Task, Skill = skill, State = run, Agent = this, Input = input, About = about };
+  }
+
+  /// ⭐ OPEN A CONVERSATION WITH IT — for whoever is signed in, on this key and charged to what this is charged to, both
+  /// fixed here for every turn. Each thing said (`Say`) is answered in a turn of its own, after the request that said it,
+  /// with the tools of every skill it holds; work a turn hands outside stays with the conversation, and when it comes
+  /// back the agent takes the next turn with it. A turn that dies part-way goes on from where it stood.
+  ///
+  ///     var talk = Agents.Of<Designer>().WithKey(key).On("design:" + d.Id).Converse("Design " + d.Name);
+  ///     Say(talk, "Make the header calmer.");
+  public AgentConversation Converse(string about = "") {
+    if (ForSomebody) {
+      throw new ValidationException("A conversation is with whoever opens it. Open it as them — `For` is for a piece of work.");
+    }
+    return OpenAgentConversation(Name, Actor, about, Key ?? "", JsonSerializer.Serialize(ChargedTo));
   }
 
   /// Ask it something. It answers in words, using the tools of the skills it holds.
@@ -267,12 +301,12 @@ public class AgentRef {
   /// ⭐ A TYPED DECISION, with a second opinion when the first is not sure enough: `input` in, a `T` out with how
   /// sure the model is. When the agent names a model to consult and the confidence is under its `ConfidenceFloor`,
   /// the same question is asked once of that model, and its answer is the one handed back (`Decision.Model` says who
-  /// answered). Both calls are charged to the agent.
+  /// answered). Both calls are charged to the agent, and both run on its key when it has one (`WithKey`).
   public async Task<Decision<T>> Decide<T>(string input, string question = "") {
     var agent = Definition(Name);
     var scopes = AgentScopes(Name);
     var limits = AgentLimitsOf(Name, agent);
-    var first = await Llm.Decide<T>(input, question, new LlmCall { Kind = LlmTaskKind.Decide, Scopes = scopes, Limits = limits, Purpose = "decide" });
+    var first = await Llm.Decide<T>(input, question, new LlmCall { Kind = LlmTaskKind.Decide, Scopes = scopes, Limits = limits, Purpose = "decide", Key = Key });
     var consults = agent.Consults;
     if (consults == "" || first.Confidence >= agent.ConfidenceFloor || !MayConsult()) { return first; }
     var record = new HelpRecord {
@@ -282,7 +316,7 @@ public class AgentRef {
     try {
       var second = await Llm.Decide<T>(input, question, new LlmCall {
         Model = consults, Kind = LlmTaskKind.Decide, Step = LlmStep.Consult, Scopes = scopes, Limits = limits,
-        Purpose = "consult", OnLimit = LlmOnLimit.Stop,
+        Purpose = "consult", OnLimit = LlmOnLimit.Stop, Key = Key,
       });
       record.Status = HelpStatus.Answered;
       record.Answer = $"Decided with confidence {second.Confidence}; the first answer had {first.Confidence}.";

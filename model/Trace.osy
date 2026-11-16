@@ -29,6 +29,12 @@ public enum TraceKind {
   [Label("Handed work on")] HandedOn,
   /// Work it handed on came back: how it ended, and what it cost.
   [Label("Work came back")] CameBack,
+  /// It handed a piece of its work outside the app — to a host — and was told it is pending.
+  [Label("Handed work outside")] HandedOutside,
+  /// Work it handed outside ended, or went quiet, and the model was told.
+  [Label("Outside work came back")] OutsideCameBack,
+  /// The run doing it stopped part-way, and the work went on from where it stood.
+  [Label("Went on")] Resumed,
 }
 
 /// ⭐ ONE LINE OF THE RECORD. `Summary` says the step in plain words and is kept with the record; `Payload` is the

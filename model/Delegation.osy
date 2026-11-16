@@ -101,6 +101,8 @@ class WorkAbove {
   /// Everything the work above is charged to and held to: this is charged there and held to it as well.
   public List<string> Scopes = [];
   public List<LlmLimit> Limits = [];
+  /// The model key the work above runs on: this runs on it too.
+  public string Key = "";
   /// The agents above, from the nearest up, by their own names.
   public List<string> Above = [];
 
@@ -479,6 +481,7 @@ ChildWork? StartChild(AgentRun run, Agent definition, LlmContentBlock asked) {
   var over = new WorkAbove {
     Task = run.Task, Root = run.Root, Depth = run.Depth, Person = run.Person, ChargedTo = mine.ChargedTo, RoomMicros = room,
     BudgetMicros = to!.Budget == null ? null : Micros(to!.Budget!), Scopes = run.Scopes, Limits = run.Limits, Above = above,
+    Key = run.Key,
   };
   var who = new AgentRef { Name = agent, Actor = account! };
   var about = mine.About != "" ? mine.About : Words(BareName(skill));

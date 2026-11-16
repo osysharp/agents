@@ -66,6 +66,18 @@ public int EraseAgentWorkContent(AgentTask task, string why) {
       proposal.ResultJson = null;
       proposal.Problem = "";
     }
+    // What it handed outside: what the host was told and given, what it reported and what it handed back.
+    foreach (var outside in AgentDelegation.Where(d => d.Task == piece).ToList()) {
+      foreach (var report in AgentDelegationProgress.Where(r => r.Delegation == outside).ToList()) {
+        report.Step = ""; report.Now = ""; report.Why = ""; report.Next = ""; report.Worry = "";
+      }
+      outside.Instruction = "";
+      outside.InputsJson = "{}";
+      outside.ResultJson = null;
+      outside.ResultText = "";
+      outside.Reason = "";
+      outside.Step = ""; outside.Now = ""; outside.Why = ""; outside.Next = ""; outside.Worry = "";
+    }
     if (piece.Result != null) { piece.Result = null; }
     if (piece.ContentErasedAt == null) {
       piece.ContentErasedAt = now;
@@ -150,7 +162,13 @@ public int ForgetAgentWork(AgentTask task) {
     foreach (var wait in AgentWait.Where(w => w.Task == piece).ToList()) { wait.Delete(); }
     foreach (var wait in AgentWorkWait.Where(w => w.Task == piece).ToList()) { wait.Delete(); }
     foreach (var parking in AgentTaskParking.Where(p => p.Task == piece).ToList()) { parking.Delete(); }
+    foreach (var ran in AgentToolRun.Where(r => r.Task == piece).ToList()) { ran.Delete(); }
     foreach (var forWhom in AgentWorkFor.Where(w => w.Task == piece.Id).ToList()) { forWhom.Delete(); }
+    foreach (var outside in AgentDelegation.Where(d => d.Task == piece).ToList()) {
+      foreach (var report in AgentDelegationProgress.Where(r => r.Delegation == outside).ToList()) { report.Delete(); }
+      foreach (var file in AgentDelegationFile.Where(f => f.Delegation == outside).ToList()) { file.Delete(); }
+      outside.Delete();
+    }
     // That it was corrected, and what was learned from it, outlive the record. What each correction SAID was about
     // this work, and goes with it; the correction lets go of the work.
     foreach (var correction in AgentCorrection.Where(c => c.Task == piece).ToList()) {
@@ -176,11 +194,46 @@ public int ForgetAgentWork(AgentTask task) {
   return tree.Count;
 }
 
+/// ⭐ ERASE WHAT WAS SAID IN A CONVERSATION — its history, every turn's content (`EraseAgentWorkContent`) and what its
+/// turns' model was writing. That it took place, when, with which agent and at what cost stays. Once it has ended.
+[Server, Authorize(ErasesAgentRecords)]
+public int EraseAgentConversationContent(AgentConversation conversation, string why) {
+  if (why.Trim() == "") { throw new ValidationException("Say why it is erased: that much is kept."); }
+  RequireConversationEnded(conversation);
+  var gone = 0;
+  foreach (var turn in AgentTask.Where(t => t.Conversation == conversation).ToList()) { gone = gone + EraseAgentWorkContent(turn, why); }
+  foreach (var draft in AgentTurnDraft.Where(d => d.Conversation == conversation).ToList()) { draft.Delete(); }
+  conversation.History = "[]";
+  return gone;
+}
+
+/// ⭐ DELETE A CONVERSATION WHOSE TIME IS UP: it, every turn's receipt and record (`ForgetAgentWork`), and its drafts.
+/// Once it has ended. Answers how many receipts went.
+[Server, Authorize(ErasesAgentRecords)]
+public int ForgetAgentConversation(AgentConversation conversation) {
+  RequireConversationEnded(conversation);
+  var gone = 0;
+  foreach (var turn in AgentTask.Where(t => t.Conversation == conversation).ToList()) { gone = gone + ForgetAgentWork(turn); }
+  foreach (var draft in AgentTurnDraft.Where(d => d.Conversation == conversation).ToList()) { draft.Delete(); }
+  conversation.Delete();
+  return gone;
+}
+
+void RequireConversationEnded(AgentConversation conversation) {
+  if (conversation.Status != AgentConversationStatus.Ended) {
+    throw new ValidationException("The conversation is still open. End it first (`EndConversation`), then erase it.");
+  }
+}
+
 /// Work is erased once it has ended: a record still being written would go on gathering what was just erased.
 void RequireEnded(List<AgentTask> tree) {
   foreach (var piece in tree) {
     if (piece.Status == AgentTaskStatus.Working || piece.Status == AgentTaskStatus.Waiting) {
       throw new ValidationException($"{BareName(piece.Agent)} is still working on it. Stop the work first (`StopAgentTask`), then erase it.");
+    }
+    if (AgentDelegation.Any(d => d.Task == piece && d.End == AgentDelegationEnd.None
+        && (d.Status == AgentDelegationStatus.Offered || d.Status == AgentDelegationStatus.Running || d.Status == AgentDelegationStatus.Stalled))) {
+      throw new ValidationException($"Work {BareName(piece.Agent)} handed outside is still under way. Call it off first (`CancelDelegation`), then erase it.");
     }
   }
 }

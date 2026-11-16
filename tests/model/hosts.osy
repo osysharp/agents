@@ -1,0 +1,128 @@
+// The packhouse's machines: work an agent hands outside — a label sheet to lay out — goes to one of them, and comes back
+// over the six calls of `agents.delegation/1`. A machine signs in as an account of its own holding the Host role; the
+// packhouse's own code says which machine a request comes from.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Agents;
+using Osysharp.Llm;
+
+policy IsHost => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Host);
+
+// Only the machines call back on work handed outside.
+policy HandlesDelegations => IsHost;
+
+/// Which machine a request comes from: the signed-in account's own machine name, as the packhouse knows it — never
+/// anything the request says.
+public class PackhouseHosts : DelegationHosts {
+  public override string Calling() {
+    var me = Session.CurrentUser;
+    if (me == null) { return ""; }
+    if (!RoleGrant.Any(g => g.Member.Id == me.Id && g.Role == PackhouseRole.Host)) { return ""; }
+    return "machine:" + me.Email;
+  }
+}
+
+/// A label sheet for a delivery, laid out on a machine: `{"labels": n}` and the sheet itself.
+public class LabelSheet : DelegationKind {
+  public override string Name => "label-sheet/1";
+  public override string ResultSchema => "{\"type\":\"object\",\"required\":[\"labels\"],\"properties\":{\"labels\":{\"type\":\"integer\"}}}";
+  public override string? Check(DelegationResult result, List<DelegationFile> files) {
+    if (!result.Json.Contains("\"labels\"")) { return "It says how many labels there are: {\"labels\": n}."; }
+    return null;
+  }
+}
+
+// The machines' takings are recorded on the packhouse's meter, as the lead's are.
+policy RecordsModelCalls => ManagesModelSpend || IsHost;
+
+/// Lay a crate's labels out on one of the machines: the tool answers at once, and the sheet comes back later.
+[Action("Lay out the crate's labels on a machine")]
+public Delegated LayOutLabels(Crate crate) {
+  return DelegateOutside(new DelegationRequest {
+    Kind = "label-sheet/1", Instruction = $"Lay out the labels for crate {crate.Code}.", InputsJson = "{\"crate\":\"" + crate.Code + "\"}",
+    Timeout = TimeSpan.FromHours(2), StaleAfter = TimeSpan.FromMinutes(10),
+  });
+}
+
+/// How many labels a crate has, and a word about them.
+public class Labels {
+  public int Count = 0;
+  public string Note = "";
+}
+
+/// Get a crate's labels laid out — by a machine.
+public class LabelCrate : Skill<Crate, Labels> {
+  public override string Description => "Get a crate's labels laid out, and say how many there are.";
+  public override List<ActionInfo> Tools => [Actions.Of(LayOutLabels)];
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+}
+
+/// Has the packhouse's machines lay labels out.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Labeller : Agent {
+  public static Person Principal => new Person { Email = "labeller@packhouse.example", DisplayName = "Labeller" };
+  public override string Purpose => "You get the labels laid out for the crates that arrive.";
+  public override List<SkillBase> Skills => [new LabelCrate()];
+  public override Permits May => Permits.ChangesAlone();
+}
+
+/// What the packhouse's transport hears: work handed outside, and work started again.
+[On] void HandedToAMachine(AgentDelegationOffered e) { new Heard { What = "handed outside", About = e.Delegation.Kind }; }
+[On] void StartedAgainOnAMachine(AgentDelegationRestarted e) { new Heard { What = "started again", About = e.Fresh ? "fresh" : "resumed" }; }
+
+/// Note what a request tells the model came back from outside — the text of its last message, when it says so.
+public void NoteCameBack(LlmRequest request) {
+  if (request.Messages.Count == 0) { return; }
+  var last = request.Messages[request.Messages.Count - 1];
+  if (last.Role != "user") { return; }
+  foreach (var b in last.Content) {
+    if (b.Kind == LlmBlockKind.Text && (b.Text ?? "").Contains("<delegation")) { new Heard { What = "came back", About = Clip(b.Text ?? "", 4000) }; }
+  }
+}
+
+/// The id of the work the model was told is pending, from what its tool answered.
+public string PendingIn(LlmRequest request) {
+  foreach (var m in request.Messages) {
+    foreach (var b in m.Content) {
+      var said = b.ResultJson ?? "";
+      var at = said.IndexOf("\"pending\":\"");
+      if (b.Kind == LlmBlockKind.ToolResult && at >= 0) { return said.Substring(at + 11, 36); }
+    }
+  }
+  return "";
+}
+
+string Clip(string text, int max) { return text.Length <= max ? text : text.Substring(0, max); }
+
+/// Which turn of the work a request is for: how many times the model has answered so far.
+public int TurnOf(LlmRequest request) {
+  var turn = 0;
+  foreach (var m in request.Messages) { if (m.Role == "assistant") { turn = turn + 1; } }
+  return turn;
+}
+
+// ── a conversation at the dock ──────────────────────────────────────────────────────────────────────────────────────
+
+/// Stamp a crate as seen at the dock: what it changes is written down where a test can count it.
+[Action("Stamp the crate as seen")]
+public string StampCrate(Crate crate) {
+  new Heard { What = "stamped", About = crate.Code };
+  return "Crate " + crate.Code + " is stamped.";
+}
+
+/// Look after the crates at the dock: stamp them, and get their labels laid out by a machine.
+public class MindTheDock : Skill<Crate, Labels> {
+  public override string Description => "Look after a crate at the dock.";
+  public override List<ActionInfo> Tools => [Actions.Of(StampCrate), Actions.Of(LayOutLabels)];
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+}
+
+/// Talks with the people at the dock about the crates there.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Docker : Agent {
+  public static Person Principal => new Person { Email = "docker@packhouse.example", DisplayName = "Docker" };
+  public override string Purpose => "You talk with the people at the dock about the crates there.";
+  public override List<SkillBase> Skills => [new MindTheDock()];
+  public override Permits May => Permits.ChangesAlone();
+}

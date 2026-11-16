@@ -30,22 +30,37 @@ SkillBase? RecordedSkill(Agent definition, string agent, string skill) {
     + $"for a skill its class lists: `public override List<SkillBase> Skills => [new {BareName(skill)}()];`");
 }
 
-/// What recorded work is charged to, for the instructions that apply to it: the agent, and the skill.
-List<string> RecordedScopes(string agent, string skill) {
-  List<string> scopes = ["agent:" + agent];
-  if (skill != "") { scopes.Add("skill:" + skill); }
-  return scopes;
+/// Obsolete since 2.5.0 — use `WorkScopes(agent, skill, charged)`. Kept so code written against 2.0 still compiles, and
+/// answers what it did: the agent's scope, and the skill's.
+List<string> RecordedScopes(string agent, string skill) { return WorkScopes(agent, skill, ""); }
+
+/// What a caller charges recorded work to beside the agent and the skill — each scope checked as `AgentRef.On` checks
+/// it (`ChargeScope`), the same one named twice kept once — as `AgentTask.ChargedTo` keeps them, one a line.
+string RecordedCharge(List<string> chargedTo) {
+  List<string> scopes = [];
+  foreach (var named in chargedTo) {
+    var scope = ChargeScope(named);
+    if (!scopes.Contains(scope)) { scopes.Add(scope); }
+  }
+  var charged = string.Join("\n", scopes);
+  if (charged.Length > 1000) {
+    throw new ValidationException($"A piece of work is charged to at most 1000 characters of scopes, and these are {charged.Length}.");
+  }
+  return charged;
 }
 
 /// ⭐ WHAT AN AGENT IS TOLD NOW, for a skill ("" — the agent as a whole), for work done for whoever is signed in: its
 /// instruction set, the active instructions that apply, and their text exactly as a piece of work is sent it.
 ///
+/// `chargedTo`: what the work would be charged to — `["product:" + p.Id]` — so the instructions for those scopes
+/// (`InstructionDraft.OnScope`) are among what it answers, as they are for work `BeginAgentWork` opens with the same.
+///
 /// For a look before the work. Work that is recorded takes what it is sent from `BeginAgentWork`, read in the same
 /// instant its receipt is written: an instruction made active in between would otherwise be in one and not the other.
 [Server, Authorize(UsesAgents)]
-public InstructionsToWork GuidanceFor(string agent, string skill = "") {
+public InstructionsToWork GuidanceFor(string agent, string skill = "", List<string>? chargedTo = null) {
   RecordedSkill(Definition(agent), agent, skill);
-  return InstructionsFor(agent, skill, Security.CurrentUserId, RecordedScopes(agent, skill));
+  return InstructionsFor(agent, skill, Security.CurrentUserId, WorkScopes(agent, skill, RecordedCharge(chargedTo ?? [])));
 }
 
 /// ⭐ OPEN A PIECE OF WORK DONE OUTSIDE THE KIT'S LOOP, as the agent's: its receipt (`Cause` = `Recorded`) with the
@@ -56,24 +71,47 @@ public InstructionsToWork GuidanceFor(string agent, string skill = "") {
 ///     var answer = RunElsewhere(work.Guidance, ticket);            // the worker is sent exactly what is recorded
 ///     FinishAgentWork(work.Task, JsonSerializer.Serialize(answer), "Classified as billing.");
 ///
+/// `chargedTo`: what the work is charged to beside the agent and the skill, as `Agents.Of<T>().On(scope)` charges the
+/// kit's own work — `["product:" + p.Id, "review:" + kind.Id]`. Each is on the receipt (`AgentTask.ChargedTo`), and the
+/// work is sent the instructions made for it (`InstructionDraft.OnScope`). Each is a kind and a subject; the kit's own
+/// kinds — `agent:`, `skill:`, `task:` — are refused, and one named twice is kept once.
+///
+/// ⚑ A SIGNED-IN CALLER CHARGES WORK ONLY WHERE THE APP SAYS THEY MAY (`ChargesAgentWorkTo`): whoever supervises the
+///   agents, and whoever reads the work charged to that scope (`ReadsAgentWorkOf`), until the app says more. Work the
+///   app's own code records, with nobody signed in, is charged where that code says — as `On` is.
+///
 /// Refused — before anything is written — when the agent has no sponsor or is paused, exactly as `Do` is. Done for
 /// whoever is signed in; nobody when the app's own code records it.
 [Server, Authorize(UsesAgents)]
-public RecordedWorkStart BeginAgentWork(string agent, string skill, string about = "", string given = "") {
+public RecordedWorkStart BeginAgentWork(string agent, string skill, string about = "", string given = "", List<string>? chargedTo = null) {
   var definition = Definition(agent);
   var held = RecordedSkill(definition, agent, skill);
   var person = Security.CurrentUserId;
+  var charged = RecordedCharge(chargedTo ?? []);
+  // SECURITY-INVARIANT(agents-recorded-work-is-charged-only-where-its-caller-may): a scope a signed-in caller names
+  // for recorded work is one the app's `ChargesAgentWorkTo` admits for them — whoever supervises, or whoever reads the
+  // work charged to it, until the app says more — and none of the kit's own kinds (`ChargeScope`). The receipt's
+  // `ChargedTo` decides who else reads it (`ReadsAgentWorkOf`) and which scoped instructions it is sent; taking it
+  // unchecked from the browser lets one tenant plant work on another's books. Guarded by tests/recorded.test.osy
+  // `recorded_work_is_charged_only_to_a_scope_of_the_callers_and_never_to_the_kits_own`.
+  if (person != null) {
+    foreach (var scope in charged.Split("\n")) {
+      if (scope != "" && !ChargesAgentWorkTo(scope)) {
+        throw new AgentRefused($"You may not charge work to {scope}. The app says who may: `policy ChargesAgentWorkTo(string scope) => …;`.");
+      }
+    }
+  }
   // SECURITY-INVARIANT(agents-recorded-work-says-what-it-was-sent): the set, the ids and the hash on the receipt are
   // read here, from the agent's active instructions, in the call that writes the receipt — and the text answered is
   // that same reading. Taking any of them from the caller lets a record claim guidance the work was never sent, and
   // corrections then teach against the wrong set. Guarded by tests/recorded.test.osy
   // `recorded_work_carries_the_set_it_ran_under_and_the_next_carries_the_new_one`.
-  var told = InstructionsFor(agent, skill, person, RecordedScopes(agent, skill));
+  var told = InstructionsFor(agent, skill, person, WorkScopes(agent, skill, charged));
   var inRun = Workflow.Current;
   var task = OpenAgentTask(new AgentTaskOpening {
     Agent = agent, Skill = skill, SkillVersion = held == null ? "" : held!.Version, Cause = AgentTaskCause.Recorded,
     InstructionSet = told.Set, InstructionsSent = string.Join("\n", told.Ids), InstructionsHash = told.Hash,
-    Account = Actor.Of(definition.GetType()), Requester = person, About = about, Given = given,
+    Account = Actor.Of(definition.GetType()), Requester = person, About = about, Given = given, ChargedTo = charged,
     Run = inRun?.Id, RunWorkflow = inRun == null ? "" : inRun.Workflow, RunState = inRun == null ? "" : inRun.State,
     RunItem = inRun?.Item, RunStarter = inRun?.Starter,
   });
@@ -116,9 +154,11 @@ public void FinishAgentWork(Guid task, string? resultJson, string outcome, bool 
 ///
 /// ⚑ IT RAN UNDER THE SET ACTIVE NOW. Work that was sent its guidance earlier opens with `BeginAgentWork` when it
 ///   starts, so the receipt says what it was really sent.
+///
+/// `chargedTo`: as `BeginAgentWork` takes it.
 [Server, Authorize(UsesAgents)]
-public Guid RecordAgentWork(string agent, string skill, string about, string given, string? resultJson, string outcome, bool failed = false) {
-  var work = BeginAgentWork(agent, skill, about, given);
+public Guid RecordAgentWork(string agent, string skill, string about, string given, string? resultJson, string outcome, bool failed = false, List<string>? chargedTo = null) {
+  var work = BeginAgentWork(agent, skill, about, given, chargedTo);
   FinishAgentWork(work.Task, resultJson, outcome, failed);
   return work.Task;
 }

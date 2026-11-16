@@ -90,11 +90,21 @@ public entity AgentTask {
   /// What its caller charged it to beside the agent and the work itself (`AgentRef.On`) — each scope on a line of
   /// its own, `case:8f1c…`. "": nothing.
   [Immutable, MaxLength(1000)] string ChargedTo = "";
+  /// The model key every call of it runs on, by the app's id for it (`AgentRef.WithKey`) — work handed on runs on the
+  /// key of the work above it. "": the app's default.
+  [Immutable, MaxLength(200)] string Key = "";
+  /// The conversation this is one turn of (`AgentRef.Converse`). Null: it is not a turn of a conversation.
+  [Immutable, Index] AgentConversation? Conversation;
 
   /// What it has spent on models, in millionths of a US dollar, and the most it may. Counted by the kit from the
   /// meter's own figure for each call, as each call returns.
   long SpentMicros = 0;
   [Immutable] long LimitMicros = 0;
+  /// Of what it has spent, how much was spent outside — by the hosts its delegations were handed to
+  /// (`RecordDelegationSpend`), on the meter's own figure.
+  long OutsideMicros = 0;
+  /// The pieces of it handed outside the app — each with how it stands, what it handed back and what it spent.
+  [ForeignKey(Task)] AgentDelegation[] Delegations;
   int ModelCalls = 0;
   int ToolCalls = 0;
   int Turns = 0;
@@ -160,7 +170,7 @@ public entity AgentTask {
     allow update when SupervisesAgents;
     allow update, delete when ErasesAgentRecords;
     deny create except via OpenAgentTask;
-    deny update SpentMicros, ModelCalls, ToolCalls, Turns, InputTokens, OutputTokens, CacheReadTokens except via SettleAgentTask;
+    deny update SpentMicros, OutsideMicros, ModelCalls, ToolCalls, Turns, InputTokens, OutputTokens, CacheReadTokens except via SettleAgentTask;
     deny update Status except via CloseAgentTask, MarkAgentTaskWaiting, MarkAgentTaskWorking;
     deny update EndedAt except via CloseAgentTask;
     deny update WaitingOn except via CloseAgentTask, MarkAgentTaskWaiting, MarkAgentTaskWorking, AnonymiseAgentWork;
@@ -334,8 +344,13 @@ public class AgentTaskOpening {
   public string Given = "";
   public long LimitMicros = 0;
   public string ChargedTo = "";
+  /// The model key the work runs on (`AgentTask.Key`). Work handed on takes the key of the work above it, read from
+  /// that work's receipt, whatever this says.
+  public string Key = "";
   public Guid? RetryOf;
   public int Attempt = 1;
+  /// The conversation the work is a turn of — see `AgentTask.Conversation`.
+  public Guid? Conversation;
   /// The workflow run the work is started in — see `AgentTask.Run`.
   public Guid? Run;
   public string RunWorkflow = "";
@@ -409,11 +424,13 @@ internal Guid OpenAgentTask(AgentTaskOpening opening) {
     Depth = parent == null ? 0 : parent.Depth + 1, Sequence = sequence, About = Clipped(opening.About, 300), Given = opening.Given,
     Lineage = parent == null ? "" : Clipped(parent.Agent + "|" + parent.Skill + (parent.Lineage == "" ? "" : "\n" + parent.Lineage), 4000),
     LimitMicros = opening.LimitMicros, ChargedTo = Clipped(opening.ChargedTo, 1000), Attempt = opening.Attempt,
+    Key = parent == null ? opening.Key : parent.Key,
     // Work handed on belongs to the step that handed it on, wherever it is opened.
     Run = parent == null ? opening.Run : parent.Run, RunWorkflow = parent == null ? opening.RunWorkflow : parent.RunWorkflow,
     RunState = parent == null ? opening.RunState : parent.RunState, RunItem = parent == null ? opening.RunItem : parent.RunItem,
     RunStarter = parent == null ? opening.RunStarter : parent.RunStarter, RunStep = runStep,
     RetryOf = opening.RetryOf == null ? null : AgentTask.FirstOrDefault(t => t.Id == opening.RetryOf),
+    Conversation = opening.Conversation == null || parent != null ? null : AgentConversation.FirstOrDefault(c => c.Id == opening.Conversation),
   };
   if (parent == null) { new AgentTraceHead { Root = task.Id }; }
   // Whom it is for, as the platform records it here: whoever this is judged for — the signed-in caller, a run's
@@ -426,6 +443,8 @@ internal Guid OpenAgentTask(AgentTaskOpening opening) {
 /// What one step added to a receipt.
 public class AgentTaskUse {
   public long Micros = 0;
+  /// Of `Micros`, what was spent outside, by a delegation's host.
+  public long OutsideMicros = 0;
   public int ModelCalls = 0;
   public int ToolCalls = 0;
   public int Turns = 0;
@@ -439,6 +458,7 @@ public class AgentTaskUse {
 internal void SettleAgentTask(Guid id, AgentTaskUse use) {
   var task = AgentTask.Single(t => t.Id == id);
   task.SpentMicros = task.SpentMicros + use.Micros;
+  task.OutsideMicros = task.OutsideMicros + use.OutsideMicros;
   task.ModelCalls = task.ModelCalls + use.ModelCalls;
   task.ToolCalls = task.ToolCalls + use.ToolCalls;
   task.Turns = task.Turns + use.Turns;
@@ -457,6 +477,9 @@ internal void CloseAgentTask(Guid id, AgentTaskStatus status, string outcome, st
   task.Outcome = Clipped(outcome, 600);
   task.EndedAt = DateTime.UtcNow;
   if (resultJson != null) { task.Result = resultJson; }
+  // Ended work goes on from nowhere: the point it would have gone on from goes with it.
+  foreach (var kept in AgentTaskParking.Where(p => p.Task == task).ToList()) { kept.Delete(); }
+  foreach (var ran in AgentToolRun.Where(r => r.Task == task).ToList()) { ran.Delete(); }
   if (status == AgentTaskStatus.Done) { Raise(new AgentTaskFinished { Task = task }); }
   else if (status == AgentTaskStatus.Failed) {
     Raise(new AgentTaskFailed { Task = task, Problem = task.Outcome });

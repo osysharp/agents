@@ -33,3 +33,16 @@ public void BuyerSentBack(Guid task, string kind, string right) { Raise(new Crat
     new Heard { What = "recurring", About = x.Message };
   }
 }
+
+/// A crate graded at the bench for a product line — `Line`, the scope the packhouse charges that line's work to. The
+/// packhouse's own code records it as the inspector's, as the app, and notes the receipt.
+[Event("Crate graded at the bench")]
+public sealed class CrateGradedAtTheBench { public string Code; public string Line; }
+
+public void GradedAtTheBench(string code, string line) { Raise(new CrateGradedAtTheBench { Code = code, Line = line }); }
+
+[On] void RecordBenchGrading(CrateGradedAtTheBench e) {
+  var task = RecordAgentWork("Packhouse.Inspector", "Packhouse.GradeCrate", "Crate " + e.Code, "Crate", "{\"Score\":7,\"Finding\":\"Sound.\"}",
+    "Graded 7 at the bench.", chargedTo: [e.Line]);
+  new Heard { What = "bench", About = task.ToString() };
+}

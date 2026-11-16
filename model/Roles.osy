@@ -10,6 +10,8 @@
 //   ReadsAllAgentWork           read the receipt of every piece of work — not what it said     whoever supervises or audits
 //   ReadsAgentWorkOf(chargedTo) read the receipt of work charged to these scopes — not what    nobody
 //                               it said; the per-tenant answer (an organisation's own auditor)
+//   ChargesAgentWorkTo(scope)   charge recorded work to a scope they name (BeginAgentWork)     whoever supervises, or reads
+//                                                                                              work charged to it
 //   DecidesAgentProposals       decide a proposal that was not put to them                     whoever supervises
 //   WidensAgentAutonomy         "from now on, alone" for their own work (Gate.osy)             nobody
 //   TeachesAgents               make an instruction active, retire one, roll back; read        nobody
@@ -62,6 +64,14 @@ virtual policy ReadsAllAgentWork => SupervisesAgents || AuditsAgents;
 /// organisation another's work: `policy ReadsAgentWorkOf(string chargedTo) => Report.Any(r => chargedTo.Contains("report:"
 /// + r.Id.ToString()) && …);`. Figures, not words, exactly as `ReadsAllAgentWork`. Nobody, until the app says.
 virtual policy ReadsAgentWorkOf(string chargedTo) => false;
+
+/// ⭐ WHO CHARGES RECORDED WORK TO A SCOPE THEY NAME — `BeginAgentWork(…, chargedTo: ["product:" + p.Id])` while signed
+/// in. A receipt's `ChargedTo` says who else reads it (`ReadsAgentWorkOf`) and which instructions it is sent, so a
+/// person charges work only where they could read it: whoever supervises the agents, and whoever reads the work
+/// charged to that scope, until the app says more — `policy ChargesAgentWorkTo(string scope) => scope.StartsWith("team:")
+/// && Team.Any(t => scope == "team:" + t.Id.ToString() && t.Members.Any(m => m == user));`. Work the app's own code
+/// records, with nobody signed in, is charged where that code says, as `AgentRef.On` is.
+virtual policy ChargesAgentWorkTo(string scope) => SupervisesAgents || ReadsAgentWorkOf(scope);
 
 /// ⭐ WHO DECIDES A PROPOSAL THAT WAS NOT PUT TO THEM. A proposal is put to the person the work is for — to the
 /// agent's sponsor when it is for nobody — and that person decides it. This says who else may: whoever supervises

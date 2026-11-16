@@ -58,6 +58,8 @@ public class AgentRun {
   public List<AgentTool> Tools = [];
   public List<string> Scopes = [];
   public List<LlmLimit> Limits = [];
+  /// The model key every call of the work runs on (`AgentTask.Key`). "": the app's default.
+  public string Key = "";
 
   public bool Typed = false;
   public int Turn = 0;
@@ -108,6 +110,15 @@ public class AgentRun {
   /// Whether the model may suggest an instruction for the agent, and how many this work has.
   public bool Suggests = false;
   public int Suggested = 0;
+  /// The work it handed outside that the model has not yet heard the end of; what it has heard the end of; each stall
+  /// it has been told of (`id/attempt/heard`); and what came back while a turn's tools were answered, still to be said.
+  public List<Guid> Outside = [];
+  public List<Guid> Returned = [];
+  public List<string> StallsTold = [];
+  public List<string> Arrived = [];
+  /// The conversation this work is a turn of (`AgentRef.Converse`). Null: none — and work it hands outside is waited for
+  /// by the work itself.
+  public Guid? Conversation;
 }
 
 // ── starting ────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -166,7 +177,36 @@ AgentRun StartChat(AgentRef agent, SkillBase skill, List<AgentTurn> turns) {
   return run;
 }
 
-AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillName, AgentTaskCause cause, string about, string given, Guid? retryOf, int attempt, WorkAbove? above = null) {
+/// What a piece of work's instructions are chosen by — the agent, the skill ("" — none), and each scope it is charged
+/// to (`charged`, one a line, as `AgentTask.ChargedTo` keeps them). The kit's loop and recorded work both ask this.
+List<string> WorkScopes(string agent, string skill, string charged) {
+  List<string> scopes = ["agent:" + agent];
+  if (skill != "") { scopes.Add("skill:" + skill); }
+  foreach (var scope in charged.Split("\n")) { if (scope.Trim() != "" && !scopes.Contains(scope.Trim())) { scopes.Add(scope.Trim()); } }
+  return scopes;
+}
+
+/// The kinds of scope the kit names itself — the agent, the skill and the piece of work — and no caller may.
+List<string> KitScopeKinds() { return ["agent:", "skill:", "task:"]; }
+
+/// A scope a caller charges work to, checked: a kind and a subject (`"case:" + c.Id`) on one line, at most as long as
+/// an instruction's `OnScope`, and none of the kit's own kinds — answered trimmed.
+string ChargeScope(string scope) {
+  var s = scope.Trim();
+  if (s == "" || !s.Contains(":") || s.StartsWith(":")) {
+    throw new ValidationException("Work is charged to a kind and a subject: `\"case:\" + c.Id`.");
+  }
+  if (s.Contains("\n") || s.Contains("\r")) { throw new ValidationException("A scope work is charged to is one line: one kind and one subject."); }
+  if (s.Length > 200) { throw new ValidationException($"A scope work is charged to is at most 200 characters, and this is {s.Length}."); }
+  foreach (var kind in KitScopeKinds()) {
+    if (s.StartsWith(kind)) {
+      throw new ValidationException($"`{kind}` is the kit's own: it names the agent, the skill and the piece of work itself. Charge the work to something of yours: `\"case:\" + c.Id`.");
+    }
+  }
+  return s;
+}
+
+AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillName, AgentTaskCause cause, string about, string given, Guid? retryOf, int attempt, WorkAbove? above = null, Guid? conversation = null) {
   var setup = App.Setting<AgentsSetup>();
   var dollars = skill.Budget ?? definition.Limits.PerTask ?? setup.TaskBudget;
   var limit = Micros(dollars);
@@ -175,28 +215,31 @@ AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillN
     person = agent.Row != null ? Records.CreatedBy(agent.Row!) : agent.SameAs != null ? ActsForOf(agent.SameAs!) : null;
   }
   var charged = string.Join("\n", agent.ChargedTo.Select(c => c.Scope));
+  var key = agent.Key ?? "";
   // Work handed on by another piece of work: for whoever THAT is for, with no more than it has left, charged where
-  // it is charged — none of which is the caller's to say.
+  // it is charged, on its key — none of which is the caller's to say.
   if (above != null) {
     person = above!.Person;
     limit = above!.LimitFor(limit);
     charged = above!.ChargedTo;
+    key = above!.Key;
   }
+  // The key is checked where the work is given, for whoever gives it — so work they may not run on it is refused
+  // before anything runs, not halfway. Each call is checked again as it leaves (`Llm.Complete`).
+  if (above == null && key != "") { RequireModelKey(key); }
   // What people have told the agent since it was written, as it stands now: the work is sent it, and records it.
-  List<string> chargedTo = ["agent:" + agent.Name];
-  if (skillName != "") { chargedTo.Add("skill:" + skillName); }
-  foreach (var scope in charged.Split("\n")) { if (scope.Trim() != "") { chargedTo.Add(scope); } }
-  var told = InstructionsFor(agent.Name, skillName, person, chargedTo);
+  var told = InstructionsFor(agent.Name, skillName, person, WorkScopes(agent.Name, skillName, charged));
   var inRun = Workflow.Current;
   var task = OpenAgentTask(new AgentTaskOpening {
     Agent = agent.Name, Skill = skillName, SkillVersion = skillName == "" ? "" : skill.Version, Cause = cause,
     InstructionSet = told.Set, InstructionsSent = string.Join("\n", told.Ids), InstructionsHash = told.Hash,
     Actor = agent.Actor.Id, Account = agent.Actor, Requester = person, About = about, Given = given, LimitMicros = limit,
-    ChargedTo = charged, RetryOf = retryOf, Attempt = attempt, Parent = above == null ? null : above!.Task,
+    ChargedTo = charged, Key = key, RetryOf = retryOf, Attempt = attempt, Parent = above == null ? null : above!.Task,
     // Given in a workflow's run, it is a step of that process: the receipt says which. (Work handed on by other work
     // takes the run of the work above it, where the receipt is opened.)
     Run = inRun?.Id, RunWorkflow = inRun == null ? "" : inRun.Workflow, RunState = inRun == null ? "" : inRun.State,
     RunItem = inRun?.Item, RunStarter = inRun?.Starter, ForInBlock = above != null || agent.ForSomebody,
+    Conversation = above == null ? conversation : null,
   });
   if (above != null || agent.ForSomebody) { RecordWorkFor(task, agent, above); }
   var people = definition.People;
@@ -209,7 +252,7 @@ AgentRun Opened(AgentRef agent, Agent definition, SkillBase skill, string skillN
     Consults = definition.Consults != "" && MayConsult() ? definition.Consults : "",
     PeopleMayChoose = people.MayChoose || people.About.Trim() != "", PeopleWhenStuck = people.WhenStuck, PeopleMost = people.Most,
     Attempt = attempt, InstructionSet = told.Set, InstructionSetHash = told.SetHash, Told = told.Text, ToldWords = ToldWords(told),
-    Suggests = definition.SuggestsInstructions,
+    Suggests = definition.SuggestsInstructions, Key = key, Conversation = above == null ? conversation : null,
   };
   run.Scopes = ["agent:" + agent.Name, "task:" + task.ToString()];
   if (skillName != "") { run.Scopes.Add("skill:" + skillName); }
@@ -353,8 +396,9 @@ LlmRequest RequestOf(AgentRun run, ModelNeeds needs) {
     request.Tools.Add(new LlmToolDefinition { Name = tool.Name, Description = tool.Description, InputSchemaJson = tool.SchemaJson });
   }
   if (needs.MaxTokens > 0) { request.MaxTokens = needs.MaxTokens; }
-  // A typed job ends with a tool call — the hand-back — so the model is held to calling one.
-  if (run.Typed) { request.ToolChoice = LlmToolChoice.Any; }
+  // A typed job ends with a tool call — the hand-back — so the model is held to calling one; while work it handed
+  // outside is out, it may also end its turn in words, which is how it waits for that work.
+  if (run.Typed && run.Outside.Count == 0) { request.ToolChoice = LlmToolChoice.Any; }
   if (run.ClearPast > 0 && EstimateTokens(request) > run.ClearPast) {
     var keep = run.Messages.Count - 4;
     var index = 0;
@@ -375,7 +419,8 @@ LlmRequest RequestOf(AgentRun run, ModelNeeds needs) {
 LlmCall CallOf(AgentRun run, ModelNeeds needs) {
   return new LlmCall {
     Model = needs.Model, Kind = needs.Kind, Step = LlmStep.Act, Latency = needs.Latency, MinQuality = needs.MinQuality,
-    Scopes = run.Scopes, Limits = run.Limits, // What the call was for, in words a person reads on the meter: "grade crate", not `GradeCrate`.
+    Scopes = run.Scopes, Limits = run.Limits, Key = run.Key == "" ? null : run.Key,
+    // What the call was for, in words a person reads on the meter: "grade crate", not `GradeCrate`.
     Purpose = run.Skill == "" ? "ask" : Words(BareName(run.Skill)).ToLower(),
     // The run the work belongs to is among its scopes already (`Opened`); the run this call happens to be made in is
     // not what it is charged to.
@@ -464,6 +509,8 @@ LlmContentBlock RunTool(AgentRun run, SkillBase skill, LlmContentBlock asked) {
   }
 
   if (name == SuggestTool && run.Suggests) { return SuggestedInstruction(run, input, back); }
+
+  if (IsOutsideTool(run, name)) { return RunOutsideTool(run, asked, back); }
 
   if (name == AskPersonTool && run.PeopleMayChoose) {
     PersonAsk ask;
@@ -588,22 +635,44 @@ LlmContentBlock RunTool(AgentRun run, SkillBase skill, LlmContentBlock asked) {
   if (gate.Rule != null) { NoteStandingRuleUsed(gate.Rule!.Value); }
   foreach (var above in gate.RulesAbove) { NoteStandingRuleUsed(above); }
   ActionResult result;
+  // Answered before, by a run that stopped before it kept the answer: what it said then is its answer now.
+  var again = false;
+  // In a run the tool runs in a commit of its own (`RunToolOnce`), which reads committed rows only — so what this work
+  // wrote before it asked (the case it was opened on, the answer that started it) is committed first, and the tool
+  // reads it.
+  if (Workflow.InRun) { UnitOfWork.Commit(); }
   try {
-    result = RunAsAgent(run, tool!.Action, input);
+    if (Workflow.InRun) {
+      var ran = RunToolOnce(run.Task, asked.ToolUseId ?? "", tool!.Action, input);
+      result = ran.Result;
+      again = ran.Again;
+    } else {
+      result = RunAsAgent(run, tool!.Action, input);
+    }
   } catch (Exception e) {
     result = new ActionResult { Outcome = ActionOutcome.Failed, Said = "", Value = "", Problem = e.Message, RanAs = "" };
   }
   var ok = result.Outcome == ActionOutcome.Done;
   var said = ok ? (result.Value == "" ? JsonSerializer.Serialize("Done.") : result.Value) : JsonSerializer.Serialize(result.Outcome.Name + ": " + result.Problem);
+  // A tool that hands work outside answers that it is pending — the delegation is opened here, on this work.
+  if (ok) {
+    var outside = HandedOutside(run, info!, asked.ToolUseId ?? "", result.Value);
+    if (outside != null) {
+      said = outside!.Said;
+      if (outside!.Failed) { ok = false; result.Problem = PlainText(said); }
+    }
+  }
   if (ok) {
     var kept = GuardAfterTool(run, info!, said);
     if (kept != null) { said = JsonSerializer.Serialize("It ran, and what it answered is kept from you: " + kept!.Why); }
   }
   Trace(run, new TraceEntry {
     Kind = TraceKind.ToolResult, Tool = tool!.Action, PayloadJson = said,
-    Summary = ok ? $"{BareName(tool!.Action)} answered." : $"{BareName(tool!.Action)} did not run: {result.Outcome.Label.ToLower()}. {Clipped(result.Problem, 300)}",
+    Summary = again ? $"{BareName(tool!.Action)} had already answered, before the run doing the work stopped: it was answered from what it said then, and did not run again."
+            : ok ? $"{BareName(tool!.Action)} answered." : $"{BareName(tool!.Action)} did not run: {result.Outcome.Label.ToLower()}. {Clipped(result.Problem, 300)}",
   });
-  SettleAgentTask(run.Task, new AgentTaskUse { ToolCalls = 1 });
+  // A call is counted once, when it ran — never again when it is answered from what it said.
+  if (!again) { SettleAgentTask(run.Task, new AgentTaskUse { ToolCalls = 1 }); }
   if (ok) { run.Failures = 0; } else { Missed(run, $"{BareName(tool!.Action)}: {result.Problem}"); }
   back.IsError = !ok;
   back.ResultJson = said;
@@ -648,19 +717,49 @@ void RecordWorkFor(Guid task, AgentRef agent, WorkAbove? above) {
 
 /// ⭐ RUN ONE ACTION AS THE AGENT — its own account, and, when the work is for a person, never past what that person
 /// may do themselves. Every change it makes is recorded with the agent, the person and this piece of work.
-ActionResult RunAsAgent(AgentRun run, string action, string argumentsJson) {
+ActionResult RunAsAgent(AgentRun run, string action, string argumentsJson) { return RunActionAsAgent(run.Task, action, argumentsJson); }
+
+ActionResult RunActionAsAgent(Guid taskId, string action, string argumentsJson) {
   var values = Actions.ValuesFromJson(action, argumentsJson);
-  var cause = "agent-task:" + run.Task.ToString();
-  var task = AgentTask.Single(t => t.Id == run.Task);
+  var cause = "agent-task:" + taskId.ToString();
+  var task = AgentTask.Single(t => t.Id == taskId);
   // The account it runs as, by its key off the receipt — never read again as the caller, who need not see it.
   var actor = task.Actor;
   // For whom, as the platform recorded it when the work was opened — read again here, never what the work remembers.
   // None recorded (work opened before it was): the agent alone.
-  var forWhom = AgentWorkFor.FirstOrDefault(w => w.Task == run.Task);
+  var forWhom = AgentWorkFor.FirstOrDefault(w => w.Task == taskId);
   if (forWhom == null || forWhom!.ActsFor == null) {
     runas (Actor.From(actor), scope: task) { return Actions.Run(action, values, cause: cause); }
   }
   runas (Actor.From(actor), onBehalfOf: forWhom!.ActsFor, scope: task) { return Actions.Run(action, values, cause: cause); }
+}
+
+/// ⭐ ONE TOOL CALL, ONCE — in a workflow's run, where a run that dies is run again. The tool runs in a commit of its
+/// own, and what it answered is kept in that same commit, by the model's id for the call: asked again for the same
+/// call — the run went on from a checkpoint made before the call was answered — it is answered from what was kept,
+/// and nothing runs again.
+[Server, Authorize(UsesAgents), CommitsAlone]
+internal ToolRan RunToolOnce(Guid task, string toolUseId, string action, string argumentsJson) {
+  var t = AgentTask.Single(x => x.Id == task);
+  if (toolUseId != "") {
+    var ran = AgentToolRun.FirstOrDefault(r => r.Task == t && r.ToolUseId == toolUseId);
+    if (ran != null) {
+      return new ToolRan { Again = true,
+        Result = new ActionResult { Outcome = ran!.Outcome, Said = ran!.Said, Value = ran!.Value, Problem = ran!.Problem, RanAs = "" } };
+    }
+  }
+  var result = RunActionAsAgent(task, action, argumentsJson);
+  if (toolUseId != "") {
+    new AgentToolRun { Task = t, ToolUseId = Clipped(toolUseId, 200), Action = Clipped(action, 300), Outcome = result.Outcome,
+                       Said = result.Said ?? "", Value = result.Value ?? "", Problem = Clipped(result.Problem ?? "", 2000) };
+  }
+  return new ToolRan { Result = result };
+}
+
+/// What one tool call answered — and whether it was answered from what it had said before, without running again.
+class ToolRan {
+  public ActionResult Result;
+  public bool Again = false;
 }
 
 /// Stop the work where it stands, on a person: the record says so, its state is kept, and nothing more runs.
@@ -750,16 +849,22 @@ string PlainText(string json) {
 /// Answer the tools of the turn under way, one by one. False: the work stopped on a person part-way; what is left
 /// stays where it is, for when it goes on.
 bool FinishTurn(AgentRun run, SkillBase skill) {
-  while (run.Pending.Count > 0 && run.Status == AgentTaskStatus.Working) {
+  // Each tool is the pass of this loop with its place in the turn: work that goes on part-way through a turn passes
+  // the tools already answered, so whatever a tool records in a run keeps its place.
+  for (var place = 0; run.Pending.Count > 0 && run.Status == AgentTaskStatus.Working; place++) {
+    if (place < run.Answered.Count) { continue; }
     // Work it hands on: every piece asked for together goes out together, and the turn waits for all of them.
     if (IsHandOn(run, run.Pending[0])) {
       if (!HandWorkOn(run)) { return false; }
+      Checkpoint(run);
       continue;
     }
     var back = RunTool(run, skill, run.Pending[0]);
     if (run.Status == AgentTaskStatus.Waiting) { return false; }
     run.Pending.RemoveAt(0);
     run.Answered.Add(back);
+    // Each tool's answer is kept as it comes: it never runs again for this tool call.
+    Checkpoint(run);
   }
   ToolsAnswered(run, run.Answered);
   run.Answered = [];
@@ -775,6 +880,11 @@ void ToolsAnswered(AgentRun run, List<LlmContentBlock> results) {
     results.Add(new LlmContentBlock { Kind = LlmBlockKind.Text, Text = run.Advice });
   }
   run.Advice = "";
+  // …and what work it handed outside handed back meanwhile, as data, last.
+  if ((run.Outside.Count > 0 || run.Arrived.Count > 0) && run.Status == AgentTaskStatus.Working) {
+    var came = TakeArrivals(run);
+    if (came != "") { results.Add(new LlmContentBlock { Kind = LlmBlockKind.Text, Text = came }); }
+  }
   run.Messages.Add(new LlmMessage { Role = "user", Content = results });
 }
 
@@ -817,7 +927,7 @@ string JobOf(AgentRun run) {
 
 /// Consult the model the agent names, during this piece of work: charged to it, held to its limits, on its record.
 HelpAnswer Consulted(AgentRun run, HelpReason why, string question, string context) {
-  var help = AskModel(run.Agent, run.Consults, why, question, context, run.Task, run.Person, run.Scopes, run.Limits);
+  var help = AskModel(run.Agent, run.Consults, why, question, context, run.Task, run.Person, run.Scopes, run.Limits, run.Key);
   run.SpentMicros = run.SpentMicros + help.CostMicros;
   var reason = why == HelpReason.Stuck ? "it was stuck" : why == HelpReason.LowConfidence ? "it was not sure" : "it chose to";
   Trace(run, new TraceEntry {
@@ -922,15 +1032,62 @@ bool Took(AgentRun run, SkillBase skill, TurnAnswer answer) {
   Answered(run, result.Response, result.Model, result.RouteRule, result.Call, result.CostMicros, result.Attempts);
   var asked = AskedFor(result.Response);
   if (asked.Count == 0) {
+    // Work it handed outside is still out: ending the turn is how the work waits for it — except a conversation's
+    // turn, which ends: the work outside stays with the conversation, and its end starts the next turn.
+    if (run.Outside.Count > 0 && run.Conversation == null) {
+      var goesOn = WaitsOnOutside(run);
+      if (goesOn) { Checkpoint(run); }
+      return goesOn;
+    }
+    if (run.Outside.Count > 0 && ToldWhatCameMeanwhile(run)) { Checkpoint(run); return true; }
     AnsweredInWords(run, result.Response);
     if (StuckParks(run)) { return false; }
+    if (run.Status == AgentTaskStatus.Working) { Checkpoint(run); }
     return run.Status == AgentTaskStatus.Working;
   }
   if (CalledOffMeanwhile(run)) { return false; }
   run.Pending = asked;
   run.Answered = [];
+  // What the model answered is kept before any tool it asked for runs: work that goes on from here never asks it again.
+  Checkpoint(run);
   if (!FinishTurn(run, skill)) { return false; }
   return run.Status == AgentTaskStatus.Working;
+}
+
+/// A conversation's turn the model ends in words while work it handed outside is out: what came back meanwhile is told
+/// first, and the turn goes on (true); otherwise the turn ends as the model ended it.
+bool ToldWhatCameMeanwhile(AgentRun run) {
+  var came = TakeArrivals(run);
+  if (came == "") { return false; }
+  run.Messages.Add(UserSays(came));
+  return true;
+}
+
+/// ⭐ KEEP WHERE THE WORK STANDS — in a workflow's run, after every answer of the model and every tool it asked for. A
+/// run that dies part-way is run again by the engine, and the work goes on from here: nothing the model answered is
+/// asked again, and no tool that answered runs twice. Outside a run nothing would go on from it, and nothing is kept.
+void Checkpoint(AgentRun run) {
+  if (!Workflow.InRun || run.Status != AgentTaskStatus.Working) { return; }
+  CheckpointAgentTask(run.Task, JsonSerializer.Serialize(run), run.Turn);
+}
+
+/// The most times work goes on from the same checkpoint: a run that stops there every time is not started again.
+const int MostResumes = 3;
+
+/// The work goes on from its checkpoint, after the run that was doing it stopped part-way: the record says so. False:
+/// it has stopped at this same point `MostResumes` times before, and it has failed instead — whatever stops it there
+/// would stop it again, and every start would pay for what it asks again.
+bool ResumedFrom(AgentRun run) {
+  var times = NoteResumedFrom(run.Task);
+  if (times > MostResumes) {
+    End(run, AgentTaskStatus.Failed, $"It stopped part-way at the same point {MostResumes + 1} times, and is not started again.");
+    return false;
+  }
+  var left = run.Pending.Count;
+  Trace(run, new TraceEntry { Kind = TraceKind.Resumed,
+    Summary = $"It went on from where it stood after turn {run.Turn}: the run doing it had stopped part-way."
+            + (left == 0 ? "" : left == 1 ? " One tool of that turn was still to answer." : $" {left} tools of that turn were still to answer.") });
+  return true;
 }
 
 /// ⭐ DO THE WORK, turn by turn, until it ends. Every way out is a status on the receipt — a model that fails, money
@@ -940,10 +1097,13 @@ void DriveWork(AgentRun run, SkillBase skill) {
   if (run.Pending.Count > 0 || run.Answered.Count > 0) {
     if (!FinishTurn(run, skill)) { return; }
   }
-  while (run.Status == AgentTaskStatus.Working) {
+  // Each turn is the pass of this loop with its number: work that goes on from a checkpoint passes the turns it has
+  // taken, so each model call keeps its place among the steps its run records.
+  for (var pass = 0; run.Status == AgentTaskStatus.Working; pass++) {
+    if (pass < run.Turn) { continue; }
     var ask = NextAsk(run, skill);
     if (ask == null) { return; }
-    var answer = await AskTheModel(ask!);
+    var answer = run.Conversation == null ? await AskTheModel(ask!) : await AskWhileDrafting(run, ask!);
     if (!Took(run, skill, answer)) { return; }
   }
 }
@@ -1018,6 +1178,11 @@ stream<AgentSignal> StreamWork(AgentRun run, SkillBase skill) {
     Answered(run, response, model, rule, call, cost, 1);
     var asked = AskedFor(response);
     if (asked.Count == 0) {
+      if (run.Outside.Count > 0 && run.Conversation == null) {
+        if (!WaitsOnOutside(run)) { break; }
+        continue;
+      }
+      if (run.Outside.Count > 0 && ToldWhatCameMeanwhile(run)) { continue; }
       AnsweredInWords(run, response);
       if (StuckParks(run)) { break; }
       continue;

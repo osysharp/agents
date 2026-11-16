@@ -43,6 +43,11 @@ public class AgentsSetup {
   /// How often the kit's own clock looks for work that was abandoned, and closes it — the clock starts with the
   /// first piece of work. Zero: never; the app closes it itself (`CloseAbandonedAgentWork`), or nothing does.
   public TimeSpan AbandonedCheckEvery = TimeSpan.FromMinutes(10);
+  /// The hosts work is handed outside to, as the app authenticates them (Outside.osy): which host a request comes
+  /// from, and whether it may take a delegation. Nobody, until the app derives its own.
+  public DelegationHosts Hosts = new DelegationHosts();
+  /// The kinds of work the app hands outside (`DelegationKind`): none, until the app lists them.
+  public List<DelegationKind> OutsideKinds = [];
 }
 
 /// What an agent may spend, and how much it may do at once.

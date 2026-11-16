@@ -109,6 +109,85 @@ void recorded_work_carries_the_set_it_ran_under_and_the_next_carries_the_new_one
   runas (Ben) { Assert.Throws<ValidationException>(() => FinishAgentWork(open, GradedSeven(), "Mine now.")); }
 }
 
+/// ⭐ WORK RECORDED FOR A PRODUCT IS SENT WHAT WAS SAID FOR THAT PRODUCT. Tess makes one instruction for each of two
+/// products. Work the lead records charged to the first is sent the first and not the second — what `GuidanceFor`
+/// shows for the same scopes — and its receipt says what it was charged to; work charged to nothing is sent neither.
+/// The packhouse's own code records work for the second, with nobody signed in, and it is sent the second.
+[Test(School)]
+void an_instruction_on_a_product_scope_reaches_work_recorded_for_that_product() {
+  AgentInstruction forPeaches;
+  AgentInstruction forPlums;
+  runas (Tess) {
+    forPeaches = Teach("A peach crate is graded on bruising first.", onScope: "product:peaches");
+    forPlums = Teach("A plum crate is graded on bloom first.", onScope: "product:plums");
+  }
+  runas (Dana) {
+    var preview = GuidanceFor(TheInspector, TheGrading, chargedTo: ["product:peaches"]);
+    var work = BeginAgentWork(TheInspector, TheGrading, about: "Crate A-1", chargedTo: ["product:peaches"]);
+    Assert.Equal(1, work.Instructions.Count);
+    Assert.Equal(forPeaches.Id.ToString(), work.Instructions[0]);
+    Assert.Equal(preview.Text, work.Guidance);
+    Assert.Equal(Heading() + "\n1. A peach crate is graded on bruising first.", work.Guidance);
+    FinishAgentWork(work.Task, GradedSeven(), "Graded 7.");
+    var plain = RecordAgentWork(TheInspector, TheGrading, "Crate A-2", "Crate", GradedSeven(), "Graded 7.");
+    UnitOfWork.Commit();
+    var receipt = AgentTask.Single(t => t.Id == work.Task);
+    Assert.Equal(forPeaches.Id.ToString(), receipt.InstructionsSent);
+    Assert.Equal("product:peaches", receipt.ChargedTo);
+    Assert.Equal("", AgentTask.Single(t => t.Id == plain).InstructionsSent);
+  }
+  runas (Ada) { GradedAtTheBench("B-1", "product:plums"); UnitOfWork.Commit(); }
+  Background.Settle();
+  runas (Dana) {
+    var byTheApp = AgentTask.Single(t => t.Id == Guid.Parse(Heard.Single(h => h.What == "bench").About));
+    Assert.Null(byTheApp.StartedBy);
+    Assert.Equal(forPlums.Id.ToString(), byTheApp.InstructionsSent);
+    Assert.Equal("product:plums", byTheApp.ChargedTo);
+  }
+}
+
+/// The school, where Ada also minds crate A-1: she reads the work charged to it (`ReadsAgentWorkOf`).
+[TestFixture]
+void SchoolWithAMinder() {
+  School();
+  var ada = Person.Single(p => p.Email == "ada@packhouse.example");
+  ada.Minds = "A-1";
+}
+
+/// ⭐ A CALLER CHARGES RECORDED WORK TO WHAT IS THEIRS, AND NEVER TO THE KIT'S OWN. The agent, the skill and the piece
+/// of work are the kit's to name — refused from anybody, in recorded work and in `On` alike — and so is a scope that
+/// is not one kind and one subject on one line. A scope named twice is kept once. A grower who neither supervises nor
+/// reads the work charged to a crate may not charge work to it — refused before anything is written — and may charge
+/// work to the crate she minds.
+[Test(SchoolWithAMinder)]
+void recorded_work_is_charged_only_to_a_scope_of_the_callers_and_never_to_the_kits_own() {
+  runas (Dana) {
+    foreach (var kits in ["agent:Packhouse.Sorter", "skill:Packhouse.GradeCrate", "task:" + Guid.NewGuid().ToString()]) {
+      Assert.Throws<ValidationException>(() => BeginAgentWork(TheInspector, TheGrading, chargedTo: [kits]));
+      Assert.Throws<ValidationException>(() => GuidanceFor(TheInspector, TheGrading, chargedTo: [kits]));
+    }
+    Assert.Throws<ValidationException>(() => RecordAgentWork(TheInspector, TheGrading, "", "", null, "Done.", chargedTo: ["agent:Packhouse.Inspector"]));
+    Assert.Throws<ValidationException>(() => Agents.Of<Inspector>().On("agent:Packhouse.Sorter"));
+    foreach (var bad in ["", "  ", "peaches", ":peaches", "product:peaches\nproduct:plums"]) {
+      Assert.Throws<ValidationException>(() => BeginAgentWork(TheInspector, TheGrading, chargedTo: [bad]));
+    }
+    var twice = BeginAgentWork(TheInspector, TheGrading, chargedTo: ["product:peaches", " product:peaches ", "crate:B-1"]);
+    UnitOfWork.Commit();
+    Assert.Equal("product:peaches\ncrate:B-1", AgentTask.Single(t => t.Id == twice.Task).ChargedTo);
+    Assert.Equal(1, AgentTask.Count());
+  }
+  runas (Ada) {
+    Assert.Throws<AgentRefused>(() => BeginAgentWork(TheInspector, TheGrading, chargedTo: ["crate:B-1"]));
+    Assert.Throws<AgentRefused>(() => RecordAgentWork(TheInspector, TheGrading, "", "", null, "Done.", chargedTo: ["crate:B-1"]));
+    Assert.Throws<AgentRefused>(() => BeginAgentWork(TheInspector, TheGrading, chargedTo: ["crate:A-1", "crate:B-1"]));
+    var mine = BeginAgentWork(TheInspector, TheGrading, chargedTo: ["crate:A-1"]);
+    UnitOfWork.Commit();
+    Assert.Equal("crate:A-1", AgentTask.Single(t => t.Id == mine.Task).ChargedTo);
+  }
+  // Nothing was written for the work refused: the lead's and Ada's own, and no more.
+  runas (Dana) { Assert.Equal(2, AgentTask.Count()); }
+}
+
 // ── outcomes ────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 [Test(School)]
@@ -238,4 +317,19 @@ void rollback_after_a_recurring_proposal_restores_the_earlier_set_for_recorded_w
     Assert.Equal(was.InstructionsHash, now.InstructionsHash);
     Assert.Equal(InstructionSetNumbered(TheInspector, 1)!.Hash, InstructionSetHashNow(TheInspector));
   }
+}
+
+/// The 2.0 forms, kept so code written against them still compiles, answer what they did: `RecordedScopes` the agent's
+/// scope and the skill's; `AskModel` without a key runs where a call naming no key does — and for an agent that names no
+/// model to consult, answers so without calling one.
+[Test(School)]
+void the_2_0_forms_answer_what_they_did() {
+  var scopes = RecordedScopes(TheInspector, TheGrading);
+  Assert.Equal(2, scopes.Count);
+  Assert.Equal("agent:" + TheInspector, scopes[0]);
+  Assert.Equal("skill:" + TheGrading, scopes[1]);
+  Assert.Equal(1, RecordedScopes(TheInspector, "").Count);
+  var answer = AskModel(TheInspector, "", HelpReason.Stuck, "Is it short?", "", null, null, scopes, new List<LlmLimit>());
+  Assert.Equal("This agent names no model to consult.", answer.Answer);
+  Assert.Equal(HelpStatus.Unavailable, answer.Status);
 }
