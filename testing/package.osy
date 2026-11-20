@@ -12,12 +12,12 @@
 // Everything around the model is real — the loop, the agent's rights, the budget, the meter, the record — so a test
 // asserts what the agent DID and what it cost, for nothing, the same on every machine.
 package Osysharp.Agents.Testing {
-  version     "2.0.0";
-  minPlatform "0.19.0";
+  version     "2.1.0";
+  minPlatform "0.22.0";
   summary     "testing agents for free: a script of the model's answers turn by turn (tool calls, the result handed back, words, advice from a consulted model), and the trajectory, models and cost of a piece of work read back from its record; and a cast that scripts several agents at once, with the tree of what they handed on to each other read back.";
 
   model "model/*.osy";
   use Osysharp.Agents@2;
-  use Osysharp.Llm@2;
+  use Osysharp.Llm@3;
   tests "tests";
 }
