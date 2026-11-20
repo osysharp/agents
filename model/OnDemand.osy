@@ -91,7 +91,7 @@ public Guid RunSkill(string agent, string skill, string inputJson, string about 
   var me = Session.CurrentUser;
   var brief = "";
   try {
-    runas (Actor.From(account), onBehalfOf: me) { brief = held!.BriefHanded(inputJson); }
+    runas (Actor.From(account), onBehalfOf: me, readOnly: true) { brief = held!.BriefHanded(inputJson); }
   } catch (ValidationException) {
     throw;
   } catch (Exception e) {

@@ -75,6 +75,97 @@ void an_org_floor_makes_a_declared_alone_send_proposed() {
   }
 }
 
+/// ⭐ The kit still acts as its agents (ORGPOL OP-FP3b-1): the platform refuses `runas` of an agent from any code but
+/// the agents kit's, and the kit's own runs the courier's tool as the courier — the letter is written, as the agent.
+[Test(FloorYard)]
+void the_agents_kit_still_runs_its_tools() {
+  runas (Ada) {
+    var a1 = CrateBy("A-1");
+    ScriptOneLetter(a1, "Your crate is in.");
+    var done = WriteAbout(a1);
+    Assert.True(done.Done);
+    Assert.Equal(1, Letter.Count());
+    Assert.True(RecordSays(done.Task, "it is one of this work's tools, so it runs as the agent"));
+    Assert.True(RecordSays(done.Task, "WriteToGrower answered."));
+  }
+}
+
+/// ⭐ The kit's own loop still asks the model with its tools (ORGPOL OP-FP3b-2) when the organization locks model tools
+/// to the agents kit (`Osysharp.Llm.LlmSetup.ToolsOnlyThroughAgents`): the LLM kit refuses a request with tools from any
+/// code but this kit's, and this kit's is served — the courier's tool runs and the letter is written.
+[Test(FloorYard)]
+void the_kits_own_loop_runs_its_tools_under_the_lock() {
+  ToolsOnlyThroughAgentsInForce.Stub(() => true);
+  runas (Ada) {
+    var a1 = CrateBy("A-1");
+    ScriptOneLetter(a1, "Your crate is in.");
+    var done = WriteAbout(a1);
+    Assert.True(done.Done);
+    Assert.Equal(1, Letter.Count());
+    Assert.True(RecordSays(done.Task, "WriteToGrower answered."));
+  }
+}
+
+/// What a refusal under the lock on model tools says, as the app's `catch` is handed it.
+string ToolsRefusal() {
+  return "PolicyRefused|This app tried to use the setting `Osysharp.Llm.LlmSetup.ToolsOnlyThroughAgents` in a way "
+    + "your organization's policy does not allow.";
+}
+
+/// ⭐ The kit's STREAMED loop under the lock (ORGPOL OP-FP3b-2b, M1): its `Llm.Stream` runs in a producer of its own, and
+/// the platform reads that producer as called from the frames that opened it — the agents kit's — so the inspector's
+/// tool runs and the answer arrives as it is made.
+[Test(FloorYard)]
+void the_kits_streamed_loop_runs_under_the_tools_lock() {
+  ToolsOnlyThroughAgentsInForce.Stub(() => true);
+  runas (Ada) {
+    var crate = CrateBy("A-2");
+    var script = AgentScript.Of(Says.Tool(Actions.Of(Weigh), CrateArg(crate)), Says.Words("A-2 weighs 8 kg."));
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var seen = WatchInspector("What does A-2 weigh?");
+    Assert.Equal(["ToolStarted:Weigh", "ToolFinished:Weigh", "text:A-2 weighs 8 kg.", "done:A-2 weighs 8 kg."], seen);
+  }
+}
+
+/// ⭐ M2: a guard of the app's is shown a copy of the request. The tool it slips in is not offered to the model — only
+/// the inspector's own are — so app code the kit calls back into cannot ride the kit's request with a tool of its own.
+[Test(FloorYard)]
+void a_guard_cannot_add_a_tool_to_the_request() {
+  ToolsOnlyThroughAgentsInForce.Stub(() => true);
+  runas (Ada) {
+    ScriptedAnswer.Stub((model, request) => { NoteOffer(request, "offered"); return Says.Words("Nothing to pay."); });
+    var reply = AskInspector("Please smuggle a tool in.");
+    Assert.Equal(AgentTaskStatus.Done, reply.Status);
+    var offered = Heard.First(h => h.What == "offered").About;
+    Assert.False(offered.Contains("PayTheGrower"));
+    Assert.True(offered.Contains("Weigh"));
+  }
+}
+
+/// The app's own code, called back into by the kit (a guard), that streams a request with a tool is refused: the frames
+/// that opened its stream are the app's, above the kit's, and an app frame is never read as the kit below it.
+[Test(FloorYard)]
+void a_guards_stream_with_tools_is_refused() {
+  ToolsOnlyThroughAgentsInForce.Stub(() => true);
+  runas (Ada) {
+    ScriptedAnswer.Stub((model, request) => Says.Words("The top drawer."));
+    var reply = AskInspector("Please stream with a tool.");
+    Assert.Equal("A guard stopped it: its stream: " + ToolsRefusal(), reply.Problem);
+  }
+}
+
+/// The same for a task the app's code keeps (`var t = Llm.Complete(…)`, awaited later): the task runs in a run of its
+/// own, read as called from the app's frames that launched it — refused.
+[Test(FloorYard)]
+void a_guards_kept_tool_task_is_refused() {
+  ToolsOnlyThroughAgentsInForce.Stub(() => true);
+  runas (Ada) {
+    ScriptedAnswer.Stub((model, request) => Says.Words("The top drawer."));
+    var reply = AskInspector("Please keep a tool task.");
+    Assert.Equal("A guard stopped it: its task: " + ToolsRefusal(), reply.Problem);
+  }
+}
+
 /// A floor is the least, not the most: a skill that proposes the letter every time still does, and no standing rule
 /// covers it — and a floor on another effect (spends) changes nothing for a tool that does not spend.
 [Test(FloorYard)]

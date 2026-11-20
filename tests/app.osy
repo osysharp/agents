@@ -7,8 +7,10 @@ app Packhouse {
   model "model/**/*.osy";
   tests "**/*.test.osy";
   use Osysharp.Agents@2;
-  use Osysharp.Llm@2;
+  use Osysharp.Llm@3;
   use Osysharp.Identity@0;
   use Osysharp.Observability;
   use Osysharp.Workflow;
+  // The scribe's brief tries an egress send (readonly.test.osy), which a read-only block refuses.
+  use Osysharp.Http;
 }

@@ -33,7 +33,9 @@ public class GuardedWork {
 ///     app.Agents = new AgentsSetup { Agents = […], Guards = [new NoCardNumbers()] };
 ///
 /// The kit ships none: what is worth stopping is the app's to say. Each guard is asked in the order listed; the
-/// first that blocks decides, and its reason is a line of the record.
+/// first that blocks decides, and its reason is a line of the record. A guard reads what it is handed and says allow
+/// or block; it never changes what is sent. `BeforeModel` is shown a copy of the request: a tool it adds there is not
+/// offered to the model.
 ///
 /// | asked | when it blocks |
 /// |---|---|
@@ -56,10 +58,28 @@ GuardedWork GuardedOf(AgentRun run) {
   return new GuardedWork { Agent = run.Agent, Skill = run.Skill, Task = run.Task, Person = run.Person };
 }
 
-/// The first guard that blocks a request, or null.
+/// What a guard is shown of a request: a copy with lists of its own, so a guard READS the request and never changes
+/// what is sent (ORGPOL OP-FP3b-2b). A tool a guard adds is not offered to the model: only the agent's own tools are, and
+/// under `Osysharp.Llm.LlmSetup.ToolsOnlyThroughAgents` that is what the lock rests on — app code the kit calls back
+/// into cannot ride the kit's own request with a tool of its own.
+/// SECURITY-INVARIANT(a-model-request-with-tools-comes-only-from-the-agents-kit).
+LlmRequest ShownToTheGuards(LlmRequest request) {
+  var copy = new LlmRequest {
+    Model = request.Model, SystemPrompt = request.SystemPrompt, SystemSegments = request.SystemSegments.ToList(),
+    Messages = request.Messages.ToList(), Temperature = request.Temperature, MaxTokens = request.MaxTokens, TopP = request.TopP,
+    CacheTools = request.CacheTools, ToolChoice = request.ToolChoice, ToolChoiceName = request.ToolChoiceName,
+    OutputSchemaJson = request.OutputSchemaJson, OutputName = request.OutputName,
+  };
+  foreach (var tool in request.Tools) {
+    copy.Tools.Add(new LlmToolDefinition { Name = tool.Name, Description = tool.Description, InputSchemaJson = tool.InputSchemaJson });
+  }
+  return copy;
+}
+
+/// The first guard that blocks a request, or null. Each guard is shown a copy (`ShownToTheGuards`).
 GuardVerdict? GuardBeforeModel(AgentRun run, LlmRequest request) {
   foreach (var guard in App.Setting<AgentsSetup>().Guards) {
-    var verdict = guard.BeforeModel(GuardedOf(run), request);
+    var verdict = guard.BeforeModel(GuardedOf(run), ShownToTheGuards(request));
     if (verdict.Blocked) { return Guarded(run, guard, "kept the request from the model", verdict); }
   }
   return null;

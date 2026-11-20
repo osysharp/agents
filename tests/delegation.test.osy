@@ -55,6 +55,9 @@ LlmResponse Noted(AgentCast cast, string model, LlmRequest request) {
 [Test(Yard)]
 [runas(Ada)]
 void work_is_handed_to_two_agents_at_once_and_comes_back_typed() {
+  // Under the organization's lock on model tools (ORGPOL OP-FP3b-2b): the pieces asked at once, each a task kept beside
+  // its caller, are still the agents kit's own requests.
+  ToolsOnlyThroughAgentsInForce.Stub(() => true);
   var a1 = CrateBy("A-1");
   var a2 = CrateBy("A-2");
   var cast = AgentCast.Of()

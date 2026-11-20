@@ -207,3 +207,25 @@ void the_record_is_written_only_by_the_kit_and_never_changed() {
   Assert.Equal(9, TraceEvent.Count(e => e.Task.Id == task));
   Assert.True(VerifyTrace(receipt).Intact);
 }
+
+// ── a chain's turnstile is the kit's ────────────────────────────────────────────────────────────────────────────────
+
+void MakeAHead() { new AgentTraceHead { Root = Guid.NewGuid() }; }
+void ResetTheHead(Guid root) { AgentTraceHead.Single(h => h.Root == root).Turn = 0; }
+int ResetTheHeadAtOnce(Guid root) => AgentTraceHead.Where(h => h.Root == root).Update(h => { h.Turn = 0; });
+
+[Test(Yard)]
+[runas(Ada)]
+void a_signed_in_caller_cannot_make_or_move_a_chains_turnstile() {
+  var task = GradedByAda();
+  var turn = AgentTraceHead.Single(h => h.Root == task).Turn;
+  Assert.True(turn > 0);
+  // Nobody makes a head of their own, or moves the kit's — row by row or in one statement.
+  Assert.Denied(() => MakeAHead());
+  UnitOfWork.Discard();
+  Assert.Denied(() => ResetTheHead(task));
+  UnitOfWork.Discard();
+  Assert.Equal(0, ResetTheHeadAtOnce(task));
+  UnitOfWork.Commit();
+  Assert.Equal(turn, AgentTraceHead.Single(h => h.Root == task).Turn);
+}

@@ -263,6 +263,22 @@ it — and a run that ends while a step still waits calls the work off. With
 [`Osysharp.Processes`](../processes) in the app, each step is told on its run and opens there as the
 [inspector](../agents-inspector) ([`Osysharp.Agents.Processes`](../agents-processes)).
 
+## Only the kit acts as an agent
+
+An agent is a principal with its own rights, so *acting as it* is the kit's act alone. A `runas (…)` block to one of the
+kit's agents, a workflow's or an `[On]`/`[OnStart]` handler's `RunsAs`, and an `Actions.Run` while the caller is an agent
+are refused unless the code doing it is the kit's own (`Osysharp.Agents`) or one of the platform's kits built on it
+(`Osysharp.Agents.HumanRequests`, `Osysharp.WorkRepositories.Agents`). Your app's code, any other package, and your code
+the kit calls back into (an `Agent` or `Skill` override, a tool body, a `Brief`) are refused, with words naming the kit as
+the only way and your organization's policy. Where the compiler can see it (`runas (TheAgent)`, `RunsAs = TheAgent`) the
+refusal is a compile error; otherwise it is raised when the code runs. An actor that is not an agent is run as before.
+A block written directly in a `[Test]` or `[TestFixture]` body is the test's and may; a test helper, and app code a test
+calls, may not. To give an agent work, ask the kit: `Agents.Of<T>().Do(skill, input)`.
+
+A **guard** (`AgentGuard.BeforeModel`) is shown a *copy* of the request, with copies of its tool definitions: a tool it
+adds to the copy is not sent. This is what lets your organization lock tool use to the kit (see
+[`Osysharp.Llm`](../llm): `LlmSetup.ToolsOnlyThroughAgents`).
+
 ## What only the kit writes
 
 Receipts, records, sponsors and requests for help are rows in your app's database that only this package's functions

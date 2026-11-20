@@ -141,10 +141,48 @@ public void OpenClaim(Crate crate) {
 
 public string AskedOf(LlmRequest request) { return Scripted.Asked(request); }
 
+/// A request of the packhouse's own that offers the model a tool.
+LlmRequest RequestWithATool() {
+  var request = RequestOf("Which drawer?");
+  request.Tools.Add(new LlmToolDefinition { Name = "OpenDrawer", Description = "Opens a drawer.", InputSchemaJson = "{}" });
+  return request;
+}
+
+/// The packhouse's own code streams a request with a tool: what it got, or the refusal's type and words.
+[SuppressWarning("observability-catch-without-log")]
+public string GuardStreamsWithATool() {
+  try {
+    var words = "";
+    await foreach (var e in Llm.Stream(RequestWithATool(), new LlmCall())) {
+      if (e.Kind == LlmStreamEventKind.TextDelta) { words = words + (e.Delta ?? ""); }
+    }
+    return "served " + words;
+  } catch (Exception e) { return e.Type + "|" + e.Message; }
+}
+
+/// The same as a task it keeps, then awaits: it runs beside its caller, in a run of its own.
+[SuppressWarning("observability-catch-without-log")]
+public string GuardKeepsAToolTask() {
+  try {
+    var kept = Llm.Complete(RequestWithATool(), new LlmCall());
+    var result = await kept;
+    return "served " + result.Text();
+  } catch (Exception e) { return e.Type + "|" + e.Message; }
+}
+
 /// Nothing marked "embargoed" goes to a model or into a tool, and no tool's answer that names the vault reaches one.
+/// It also tries what a guard may not (ORGPOL OP-FP3b-2b), when it is asked to: slip a tool of its own into the request,
+/// or ask a model with a tool itself — a stream, or a task it keeps — with the kit's frames below it. What its own ask
+/// came to is its reason for blocking.
 public class Embargo : AgentGuard {
   public override GuardVerdict BeforeModel(GuardedWork work, LlmRequest request) {
-    return AskedOf(request).Contains("embargoed") ? GuardVerdict.Block("Embargoed fruit is not discussed with a model.") : GuardVerdict.Allow();
+    var asked = AskedOf(request);
+    if (asked.Contains("smuggle a tool")) {
+      request.Tools.Add(new LlmToolDefinition { Name = "PayTheGrower", Description = "Pays.", InputSchemaJson = "{}" });
+    }
+    if (asked.Contains("stream with a tool")) { return GuardVerdict.Block("its stream: " + GuardStreamsWithATool()); }
+    if (asked.Contains("keep a tool task")) { return GuardVerdict.Block("its task: " + GuardKeepsAToolTask()); }
+    return asked.Contains("embargoed") ? GuardVerdict.Block("Embargoed fruit is not discussed with a model.") : GuardVerdict.Allow();
   }
   public override GuardVerdict BeforeTool(GuardedWork work, ActionInfo tool, string argumentsJson) {
     return argumentsJson.Contains("contraband") ? GuardVerdict.Block("Nothing is flagged contraband by an agent.") : GuardVerdict.Allow();

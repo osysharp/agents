@@ -192,7 +192,13 @@ public class AgentRef {
   ///
   /// ⚑ A SIGNED-IN CALLER NAMES THEMSELVES, AND NOBODY ELSE — unless the app says they may:
   ///   `policy DirectsAgentsForOthers => IsLead;`. Otherwise the work is refused before anything runs.
+  ///
+  /// ⚑ A PERSON IS NOT SUCH A ROW. `For(person)` is refused: it would be work for whoever made the person's account —
+  ///   somebody else, or nobody, and then the agent alone with its own rights.
   public AgentRef For(Entity row) {
+    if (row is Principal) {
+      throw new ValidationException("For(row) takes the row the work is about (an order, a report), and the work is for whoever made it. A person is not such a row: pass the row they made, or leave For out to work for whoever is signed in.");
+    }
     return new AgentRef { Name = Name, Actor = Actor, Row = row, ForSomebody = true, ChargedTo = ChargedTo, Key = Key };
   }
 

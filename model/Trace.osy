@@ -102,16 +102,24 @@ public entity TraceEvent {
   }
 }
 
-/// The turnstile of one chain: lines are appended one at a time, each waiting for the one before it to be stored. It
-/// holds nothing worth protecting — the chain is in the lines themselves.
+/// The turnstile of one chain: lines are appended one at a time, each waiting for the one before it to be stored. Made by
+/// `OpenAgentTask` with the chain's first piece of work, moved only by `AppendAgentTrace`.
 [Unique(Root)]
 public entity AgentTraceHead {
   [Required, Immutable] Guid Root;
   long Turn = 0;
 
   security {
+    // Read by whoever may use an agent: `AppendAgentTrace` runs as that caller, and its one statement selects the row
+    // through the caller's read. `Turn` counts lines and says nothing else.
     allow read, create, update when UsesAgents;
     allow delete when ErasesAgentRecords;
+    // SECURITY-INVARIANT(a-kits-throttle-is-written-only-by-the-kit): a chain's turnstile is made and moved only by the
+    // kit's internal functions, never by a request — so nobody holds a chain's appends in a write of their own or makes
+    // heads for chains that do not exist. Guarded by tests/trace.test.osy
+    // `a_signed_in_caller_cannot_make_or_move_a_chains_turnstile`.
+    deny create except via OpenAgentTask;
+    deny update Turn except via AppendAgentTrace;
     deny delete except via ForgetAgentWork;
   }
 }

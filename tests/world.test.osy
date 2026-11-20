@@ -32,6 +32,7 @@ void Yard() {
   new AgentSeat { Agent = "Packhouse.Yardmaster", Sponsor = omar };
   new AgentSeat { Agent = "Packhouse.Steward", Sponsor = dana };
   new AgentSeat { Agent = "Packhouse.Warden", Sponsor = dana };
+  new AgentSeat { Agent = "Packhouse.Scribe", Sponsor = dana };
 }
 
 principal Ada  => Person.Single(p => p.Email == "ada@packhouse.example");

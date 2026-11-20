@@ -1,0 +1,131 @@
+// ORGPOL OP-FP3b-3b — a skill's brief reads as the agent but can't write. The scribe's skills each try one thing from
+// their `Brief`, which the kit works out inside `runas (…, readOnly: true)`; its settling skill writes from a TOOL, which
+// the agent's gate allows. The tallyman is an actor of the app's own, not an agent: a block of its inside a brief is
+// read-only too.
+namespace Packhouse;
+
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Workflow;
+
+/// An actor of the packhouse's own that is not an agent.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Tallyman {
+  public static Person Principal => new Person { Email = "tallyman@packhouse.example", DisplayName = "Tallyman" };
+}
+
+/// A skill on one crate, named by its id — what each of the scribe's skills takes.
+public class ScribeSkill : Skill<Crate, string> {
+  public override string Description => "Look at one crate.";
+  public override string HandedSchema() => HandOn.ById("The crate.");
+  public override Crate Handed(string inputJson) {
+    var id = HandOn.IdIn(inputJson);
+    return Crate.Single(c => c.Id == id);
+  }
+}
+
+public class ScribeNew : ScribeSkill {
+  public override string Brief(Crate c) { new Note { Crate = c, Text = "from a brief" }; return c.Code; }
+}
+
+public class ScribeChange : ScribeSkill {
+  public override string Brief(Crate c) { c.Flag = "scribbled"; return c.Code; }
+}
+
+public class ScribeDrop : ScribeSkill {
+  public override string Brief(Crate c) { c.Delete(); return c.Code; }
+}
+
+async Task<int> ScribeLater(Crate c) { new Note { Crate = c, Text = "from a task" }; return 1; }
+
+public class ScribeTask : ScribeSkill {
+  public override string Brief(Crate c) { var writing = ScribeLater(c); var n = await writing; return c.Code; }
+}
+
+public class ScribeNested : ScribeSkill {
+  public override string Brief(Crate c) { runas (Tallyman) { new Note { Crate = c, Text = "nested" }; } return c.Code; }
+}
+
+public class ScribeRings : ScribeSkill {
+  public override string Brief(Crate c) { var r = Actions.Run("Packhouse.Weigh", []); return c.Code; }
+}
+
+public class ScribeSends : ScribeSkill {
+  public override string Brief(Crate c) { var r = Http.Get("https://scribe.example/crate"); return c.Code; }
+}
+
+public class ScribeSwallows : ScribeSkill {
+  public override string Brief(Crate c) {
+    // The refusal is caught: the `try` that threw drops what it staged, so nothing is left to write.
+    try { new Note { Crate = c, Text = "swallowed" }; } catch (Exception e) { }
+    return c.Code;
+  }
+}
+
+/// OP-FP3b-3d — what else a brief may not set off: an event a handler hears, a workflow's advance, a topic's subscribers,
+/// and other sessions ending.
+[Event("A crate the scribe looked at")]
+public sealed class ScribeLooked { public Crate Crate; }
+[On] void ScribeHeardIt(ScribeLooked e) { new Note { Crate = e.Crate, Text = "heard" }; }
+
+public class ScribeRaises : ScribeSkill {
+  public override string Brief(Crate c) { Raise(new ScribeLooked { Crate = c }); return c.Code; }
+}
+
+public enum ScribeBookStage { Open, Signed }
+
+/// A book a workflow keeps open until it is signed.
+entity ScribeBook {
+  [MaxLength(40)] string Code;
+  ScribeBookStage Stage = ScribeBookStage.Open;
+  security { allow read, create, update when IsAuthenticated; }
+}
+
+workflow ScribeBookFlow {
+  Tracks = ScribeBook.Stage; Autostart = false; Initial = Open;
+  event Sign();
+  state Open {
+    subscribe Sign();
+    on Sign { goto Signed; }
+  }
+  terminal success Signed { }
+}
+
+public class ScribeSigns : ScribeSkill {
+  public override string Brief(Crate c) {
+    Workflow.Raise(ScribeBook.Single(b => b.Code == c.Code), Sign());
+    return c.Code;
+  }
+}
+
+public class ScribeLine { public string Text; }
+topic ScribeFeed(Guid crateId) {
+  Candidates = u => true;
+  Carries    = ScribeLine;
+}
+
+public class ScribePublishes : ScribeSkill {
+  public override string Brief(Crate c) { ScribeFeed.For(c.Id).Publish(new ScribeLine { Text = c.Code }); return c.Code; }
+}
+
+public class ScribeEnds : ScribeSkill {
+  public override string Brief(Crate c) { Security.EndOtherSessions(c.Grower.Id); return c.Code; }
+}
+
+/// Settles a crate by a tool: the write is the tool's, as the agent.
+public class ScribeSettles : ScribeSkill {
+  public override List<ActionInfo> Tools => [Actions.Of(MoveToLine)];
+  public override string Brief(Crate c) => $"Crate {c.Code}. Its id is {c.Id}.";
+}
+
+/// Tries, from a brief, everything a brief may not do.
+[Actor(Roles = [PackhouseRole.Grader])]
+public class Scribe : Agent {
+  public static Person Principal => new Person { Email = "scribe@packhouse.example", DisplayName = "Scribe" };
+  public override string Purpose => "You look at crates.";
+  public override List<SkillBase> Skills => [new ScribeNew(), new ScribeChange(), new ScribeDrop(), new ScribeTask(),
+    new ScribeNested(), new ScribeRings(), new ScribeSends(), new ScribeSwallows(), new ScribeSettles(), new ScribeRaises(), new ScribeSigns(), new ScribePublishes(),
+    new ScribeEnds()];
+  public override Permits May => Permits.ChangesAlone();
+}

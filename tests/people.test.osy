@@ -286,6 +286,19 @@ void work_for_a_row_acts_for_whoever_made_it() {
   }
 }
 
+/// A person is not the row the work is about. `For(person)` — how Agents 1 named whom the work was for — is refused where
+/// it is written, before anything runs: read as "whoever made that person's account" it would work for somebody else, or
+/// for nobody, with the agent's own rights.
+[Test(Yard)]
+void work_for_a_person_row_is_refused() {
+  runas (Dana) {
+    var ben = Person.Single(p => p.Email == "ben@packhouse.example");
+    var refused = Assert.Throws<ValidationException>(() => InspectForMaker(ben, Crate.Single(c => c.Code == "A-1")));
+    Assert.Contains("For(row)", refused.Message);
+    Assert.Equal(0, AgentTask.Count());
+  }
+}
+
 /// Work whose person is not recorded — opened where nobody is acted for, as work opened before this was recorded at
 /// all — acts as the agent alone: with its own roles, and for nobody.
 [Test(Yard)]

@@ -382,14 +382,15 @@ long RoomOf(AgentRun run) {
 }
 
 /// The brief of a piece of handed-on work, made AS the agent that would do it and never past the person the work is
-/// for — so a row the model names is found only when both may read it.
+/// for — so a row the model names is found only when both may read it. Read-only: a skill's brief reads as the agent
+/// but can't write; a write is a tool's, which the agent's gate allows (OP-FP3b-3b).
 string BriefAs(AgentRun run, Principal account, SkillBase skill, string inputJson) {
   var task = AgentTask.Single(t => t.Id == run.Task);
   var forWhom = AgentWorkFor.FirstOrDefault(w => w.Task == run.Task);
   if (forWhom == null || forWhom!.ActsFor == null) {
-    runas (Actor.From(account), scope: task) { return skill.BriefHanded(inputJson); }
+    runas (Actor.From(account), scope: task, readOnly: true) { return skill.BriefHanded(inputJson); }
   }
-  runas (Actor.From(account), onBehalfOf: forWhom!.ActsFor, scope: task) { return skill.BriefHanded(inputJson); }
+  runas (Actor.From(account), onBehalfOf: forWhom!.ActsFor, scope: task, readOnly: true) { return skill.BriefHanded(inputJson); }
 }
 
 /// What a piece of work is about, as its receipt says.

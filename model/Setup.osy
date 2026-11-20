@@ -35,7 +35,7 @@ public class AgentsSetup {
   /// How many turns a piece of work may take when its skill does not say — and the most a skill's own `StopWhen`
   /// gets: a skill may say fewer, never more. Your organization may bound it (a range): the value read is then held
   /// inside the range, whatever the app assigns.
-  [OrgPolicy(OrgPolicyMode.Range)] public int MaxTurns = 12;
+  [OrgPolicy(OrgPolicyMode.Range, Name = "Agent turns per piece of work")] public int MaxTurns = 12;
   /// ⭐ YOUR ORGANIZATION'S FLOOR, BY WHAT A TOOL DOES (ORGPOL OP-FP3). The least an agent must do before a tool that
   /// changes the app's data, sends, spends or reaches outside in another way than sending or spending
   /// (`ReachesOutAtLeast` covers neither a send nor a spend: those have their own) runs. `Alone` (the kit's default)
@@ -44,13 +44,13 @@ public class AgentsSetup {
   /// `ProposeEveryTime` and `Never` as their names say. A tool whose effects the compiler could not all see meets the
   /// strictest of the four. An agent's own `May` can be stricter than the floor, never looser. Locked by an
   /// organization, the value read is the organization's, whatever the app assigns.
-  [OrgPolicy(OrgPolicyMode.Lock)] public Leave ChangesAtLeast = Leave.Alone;
-  [OrgPolicy(OrgPolicyMode.Lock)] public Leave SendsAtLeast = Leave.Alone;
-  [OrgPolicy(OrgPolicyMode.Lock)] public Leave SpendsAtLeast = Leave.Alone;
-  [OrgPolicy(OrgPolicyMode.Lock)] public Leave ReachesOutAtLeast = Leave.Alone;
+  [OrgPolicy(OrgPolicyMode.Lock, Name = "Oversight before an agent changes data")] public Leave ChangesAtLeast = Leave.Alone;
+  [OrgPolicy(OrgPolicyMode.Lock, Name = "Oversight before an agent sends")] public Leave SendsAtLeast = Leave.Alone;
+  [OrgPolicy(OrgPolicyMode.Lock, Name = "Oversight before an agent spends")] public Leave SpendsAtLeast = Leave.Alone;
+  [OrgPolicy(OrgPolicyMode.Lock, Name = "Oversight before an agent reaches out")] public Leave ReachesOutAtLeast = Leave.Alone;
   /// Whether anybody may say "from now on, alone" (`AllowAlone`). Off: a standing rule is refused, and the rules
   /// that already stand are not read by the gate (they are kept, and count again if it is turned back on).
-  [OrgPolicy(OrgPolicyMode.Lock)] public bool StandingRules = true;
+  [OrgPolicy(OrgPolicyMode.Lock, Name = "Standing rules allowed for agents")] public bool StandingRules = true;
   /// The app's own checks on every piece of work — see `AgentGuard`. Asked in this order.
   public List<AgentGuard> Guards = [];
   /// How long work that says it is under way may write nothing on its record before it counts as abandoned — the

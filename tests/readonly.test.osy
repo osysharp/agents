@@ -1,0 +1,138 @@
+// Osysharp.Agents — ORGPOL OP-FP3b-3b: a skill's brief reads as the agent but can't write; write from a tool, which the
+// agent's gate allows. SECURITY-INVARIANT(a-read-only-block-writes-nothing).
+using Osysharp.Identity;
+using Osysharp.Llm;
+using Osysharp.Agents;
+using Osysharp.Workflow;
+using Packhouse.Testing;
+using Packhouse;
+
+string ScribeInput(Crate c) { return "{\"id\":\"" + c.Id.ToString() + "\"}"; }
+
+string ScribeRefusal(string skill) {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var e = Assert.Throws<ValidationException>(() => RunSkill("Packhouse.Scribe", skill, ScribeInput(crate)));
+  Assert.Contains("inside `runas (Scribe, readOnly: true)`", e.Message);
+  Assert.Contains("A skill's brief reads as the agent but can't write; write from a tool, which the agent's gate allows.", e.Message);
+  Assert.Equal(0, AgentTask.Count());
+  return e.Message;
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_creates_a_row_and_is_refused() {
+  Assert.Contains("Refused: a write to `Note`", ScribeRefusal("Packhouse.ScribeNew"));
+  Assert.Equal(0, Note.Count(n => n.Text == "from a brief"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_updates_a_row_and_is_refused() {
+  Assert.Contains("Refused: a write to `Crate`", ScribeRefusal("Packhouse.ScribeChange"));
+  Assert.Equal("", Crate.Single(c => c.Code == "A-1").Flag);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_deletes_a_row_and_is_refused() {
+  Assert.Contains("Refused: a write to `Crate`", ScribeRefusal("Packhouse.ScribeDrop"));
+  Assert.Equal(1, Crate.Count(c => c.Code == "A-1"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_starts_a_task_that_writes_and_is_refused() {
+  Assert.Contains("Refused: a write to `Note`", ScribeRefusal("Packhouse.ScribeTask"));
+  Assert.Equal(0, Note.Count(n => n.Text == "from a task"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_briefs_nested_runas_cant_lift_read_only() {
+  var said = ScribeRefusal("Packhouse.ScribeNested");
+  // Named as the block that SAID read-only, never as the plain `runas (Tallyman)` inside it.
+  Assert.Contains("Refused: a write to `Note` inside `runas (Scribe, readOnly: true)`", said);
+  Assert.DoesNotContain("runas (Tallyman", said);
+  Assert.Equal(0, Note.Count(n => n.Text == "nested"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_runs_a_tool_and_is_refused() {
+  Assert.Contains("Refused: `Actions.Run(\"Packhouse.Weigh\")`", ScribeRefusal("Packhouse.ScribeRings"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_sends_out_and_is_refused() {
+  Assert.Contains("Refused: `Http.Get`", ScribeRefusal("Packhouse.ScribeSends"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_briefs_swallowed_write_writes_nothing() {
+  // The brief catches its own refusal and goes on: the work runs, and the row it tried to make is not there (a `try`
+  // that throws drops what it staged, so nothing is left pending for the block's commit either).
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(Says.Words("Looked."));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  var task = RunSkill("Packhouse.Scribe", "Packhouse.ScribeSwallows", ScribeInput(crate));
+  Assert.Equal(AgentTaskStatus.Done, AgentTask.Single(t => t.Id == task).Status);
+  Assert.Equal(0, Note.Count());
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_tool_that_writes_as_the_agent_still_works() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var script = AgentScript.Of(
+    Says.Tool("It goes to juice.", Actions.Of(MoveToLine), "{\"crate\":\"" + crate.Id.ToString() + "\",\"line\":\"Juice\"}"),
+    Says.Words("Sent to juice."));
+  ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+  var task = RunSkill("Packhouse.Scribe", "Packhouse.ScribeSettles", ScribeInput(crate));
+  Assert.Equal(AgentTaskStatus.Done, AgentTask.Single(t => t.Id == task).Status);
+  Assert.Equal("Juice", Crate.Single(c => c.Code == "A-1").Line);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void plain_runas_without_read_only_writes_as_today() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  runas (Tallyman) { new Note { Crate = crate, Text = "as today" }; }
+  Assert.Equal(1, Note.Count(n => n.Text == "as today"));
+}
+
+// OP-FP3b-3d — what else a brief may not set off, each refused where it is called.
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_raises_an_event_and_no_handler_runs() {
+  Assert.Contains("Refused: raising `ScribeLooked`", ScribeRefusal("Packhouse.ScribeRaises"));
+  Assert.Equal(0, Note.Count(n => n.Text == "heard"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_ends_sessions_and_is_refused() {
+  Assert.Contains("Refused: ending sessions (`Security.EndOtherSessions`/`SignOutEverywhere`)",
+    ScribeRefusal("Packhouse.ScribeEnds"));
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_advances_a_workflow_and_is_refused() {
+  var book = new ScribeBook { Code = "A-1" };
+  UnitOfWork.Commit();
+  Workflow.Run(book);
+  UnitOfWork.Commit();
+  Assert.Contains("Refused: advancing a workflow (`Workflow.Raise(…, Sign)`)", ScribeRefusal("Packhouse.ScribeSigns"));
+  Assert.Equal(ScribeBookStage.Open, ScribeBook.Single(b => b.Code == "A-1").Stage);
+}
+
+[Test(Yard)]
+[runas(Ada)]
+void a_brief_publishes_and_no_subscriber_hears() {
+  var crate = Crate.Single(c => c.Code == "A-1");
+  var heard = ScribeFeed.For(crate.Id).Listen();
+  Assert.Contains("Refused: publishing on a topic (`Publish`)", ScribeRefusal("Packhouse.ScribePublishes"));
+  Assert.Equal(0, heard.Count);
+}

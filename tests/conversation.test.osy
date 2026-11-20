@@ -108,6 +108,30 @@ void a_conversation_resumes_after_a_crash_without_paying_twice() {
   }
 }
 
+/// ⭐ A CONVERSATION'S TURN UNDER THE LOCK ON MODEL TOOLS (ORGPOL OP-FP3b-2b, M1). Every turn asks its model through
+/// `Llm.Stream` (drafting as it goes), in a producer of its own; the platform reads it as called from the turn's frames
+/// — the agents kit's — so the docker's stamp runs and the turn ends in its words.
+[Test(Desk)]
+void a_conversation_turn_runs_under_the_tools_lock() {
+  ToolsOnlyThroughAgentsInForce.Stub(() => true);
+  Guid id;
+  runas (Dana) {
+    var script = Stamping();
+    ScriptedAnswer.Stub((model, request) => script.Answer(model, request));
+    var talk = Agents.Of<Docker>().Converse("Crate A-1");
+    id = talk.Id;
+    Say(talk, "Please stamp crate A-1.");
+  }
+  LetTheDeskGoOn();
+  runas (Dana) {
+    var talk = AgentConversation.Single(c => c.Id == id);
+    Assert.Equal(AgentConversationStatus.Idle, talk.Status);
+    Assert.Equal(["user: Please stamp crate A-1.", "assistant: Crate A-1 is stamped."],
+      JsonSerializer.Deserialize<List<AgentTurn>>(talk.History).Select(t => t.Role + ": " + t.Text).ToList());
+    Assert.Equal(1, Heard.Count(h => h.What == "stamped"));
+  }
+}
+
 /// ⭐ WORK HANDED OUTSIDE THAT ENDS AFTER THE TURN STARTS THE NEXT TURN. Dana asks for crate A-1's labels; the docker's
 /// turn hands the sheet to the machines, hears it is pending, and ends — telling Dana it will say when the labels are
 /// back. The turn is done, and the sheet is not called off with it: it stays with the conversation. When Hal hands it
