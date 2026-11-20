@@ -13,7 +13,7 @@ app Procurement {
   use Osysharp.Agents.Teaching@2;
   use Osysharp.Agents.Processes@2;
   use Osysharp.Processes@1;
-  use Osysharp.Llm@2;
+  use Osysharp.Llm@3;
   use Osysharp.Identity@0;
   use Osysharp.Observability;
   use Osysharp.Workflow;
