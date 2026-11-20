@@ -11,7 +11,7 @@ app Purchasing {
   use Osysharp.Agents.HumanRequests@2;
   use Osysharp.HumanRequests@1;
   use Osysharp.WorkQueues@1;
-  use Osysharp.Llm@2;
+  use Osysharp.Llm@3;
   use Osysharp.Identity@0;
   use Osysharp.Organizations@0;
   use Osysharp.Organizations.ServicePlans@0;
