@@ -165,7 +165,10 @@ public AgentCorrection CorrectAgentWork(AgentTask task, Correction correction) {
             || (task.StartedBy != null && task.StartedBy!.Id == person!.Id)
             || (proposal != null && proposal!.DecideBy != null && proposal!.DecideBy!.Id == person!.Id)
             || Security.Authorize(person!, SupervisesAgents) || Security.Authorize(person!, TeachesAgents);
-  if (!theirs) { throw new AgentRefused("This piece of work is not yours to correct."); }
+  if (!theirs) {
+    throw new AgentRefused("This piece of work is not yours to correct: you did not ask for it, start it or decide what it "
+      + $"proposed, and the app's `SupervisesAgents` and `TeachesAgents` both answer no for {NameOfPrincipal(person!)} now.");
+  }
 
   var said = "";
   if (correction.Step > 0) {
@@ -245,7 +248,10 @@ public void WithdrawAgentCorrection(AgentCorrection correction, string why) {
   var person = me == null ? null : Principal.FirstOrDefault(p => p.Id == me);
   if (person == null) { throw new AgentRefused("A correction is taken back by a person: nobody is signed in."); }
   var theirs = (correction.By != null && correction.By!.Id == person!.Id) || Security.Authorize(person!, TeachesAgents);
-  if (!theirs) { throw new AgentRefused("A correction is taken back by whoever wrote it, or by whoever teaches the agents."); }
+  if (!theirs) {
+    throw new AgentRefused("A correction is taken back by whoever wrote it, or by whoever teaches the agents; the app's "
+      + $"`TeachesAgents` answers no for {NameOfPrincipal(person!)} now.");
+  }
   if (why.Trim() == "") { throw new ValidationException("Say why it is taken back."); }
   correction.WithdrawnAt = DateTime.UtcNow;
   correction.WithdrawnWhy = Clipped(why.Trim(), 300);

@@ -123,7 +123,8 @@ void a_correction_is_a_record_on_the_work_and_the_step_it_corrects() {
   // is in charge of the agents.
   runas (Omar) {
     var refused = Assert.Throws<AgentRefused>(() => Correct(task));
-    Assert.Equal("This piece of work is not yours to correct.", refused.Message);
+    Assert.Equal("This piece of work is not yours to correct: you did not ask for it, start it or decide what it proposed, "
+      + "and the app's `SupervisesAgents` and `TeachesAgents` both answer no for Omar now.", refused.Message);
   }
   // The lead may, and so may whoever teaches.
   runas (Dana) { Assert.Equal(CorrectionAbout.Result, Correct(task).About); }
@@ -294,6 +295,65 @@ void code_running_as_the_app_cannot_activate_one() {
     Background.Settle();
     // It ran — as the app, where nobody is signed in — and was refused.
     Assert.Contains("nobody is signed in", Heard.Single(h => h.What == "auto").About);
+    Assert.Equal(InstructionState.Proposed, AgentInstruction.Single().State);
+    Assert.Equal(0, InstructionSetOf(TheInspector));
+  }
+}
+
+// ── somebody who acts for a teacher ─────────────────────────────────────────────────────────────────────────────────
+
+/// Sam stands in for Tess while she is away, until tomorrow; Pat stood in for her until yesterday. Each is an account
+/// of its own holding no role: what the packhouse's `TeachesAgents` says of it comes through Tess (PLATFORM-725).
+[TestFixture(School)]
+void StandIns() {
+  var tess = Person.Single(p => p.Email == "tess@packhouse.example");
+  var sam = new Person { Email = "sam@packhouse.example", DisplayName = "Sam" };
+  var pat = new Person { Email = "pat@packhouse.example", DisplayName = "Pat" };
+  new StandIn { Account = sam, For = tess, Until = DateTime.UtcNow.AddDays(1) };
+  new StandIn { Account = pat, For = tess, Until = DateTime.UtcNow.AddDays(-1) };
+}
+
+principal Sam => Person.Single(p => p.Email == "sam@packhouse.example");
+principal Pat => Person.Single(p => p.Email == "pat@packhouse.example");
+
+/// The kit asks the app's `TeachesAgents` about the account that is signed in, and the app's answer is the one that
+/// holds — here, yes, through the person it stands in for: Sam proposes outright, with no correction behind it, and
+/// makes it active, and both are his.
+[Test(StandIns)]
+void a_stand_in_for_a_teacher_proposes_outright_and_makes_it_active() {
+  runas (Sam) {
+    var made = ProposeAgentInstruction(new InstructionDraft { Agent = TheInspector, Guidance = ShortRule(), Why = "Tess asked for it before she left." });
+    Assert.Equal(InstructionState.Proposed, made.State);
+    Assert.Equal(Sam.Id, made.ProposedBy!.Id);
+    Assert.Equal(0, made.DrawnFrom);
+    var set = ActivateAgentInstruction(made, "Agreed with Tess.");
+    UnitOfWork.Commit();
+    Assert.Equal(1, set.Number);
+    Assert.Equal(Sam.Id, set.By!.Id);
+    Assert.Equal(InstructionState.Active, AgentInstruction.Single(i => i.Id == made.Id).State);
+  }
+}
+
+/// Pat's time is up, so the app's rules answer no for her — and the kit says that is what refused her, naming the
+/// rules and the account, rather than leaving her to guess that she is not a teacher. Nothing is proposed or made active.
+[Test(StandIns)]
+void a_stand_in_whose_time_is_up_is_refused_and_told_the_apps_rules_said_no() {
+  AgentInstruction? proposed = null;
+  runas (Tess) {
+    proposed = ProposeAgentInstruction(new InstructionDraft { Agent = TheInspector, Guidance = ShortRule(), Why = "Tess's own." });
+    UnitOfWork.Commit();
+  }
+  runas (Pat) {
+    var outright = Assert.Throws<AgentRefused>(() => ProposeAgentInstruction(new InstructionDraft {
+      Agent = TheInspector, Guidance = "Condemn every crate.", Why = "Tess asked for it before she left.",
+    }));
+    Assert.Equal("Propose an instruction from a correction you made (`From`). Whoever the app's `TeachesAgents` or "
+      + "`SupervisesAgents` admits may propose any instruction outright, and both answer no for Pat now.", outright.Message);
+    // Making one active is the app's `TeachesAgents` to say, at the door, and it says no for her too.
+    Assert.Denied(() => ActivateAgentInstruction(proposed!, "Tess agreed."));
+  }
+  runas (Tess) {
+    Assert.Equal(1, AgentInstruction.Count());
     Assert.Equal(InstructionState.Proposed, AgentInstruction.Single().State);
     Assert.Equal(0, InstructionSetOf(TheInspector));
   }

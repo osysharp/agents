@@ -8,9 +8,21 @@ using Osysharp.Llm;
 using Osysharp.Agents;
 
 policy IsTeacher => RoleGrant.Any(g => g.Member == user && g.Role == PackhouseRole.Teacher);
-// Tess teaches the agents. The understudy's own account holds the same role — the packhouse's mistake, and one the
-// kit does not depend on it never making.
-policy TeachesAgents => IsTeacher;
+// Tess teaches the agents — and so does whoever stands in for a teacher, while its time stands. The understudy's own
+// account holds the teacher's role — the packhouse's mistake, and one the kit does not depend on it never making.
+policy TeachesAgents => IsTeacher || StandsInForATeacher;
+
+/// An account that acts for a person while they are away — its own sign-in, holding no role of its own: what it may
+/// do is what its person may, and only until `Until`. Written the way an app writes a person's delegate, so the kit is
+/// asked about an account whose answer comes through somebody else and runs out.
+entity StandIn {
+  [Required] Person Account;
+  [Required] Person For;
+  DateTime Until;
+  security { allow read when IsAuthenticated; }
+}
+policy StandsInForATeacher => StandIn.Any(s => s.Account == user && s.Until > DateTime.UtcNow
+  && RoleGrant.Any(g => g.Member == s.For && g.Role == PackhouseRole.Teacher));
 
 // The packhouse sends a piece of work at most three instructions.
 // (Set where the app is configured: model/setup.osy.)

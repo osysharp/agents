@@ -243,15 +243,15 @@ public AgentInstruction ProposeAgentInstruction(InstructionDraft draft) {
     if (c == null || c!.Agent != draft.Agent) { throw new ValidationException("An instruction is drawn from corrections of the same agent's work."); }
     if (c!.WithdrawnAt != null) { throw new ValidationException("One of those corrections was taken back; nothing new is drawn from it."); }
     if (!inCharge && (c!.By == null || c!.By!.Id != person!.Id)) {
-      throw new AgentRefused("You may propose an instruction from a correction you made yourself. Whoever teaches the agents may propose any.");
+      throw new AgentRefused($"You may propose an instruction from a correction you made yourself. {InChargeSaysNo(person!)}");
     }
     from.Add(c!);
   }
   if (!inCharge && from.Count == 0) {
-    throw new AgentRefused("Propose an instruction from a correction you made (`From`). Whoever teaches the agents may propose one outright.");
+    throw new AgentRefused($"Propose an instruction from a correction you made (`From`). {InChargeSaysNo(person!)}");
   }
   if (!inCharge && draft.For != null && draft.For != person!.Id) {
-    throw new AgentRefused("You may propose an instruction for the work an agent does for you, or for anybody — not for one other person.");
+    throw new AgentRefused($"You may propose an instruction for the work an agent does for you, or for anybody — not for one other person. {InChargeSaysNo(person!)}");
   }
   var made = new AgentInstruction {
     Agent = draft.Agent, Skill = draft.Skill, For = draft.For == null ? null : Principal.FirstOrDefault(p => p.Id == draft.For),
@@ -261,6 +261,14 @@ public AgentInstruction ProposeAgentInstruction(InstructionDraft draft) {
   foreach (var c in from) { new AgentInstructionSource { Instruction = made, Correction = c }; }
   Raise(new AgentInstructionProposed { Instruction = made });
   return made;
+}
+
+/// Why a proposer is not one of those who may propose anything: the app's two answers, asked about this account NOW.
+/// Each is the app's own rule, so whatever it reads — a role, a person somebody acts for, a reason still in force — is
+/// what said no; the refusal names both rules and the account, so whoever is refused knows where to look.
+internal string InChargeSaysNo(Principal person) {
+  return $"Whoever the app's `TeachesAgents` or `SupervisesAgents` admits may propose any instruction outright, and both "
+    + $"answer no for {NameOfPrincipal(person)} now.";
 }
 
 /// The words of a draft, checked: an agent the app lists, a skill it holds, and guidance short enough to be sent.
